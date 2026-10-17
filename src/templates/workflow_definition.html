@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}{{ definition.key }} — Workflow definition — FlowOps{% endblock %}
+{% block content %}
+<section class="page-heading"><div><span class="eyebrow"><a href="/ui/workflow-definitions">Definitions</a> / {{ definition.key }}</span><h1>{{ definition.name }}</h1><p class="muted">{{ definition.request_type }} · {{ definition.status }} · current v{{ definition.current_version or '—' }}</p></div></section>
+{% for version in definition.versions %}
+<section class="panel">
+  <div class="panel-head"><h2>Version {{ version.version }}</h2><span class="muted small">SHA-256 {{ version.checksum[:16] }}…</span></div>
+  <div class="table-wrap"><table><thead><tr><th>Step</th><th>Queue</th><th>Depends on</th><th>Join</th><th>When</th><th>SLA</th></tr></thead><tbody>
+  {% for step in version.steps %}<tr><td>{{ step.step }} <span class="muted small">({{ step.key }})</span></td><td>{{ step.queue }}</td><td>{{ step.depends_on | join(', ') or '—' }}</td><td>{{ step.join }}</td><td>{{ step.when | join(' and ') or '—' }}</td><td>{{ step.sla_minutes or '—' }}</td></tr>{% endfor %}
+  </tbody></table></div>
+</section>
+{% endfor %}
+{% endblock %}

@@ -31,6 +31,7 @@ FlowOps is an IT workflow automation platform. It receives support tickets and o
 | v1.1 Secure operator console | ✅ | Signed session login, CSRF-protected UI actions, role-aware controls, login/logout audit |
 | v1.1 Workflow DAG engine | ✅ | Step dependencies, blocked/cascade states, output piping, signed single-use ChatOps approvals |
 | v1.2 Workflow orchestrator | ✅ | DB-backed run/step/event ledger, leased scheduler, parallel ready steps, pause/resume/cancel, DAG metrics |
+| v1.3 Versioned definitions | ✅ | Immutable workflow versions, safe predicates, all/any joins, SLA timers, runtime migration |
 | v0.6.1 Offboarding completion ledger | ✅ | Admin-only, claim-before-execute, idempotent replay, stale-claim takeover, ledger-backed offboarding |
 | v1.0 Operations: readiness, metrics, migrations | ✅ | `/ready`, `/metrics`, correlation IDs, Alembic baseline, container migration entrypoint |
 | v1.0 CI + Docker | ✅ | GitHub Actions runs pytest, a Docker Compose API + PostgreSQL smoke test, and PostgreSQL reliability tests |
@@ -360,6 +361,25 @@ compatibility; opt into `onboarding-dag` or `offboarding-dag` with
 - `/metrics` exposes `flowops_dag_runs`, `flowops_dag_steps`, and
   `flowops_dag_scheduler_ticks_total`.
 
+## Versioned workflows and SLA timers (v1.3)
+
+Workflow definitions can be stored as immutable versions (migration `0008_workflow_definitions`):
+
+- `POST /workflow-definitions`, `PUT /workflow-definitions/{key}`,
+  `POST /workflow-definitions/{key}/publish`, `GET /workflow-definitions`.
+- Requests pin `definition_key`/`definition_version` at creation; publishing a
+  new version never mutates in-flight work.
+- Steps support `join: all|any`, safe `when` predicates evaluated by
+  `src/expressions.py`, and `sla_minutes`.
+- False predicates mark a step `skipped`; unknown identifiers fail closed.
+- `workflow_timers` plus `src/timers.py` fire leased, conditional SLA alarms,
+  write `onboarding.step.overdue`, enqueue escalation notices, and can reassign
+  the queue. Run `python -m src.timers --once` or `--poll`.
+- `POST /onboarding-requests/{id}/definition` previews/applies a safe version
+  migration while preserving completed outputs.
+- Definition pages: `/ui/workflow-definitions`; request detail shows overdue/SLA
+  badges and skip state.
+
 ## Operator UI
 
 The HTML UI is server-rendered with Jinja2 templates and local CSS/vanilla JS
@@ -438,7 +458,7 @@ No real secrets or Microsoft tenant are included.
 ## Running the tests
 
 ```bash
-pytest    # 259 passed, 14 skipped locally; the skips are PostgreSQL-only tests
+pytest    # 292 passed, 15 skipped locally; the skips are PostgreSQL-only tests
 python -m compileall -q src tests
 ```
 

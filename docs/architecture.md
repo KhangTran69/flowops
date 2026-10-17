@@ -112,6 +112,15 @@ run stores `{}` outputs. The piping contract is exercised with adapter doubles
 in `tests/test_workflow_dag.py` and by the Graph / Power Automate adapters,
 which can return real payloads once credentials are configured.
 
+## Versioned definitions and SLA timers (v1.3)
+
+Workflow graphs can be stored as immutable versions in
+`workflow_definitions`/`workflow_definition_versions`; requests pin a version
+at creation. `src/expressions.py` parses predicates without `eval`, and the
+resolver supports `all`/`any` joins with false predicates becoming `skipped`.
+`workflow_timers` and `src/timers.py` use leased, conditional updates to fire
+SLA alarms once and enqueue escalation notices.
+
 ## Workflow orchestrator (v1.2)
 
 `src/scheduler.py` leases a `workflow_runs` row, resolves readiness from the

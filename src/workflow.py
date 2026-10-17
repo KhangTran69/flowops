@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from src import db
 from src.onboarding import (
     STATUS_BLOCKED,
+    STATUS_SKIPPED,
     STATUS_CASCADE_BLOCKED,
     STATUS_COMPLETED,
     StepState,
@@ -59,12 +60,29 @@ def dependencies_of(item: db.ChecklistItemRecord) -> list[str]:
     return [str(key) for key in value]
 
 
+def predicates_of(item: db.ChecklistItemRecord) -> tuple[str, ...]:
+    raw = getattr(item, "when_json", None)
+    if not raw:
+        return ()
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    if not isinstance(value, list):
+        return ()
+    return tuple(str(predicate) for predicate in value)
+
+
 def step_state(item: db.ChecklistItemRecord) -> StepState:
     return StepState(
         key=state_key(item),
         status=item.status,
         requires_approval=bool(item.requires_approval),
         depends_on=tuple(dependencies_of(item)),
+        join_mode=getattr(item, "join_mode", None) or "all",
+        when=predicates_of(item),
     )
 
 
@@ -154,6 +172,19 @@ def action_context_outputs(
     }
 
 
+def graph_scope(items: Sequence[db.ChecklistItemRecord]) -> dict[str, Any]:
+    """Build the predicate scope from current step outputs/statuses."""
+    step_scope = {
+        state_key(item): {"status": item.status, "output": step_output(item)}
+        for item in items
+    }
+    flat_output: dict[str, Any] = {}
+    for item in items:
+        for key, value in step_output(item).items():
+            flat_output.setdefault(str(key), value)
+    return {"step": step_scope, "output": flat_output}
+
+
 def apply_graph_transitions(
     session: Session,
     items: Sequence[db.ChecklistItemRecord],
@@ -161,6 +192,7 @@ def apply_graph_transitions(
     request_id: int,
     actor_subject: Optional[str] = None,
     reason: Optional[str] = None,
+    context: Optional[Mapping[str, Any]] = None,
 ) -> list[StepTransition]:
     """Resolve the graph after a status change and persist the transitions.
 
@@ -169,7 +201,10 @@ def apply_graph_transitions(
     prerequisite is logged as ``onboarding.item.cascade_blocked``. Both rows
     carry the actor so the audit page shows who caused the cascade.
     """
-    transitions = resolve_blocked_steps(step_states(items))
+    scope = graph_scope(items)
+    if context:
+        scope["context"] = dict(context)
+    transitions = resolve_blocked_steps(step_states(items), scope=scope)
     if not transitions:
         return []
     by_key = {state_key(item): item for item in items}
@@ -179,20 +214,27 @@ def apply_graph_transitions(
             continue
         item.status = transition.to_status
         cascaded = transition.to_status == STATUS_CASCADE_BLOCKED
+        skipped = transition.to_status == STATUS_SKIPPED
         detail = (
             f"step '{item.step}' of request #{request_id} "
-            f"{'cascade-blocked' if cascaded else 'unblocked'} "
+            f"{'skipped' if skipped else ('cascade-blocked' if cascaded else 'unblocked')} "
             f"({transition.from_status} -> {transition.to_status})"
         )
+        if transition.reason:
+            detail = f"{detail}; {transition.reason}"
         if reason:
             detail = f"{detail}; {reason}"
         db.log_execution(
             session,
             run_id=_new_run_id(),
             action=(
-                "onboarding.item.cascade_blocked"
-                if cascaded
-                else "onboarding.item.unblocked"
+                "onboarding.item.skipped"
+                if skipped
+                else (
+                    "onboarding.item.cascade_blocked"
+                    if cascaded
+                    else "onboarding.item.unblocked"
+                )
             ),
             status="success",
             duration_ms=0,

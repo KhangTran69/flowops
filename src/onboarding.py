@@ -13,6 +13,8 @@ status 422, so a rejected template never surfaces as an unhandled 500.
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Optional, Sequence, TypedDict
 
+from src import expressions
+
 from fastapi import HTTPException
 
 VALID_REQUEST_TYPES = ("onboarding", "offboarding")
@@ -79,6 +81,8 @@ class StepState:
     status: str
     requires_approval: bool = False
     depends_on: tuple[str, ...] = ()
+    join_mode: str = "all"
+    when: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -88,6 +92,7 @@ class StepTransition:
     key: str
     from_status: str
     to_status: str
+    reason: str = ""
 
 
 ONBOARDING_STEPS: tuple[ChecklistStep, ...] = (
@@ -146,6 +151,7 @@ TEMPLATES: dict[str, tuple[str, tuple[ChecklistStep, ...]]] = {
     "onboarding-standard": ("onboarding", ONBOARDING_STEPS),
     "onboarding-dag": ("onboarding", ONBOARDING_DAG_STEPS),
     "offboarding-standard": ("offboarding", OFFBOARDING_STEPS),
+    "offboarding-dag": ("offboarding", OFFBOARDING_DAG_SHAPE),
 }
 
 
@@ -200,24 +206,26 @@ def resolve_blocked_steps(
     states: Mapping[str, StepState],
     *,
     pre_approved: Iterable[str] = (),
+    scope: Optional[Mapping[str, Any]] = None,
 ) -> list[StepTransition]:
     """Promote or cascade every ``blocked`` step and return the transitions.
 
-    Rules (v1.1):
-
-    * ``blocked`` -> ``pending`` once *all* prerequisites are ``completed``.
-    * ``blocked`` -> ``approved`` instead, when the caller records that the
-      gated step was pre-approved out of band (``pre_approved``).
-    * ``blocked`` -> ``cascade_blocked`` when any prerequisite failed
-      terminally (failed, cancelled, rejected, skipped, already cascaded).
-
-    The function is pure: it reads a status snapshot and returns the changes.
-    It runs to a fixed point, so a cascade propagates through a whole chain of
-    dependents in one call regardless of dict ordering.
+    Rules (v1.3): ``all`` requires every prerequisite completed; ``any``
+    requires one completed and cascades only when every prerequisite is
+    terminal. Predicates are evaluated only after the join is ready, so a
+    downstream ``output.user_id`` predicate cannot skip before its upstream
+    action has produced the output. False predicates become ``skipped``.
     """
     approved = set(pre_approved)
+    scope = scope or {}
     current = {key: state.status for key, state in states.items()}
     transitions: list[StepTransition] = []
+    failed_states = {
+        STATUS_FAILED,
+        STATUS_CANCELLED,
+        STATUS_REJECTED,
+        STATUS_CASCADE_BLOCKED,
+    }
     changed = True
     while changed:
         changed = False
@@ -227,25 +235,60 @@ def resolve_blocked_steps(
             dependency_statuses = [
                 current.get(dependency) for dependency in step.depends_on
             ]
-            # A missing prerequisite fails closed: cascade, never unblock.
-            if any(
-                status is None or status in TERMINAL_FAILURE_STATUSES
-                for status in dependency_statuses
-            ):
+            missing = any(status is None for status in dependency_statuses)
+            if not step.depends_on:
+                ready, cascade = True, False
+            elif step.join_mode == "any":
+                if missing:
+                    continue
+                if any(status == STATUS_COMPLETED for status in dependency_statuses):
+                    ready, cascade = True, False
+                elif all(
+                    status in failed_states or status == STATUS_SKIPPED
+                    for status in dependency_statuses
+                ):
+                    ready, cascade = False, True
+                else:
+                    continue
+            else:
+                if missing or any(
+                    status in failed_states for status in dependency_statuses
+                ):
+                    ready, cascade = False, True
+                elif all(
+                    status == STATUS_COMPLETED for status in dependency_statuses
+                ):
+                    ready, cascade = True, False
+                else:
+                    continue
+            if cascade:
                 new_status = STATUS_CASCADE_BLOCKED
-            elif all(
-                status == STATUS_COMPLETED for status in dependency_statuses
-            ):
+                reason = "prerequisite failed or missing: " + ", ".join(
+                    dependency
+                    for dependency in step.depends_on
+                    if current.get(dependency) in failed_states
+                    or current.get(dependency) is None
+                )
+            elif ready and step.when and not expressions.evaluate_all(step.when, scope):
+                new_status = STATUS_SKIPPED
+                reason = "predicate false: " + expressions.describe(step.when)
+            elif ready:
                 new_status = (
                     STATUS_APPROVED
                     if step.requires_approval and key in approved
                     else STATUS_PENDING
                 )
+                reason = "prerequisites satisfied"
             else:
                 continue
             current[key] = new_status
             transitions.append(
-                StepTransition(key=key, from_status=STATUS_BLOCKED, to_status=new_status)
+                StepTransition(
+                    key=key,
+                    from_status=STATUS_BLOCKED,
+                    to_status=new_status,
+                    reason=reason,
+                )
             )
             changed = True
     return transitions
@@ -270,6 +313,21 @@ def validate_graph(steps: Sequence[Mapping[str, Any]]) -> None:
     known = set(keys)
     for step in steps:
         key = str(step["key"])
+        join = str(step.get("join", "all")).lower()
+        if join not in ("all", "any"):
+            raise WorkflowGraphError(f"Step {key!r} has unsupported join mode {join!r}.")
+        for predicate in step.get("when") or []:
+            if not str(predicate).strip():
+                raise WorkflowGraphError(f"Step {key!r} has an empty predicate.")
+            try:
+                expressions.compile_predicate(str(predicate))
+            except expressions.ExpressionError as error:
+                raise WorkflowGraphError(
+                    f"Step {key!r} has an invalid predicate: {error}"
+                ) from error
+        sla = step.get("sla_minutes")
+        if sla is not None and (not isinstance(sla, int) or sla <= 0):
+            raise WorkflowGraphError(f"Step {key!r} has invalid sla_minutes.")
         for dependency in step_dependencies(step):
             if dependency == key:
                 raise WorkflowGraphError(f"Step {key!r} cannot depend on itself.")
