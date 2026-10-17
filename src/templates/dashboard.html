@@ -83,6 +83,19 @@
   {% endif %}
 </section>
 
+<section class="panel" aria-labelledby="ai-heading">
+  <div class="panel-head">
+    <h2 id="ai-heading">AI activity</h2>
+    <a class="button small ghost" href="/ui/tickets">Open tickets</a>
+  </div>
+  <div class="kpi-grid">
+    <div class="kpi"><span class="kpi-value">{{ ai_stats.triage }}</span><span class="kpi-label">Triage calls</span></div>
+    <div class="kpi"><span class="kpi-value">{{ ai_stats.applies }}</span><span class="kpi-label">Applied recommendations</span></div>
+    <div class="kpi"><span class="kpi-value {% if ai_stats.errors %}fail{% endif %}">{{ ai_stats.errors }}</span><span class="kpi-label">Provider errors</span></div>
+  </div>
+  <p class="muted small">AI is suggest-only; only operator-approved queue/priority changes are applied.</p>
+</section>
+
 <section class="panel" aria-labelledby="runs-heading">
   <div class="panel-head">
     <h2 id="runs-heading">Recent workflow runs</h2>

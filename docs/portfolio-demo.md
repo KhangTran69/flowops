@@ -200,3 +200,18 @@ correlation ID.
 The simulated adapter is credential-free. The optional `LLMAIAdapter` is a
 pluggable boundary and is not called by tests; no paid LLM key is required to
 run the demo.
+
+
+## 9. Explain the AI safety boundary
+
+- Ticket text is redacted and truncated before provider calls; embedded
+  instructions are treated as untrusted data.
+- The model may propose only queue/priority changes, plus informational
+  response/workflow suggestions. Status, title, and requester are immutable.
+- Applying a suggestion requires an explicit operator recommendation-ID list.
+- `tests/test_ai_eval.py` checks the deterministic simulated agent against a
+  12-ticket golden set.
+- `/metrics` tracks AI triage/apply/provider errors; `/ui/tickets/{id}?triage=1`
+  shows the same summary and KB matches an operator would review.
+- `python scripts/ai_smoke.py` optionally exercises a configured live
+  Gemini/Groq/Ollama provider; it is not part of CI.

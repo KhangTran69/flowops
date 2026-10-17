@@ -76,6 +76,7 @@ flowops/
 ├── docs/architecture.md      # Data flow and reliability boundaries
 ├── scripts/demo_smoke.sh     # Local end-to-end smoke test
 ├── scripts/load_smoke.py     # Small concurrent intake/replay smoke test
+├── scripts/ai_smoke.py       # Opt-in live AI provider smoke check
 ├── .gitignore  .env.example  requirements.txt  README.md
 ```
 
@@ -230,6 +231,27 @@ The AI boundary is suggest-only by default:
 - `/ui/tickets/{id}?triage=1` renders the summary, KB guidance, and approval
   checkboxes; the Apply button calls the approval endpoint.
 
+AI safety guardrails:
+
+- Ticket text is redacted (emails, phone numbers, tokens, credentialed URLs)
+  and truncated before an LLM prompt. Ticket content is delimited as untrusted
+  data with explicit instructions to ignore embedded instructions.
+- LLM output is schema-validated: only known recommendation kinds are kept,
+  queue/priority suggestions must use known values, confidence is clamped, and
+  only queue/priority may be applicable. Status/title/requester changes are
+  impossible through the apply endpoint.
+- Provider failures return `503` and write an `ai.error` log with actor and
+  correlation ID.
+- `tests/test_ai_eval.py` runs a deterministic golden evaluation over 12
+  synthetic tickets (top-1 KB accuracy threshold, queue/priority recall,
+  workflow suggestions never applicable, no false positives on correct
+  tickets).
+- `/metrics` exposes `flowops_ai_triage_total`, `flowops_ai_apply_total`, and
+  `flowops_ai_provider_errors_total`; the dashboard has an AI activity panel.
+- `scripts/ai_smoke.py` is an opt-in live provider smoke check. It reads
+  `FLOWOPS_AI_*` from the environment, never prints the key, and is not part of
+  CI.
+
 ## How routing works
 
 `src/routing.py` is a set of **pure functions** (the same shape as branch logic in Rewst or n8n):
@@ -355,7 +377,7 @@ No real secrets or Microsoft tenant are included.
 ## Running the tests
 
 ```bash
-pytest    # 201 passed, 13 skipped locally; the skips are PostgreSQL-only tests
+pytest    # 209 passed, 13 skipped locally; the skips are PostgreSQL-only tests
 python -m compileall -q src tests
 ```
 

@@ -85,6 +85,10 @@ fields. The optional LLM adapter is an OpenAI-compatible client boundary for Gem
 Groq, OpenRouter, OpenAI, or local Ollama; the default simulated adapter needs
 no credentials and is what tests exercise. Every AI
 action is written to the execution log with actor and correlation ID.
+Before provider calls, ticket text is redacted and bounded, and the prompt labels
+ticket content as untrusted data. Provider output is schema-validated and
+allowlisted; only queue/priority can become applicable. AI metrics are exposed
+at `/metrics`, and the golden evaluation suite runs offline.
 
 ## Deliberate limits
 

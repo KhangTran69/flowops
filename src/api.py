@@ -163,6 +163,30 @@ def _webhook_actor(
 _METRICS_LOCK = threading.Lock()
 _METRICS: dict[tuple[str, str, int], int] = {}
 _METRICS_STARTED = time.time()
+_AI_METRICS_LOCK = threading.Lock()
+_AI_TRIAGE: dict[tuple[str, str], int] = {}
+_AI_APPLY: dict[str, int] = {}
+_AI_PROVIDER_ERRORS: dict[str, int] = {}
+
+
+def _ai_provider_name() -> str:
+    return str(getattr(AI_ADAPTER, "provider", getattr(AI_ADAPTER, "name", "unknown")))
+
+
+def _record_ai_triage(adapter: str, outcome: str) -> None:
+    with _AI_METRICS_LOCK:
+        key = (adapter, outcome)
+        _AI_TRIAGE[key] = _AI_TRIAGE.get(key, 0) + 1
+
+
+def _record_ai_apply(field: str) -> None:
+    with _AI_METRICS_LOCK:
+        _AI_APPLY[field] = _AI_APPLY.get(field, 0) + 1
+
+
+def _record_ai_provider_error(provider: str) -> None:
+    with _AI_METRICS_LOCK:
+        _AI_PROVIDER_ERRORS[provider] = _AI_PROVIDER_ERRORS.get(provider, 0) + 1
 
 
 def _record_request(method: str, route: str, status_code: int, duration: float) -> None:
@@ -879,6 +903,38 @@ def metrics(session: Session = Depends(db.get_session)) -> Response:
         lines.append(
             f'flowops_notification_outbox{{status="{state}"}} {outbox_counts.get(state, 0)}'
         )
+    with _AI_METRICS_LOCK:
+        triage_counts = dict(_AI_TRIAGE)
+        apply_counts = dict(_AI_APPLY)
+        provider_errors = dict(_AI_PROVIDER_ERRORS)
+    lines.extend(
+        [
+            "# HELP flowops_ai_triage_total AI triage calls by adapter and outcome",
+            "# TYPE flowops_ai_triage_total counter",
+        ]
+    )
+    for (adapter, outcome), count in sorted(triage_counts.items()):
+        lines.append(
+            f'flowops_ai_triage_total{{adapter="{adapter}",outcome="{outcome}"}} {count}'
+        )
+    lines.extend(
+        [
+            "# HELP flowops_ai_apply_total Applied AI recommendation fields",
+            "# TYPE flowops_ai_apply_total counter",
+        ]
+    )
+    for field in sorted(apply_counts):
+        lines.append(f'flowops_ai_apply_total{{field="{field}"}} {apply_counts[field]}')
+    lines.extend(
+        [
+            "# HELP flowops_ai_provider_errors_total AI provider failures",
+            "# TYPE flowops_ai_provider_errors_total counter",
+        ]
+    )
+    for provider in sorted(provider_errors):
+        lines.append(
+            f'flowops_ai_provider_errors_total{{provider="{provider}"}} {provider_errors[provider]}'
+        )
     lines.append(f"flowops_uptime_seconds {time.time() - _METRICS_STARTED:.1f}")
     return Response("\n".join(lines) + "\n", media_type="text/plain")
 
@@ -1031,12 +1087,35 @@ def _triage_out(result: ai_agent.TriageResult) -> AITriageOut:
 
 
 def _analyze_ticket(
-    record: db.TicketRecord, history: list[dict[str, Any]]
+    record: db.TicketRecord,
+    history: list[dict[str, Any]],
+    *,
+    request: Optional[Request] = None,
+    session: Optional[Session] = None,
+    actor: Optional[Actor] = None,
 ) -> ai_agent.TriageResult:
     snapshot = ai_agent.TicketSnapshot.from_record(record)
     try:
         return AI_ADAPTER.analyze(snapshot, history)
     except ai_agent.AIAvailabilityError as error:
+        provider = _ai_provider_name()
+        _record_ai_triage(provider, "error")
+        _record_ai_provider_error(provider)
+        if session is not None and actor is not None:
+            db.log_execution(
+                session,
+                run_id=_new_run_id(),
+                action="ai.error",
+                status="failure",
+                ticket_id=record.ticket_id,
+                duration_ms=0,
+                detail=ai_agent.redact_text(str(error), 500),
+                actor_subject=actor.subject,
+                correlation_id=getattr(request.state, "correlation_id", None)
+                if request is not None
+                else None,
+            )
+            session.commit()
         raise HTTPException(status_code=503, detail=str(error)) from error
 
 
@@ -1051,7 +1130,10 @@ def triage_ticket(
     record = _load_ticket(session, ticket_id)
     history = _ticket_history(session, ticket_id)
     started = time.perf_counter()
-    result = _analyze_ticket(record, history)
+    result = _analyze_ticket(
+        record, history, request=request, session=session, actor=actor
+    )
+    _record_ai_triage(result.adapter, "success")
     duration_ms = int((time.perf_counter() - started) * 1000)
     correlation_id = getattr(request.state, "correlation_id", None)
     db.log_execution(
@@ -1102,7 +1184,9 @@ def apply_ai_recommendations(
     record = _load_ticket(session, ticket_id)
     history = _ticket_history(session, ticket_id)
     started = time.perf_counter()
-    result = _analyze_ticket(record, history)
+    result = _analyze_ticket(
+        record, history, request=request, session=session, actor=actor
+    )
     by_id = {recommendation.id: recommendation for recommendation in result.recommendations}
     unknown = [item for item in payload.recommendation_ids if item not in by_id]
     if unknown:
@@ -1120,10 +1204,12 @@ def apply_ai_recommendations(
             record.queue = recommendation.suggested
             applied.append(recommendation.id)
             applied_fields.append(f"queue={recommendation.suggested}")
+            _record_ai_apply("queue")
         elif recommendation.kind == "priority" and recommendation.suggested:
             record.priority = recommendation.suggested
             applied.append(recommendation.id)
             applied_fields.append(f"priority={recommendation.suggested}")
+            _record_ai_apply("priority")
 
     if not applied:
         raise HTTPException(
@@ -2697,5 +2783,10 @@ def dashboard(
             "auto_refresh": auto_refresh,
             "last_updated": db.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
             "offboarding_rows": offboarding_rows,
+            "ai_stats": {
+                "triage": sum(_AI_TRIAGE.values()),
+                "applies": sum(_AI_APPLY.values()),
+                "errors": sum(_AI_PROVIDER_ERRORS.values()),
+            },
         },
     )
