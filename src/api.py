@@ -89,11 +89,18 @@ def _new_run_id() -> str:
 
 def _claim_idempotency_key(
     session: Session, key: str, ticket_id: str, request_hash: str
-) -> bool:
-    """Atomically claim a key or take over an expired processing reservation."""
+) -> Optional[str]:
+    """Atomically claim a key or take over an expired processing reservation.
+
+    Returns a fresh fencing token when this request owns the reservation, or
+    ``None`` when another request owns it. A takeover replaces the token and
+    refreshes the lease timestamp in the same upsert, so the previous owner
+    loses the ability to finalize or remove the reservation.
+    """
     table = db.IdempotencyRecord.__table__
     now = db.utcnow()
     stale_before = now - IDEMPOTENCY_PROCESSING_TIMEOUT
+    owner_token = uuid.uuid4().hex
     values = {
         "key": key,
         "ticket_id": ticket_id,
@@ -101,7 +108,13 @@ def _claim_idempotency_key(
             {"request_hash": request_hash, "state": "processing"},
             separators=(",", ":"),
         ),
+        "owner_token": owner_token,
+        "created_at": now,
     }
+    takeover = and_(
+        table.c.created_at < stale_before,
+        table.c.response_json.like('%"state":"processing"%'),
+    )
     dialect = session.get_bind().dialect.name
     if dialect == "sqlite":
         statement = sqlite_insert(table).values(**values).on_conflict_do_update(
@@ -109,12 +122,10 @@ def _claim_idempotency_key(
             set_={
                 "ticket_id": ticket_id,
                 "response_json": values["response_json"],
+                "owner_token": owner_token,
                 "created_at": now,
             },
-            where=and_(
-                table.c.created_at < stale_before,
-                table.c.response_json.like('%"state":"processing"%'),
-            ),
+            where=takeover,
         )
     elif dialect == "postgresql":
         statement = postgres_insert(table).values(**values).on_conflict_do_update(
@@ -122,19 +133,77 @@ def _claim_idempotency_key(
             set_={
                 "ticket_id": ticket_id,
                 "response_json": values["response_json"],
+                "owner_token": owner_token,
                 "created_at": now,
             },
-            where=and_(
-                table.c.created_at < stale_before,
-                table.c.response_json.like('%"state":"processing"%'),
-            ),
+            where=takeover,
         )
     else:
         raise RuntimeError(f"Idempotency reservations do not support database dialect {dialect!r}.")
 
-    inserted = session.execute(statement).rowcount == 1
+    claimed = session.execute(statement).rowcount == 1
     session.commit()
-    return inserted
+    return owner_token if claimed else None
+
+
+def _complete_idempotency_key(
+    session: Session,
+    key: str,
+    owner_token: str,
+    request_hash: str,
+    ticket: "Ticket",
+) -> bool:
+    """Store the completed response only if this request still owns the key.
+
+    The conditional update runs in the same transaction as the ticket and
+    execution-log writes, so losing the fencing token rolls all of them back
+    instead of committing a duplicate durable result.
+    """
+    table = db.IdempotencyRecord.__table__
+    result = session.execute(
+        update(table)
+        .where(
+            and_(
+                table.c.key == key,
+                table.c.owner_token == owner_token,
+                table.c.response_json.like('%"state":"processing"%'),
+            )
+        )
+        .values(
+            ticket_id=ticket.ticket_id,
+            response_json=json.dumps(
+                {
+                    "request_hash": request_hash,
+                    "state": "completed",
+                    "ticket": ticket.model_dump(),
+                },
+                separators=(",", ":"),
+            ),
+        )
+    )
+    return result.rowcount == 1
+
+
+def _release_idempotency_key(
+    session: Session, key: str, owner_token: str
+) -> bool:
+    """Delete a failed request's reservation, but only while it still owns it."""
+    table = db.IdempotencyRecord.__table__
+    result = session.execute(
+        delete(table).where(
+            and_(
+                table.c.key == key,
+                table.c.owner_token == owner_token,
+                table.c.response_json.like('%"state":"processing"%'),
+            )
+        )
+    )
+    released = result.rowcount == 1
+    if released:
+        session.commit()
+    else:
+        session.rollback()
+    return released
 
 
 def _reservation_is_stale(created_at: datetime) -> bool:
@@ -449,6 +518,7 @@ def create_ticket(
     request_hash = hashlib.sha256(
         json.dumps(request.model_dump(), sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+    owner_token: Optional[str] = None
     if idempotency_key:
         stored = session.get(db.IdempotencyRecord, idempotency_key)
         if stored:
@@ -461,55 +531,47 @@ def create_ticket(
                     )
                 if not _reservation_is_stale(stored.created_at):
                     return _replay_or_reject(stored, request_hash, response, session)
-                claimed = _claim_idempotency_key(
+                owner_token = _claim_idempotency_key(
                     session, idempotency_key, str(request.id), request_hash
                 )
             else:
                 return _replay_or_reject(stored, request_hash, response, session)
         else:
-            claimed = _claim_idempotency_key(
+            owner_token = _claim_idempotency_key(
                 session, idempotency_key, str(request.id), request_hash
             )
-        if not claimed:
+        if owner_token is None:
             session.expire_all()
             stored = session.get(db.IdempotencyRecord, idempotency_key)
             if stored is None:
                 raise HTTPException(409, "Unable to claim this Idempotency-Key; retry the request.")
             return _replay_or_reject(stored, request_hash, response, session)
 
+    ownership_lost = False
     try:
         if session.get(db.TicketRecord, str(request.id)) is not None:
             response.status_code = http_status.HTTP_200_OK
         result = _process_intake(request, session)
-        if idempotency_key:
-            stored = session.get(db.IdempotencyRecord, idempotency_key)
-            if stored is None:
-                raise RuntimeError("Idempotency reservation disappeared during ticket processing.")
-            stored.ticket_id = result.ticket_id
-            stored.response_json = json.dumps(
-                {
-                    "request_hash": request_hash,
-                    "state": "completed",
-                    "ticket": result.model_dump(),
-                },
-                separators=(",", ":"),
-            )
+        if idempotency_key and owner_token is not None:
+            if not _complete_idempotency_key(
+                session, idempotency_key, owner_token, request_hash, result
+            ):
+                # Another request took over the expired lease. Roll back this
+                # request's ticket/log writes before reporting a retryable conflict.
+                session.rollback()
+                ownership_lost = True
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Another request took over this Idempotency-Key while it was "
+                        "processing; retry the request."
+                    ),
+                )
         return result
     except Exception:
-        if idempotency_key:
+        if idempotency_key and owner_token is not None and not ownership_lost:
             session.rollback()
-            reservation = session.get(db.IdempotencyRecord, idempotency_key)
-            if reservation is not None:
-                try:
-                    reservation_payload = json.loads(reservation.response_json)
-                except json.JSONDecodeError:
-                    reservation_payload = {}
-                if (
-                    reservation_payload.get("request_hash") == request_hash
-                    and reservation_payload.get("state") == "processing"
-                ):
-                    session.delete(reservation)
-                    session.commit()
+            _release_idempotency_key(session, idempotency_key, owner_token)
         raise
 
 

@@ -3,6 +3,10 @@
 Fully offline: SQLite in a temp directory, HTTP via TestClient.
 """
 
+import hashlib
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 
 import pytest
@@ -123,6 +127,45 @@ def test_list_tickets_sorted_by_id(client):
 
 
 # --- Idempotency (v0.5) ---
+
+
+def _request_hash(payload=None):
+    payload = VALID_REQUEST if payload is None else payload
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _ensure_tables():
+    db.Base.metadata.create_all(bind=db.engine)
+
+
+def _reservation(key):
+    """Read one reservation directly, outside the request session."""
+    session = db.SessionLocal()
+    try:
+        record = session.get(db.IdempotencyRecord, key)
+        if record is None:
+            return None
+        return {
+            "payload": json.loads(record.response_json),
+            "owner_token": record.owner_token,
+            "created_at": record.created_at,
+        }
+    finally:
+        session.close()
+
+
+def _make_reservation_stale(key):
+    """Move a reservation's lease into the past without sleeping."""
+    session = db.SessionLocal()
+    try:
+        record = session.get(db.IdempotencyRecord, key)
+        assert record is not None, "reservation must exist before it can go stale"
+        record.created_at = db.utcnow() - timedelta(minutes=10)
+        session.commit()
+    finally:
+        session.close()
 
 
 def test_idempotency_key_replays_stored_response(client):
@@ -348,6 +391,215 @@ def test_legacy_idempotency_record_without_fingerprint_returns_409(client, tmp_p
         "/tickets", json=VALID_REQUEST, headers={"Idempotency-Key": "legacy-key-no-hash"}
     )
     assert response.status_code == 409
+
+
+def test_stale_owner_cannot_finalize_after_takeover(client, monkeypatch):
+    """A request whose lease expired cannot complete the new owner's reservation.
+
+    Request A claims the key and pauses before the ticket pipeline runs. Its
+    lease is moved into the past, request B reclaims the key and completes the
+    ticket, then A resumes. Only B's fence token may finalize; A's ticket and
+    execution-log writes must roll back together.
+    """
+    _ensure_tables()
+    a_entered = threading.Event()
+    release_a = threading.Event()
+    calls = 0
+    call_lock = threading.Lock()
+    original_process = api._process_intake
+
+    def pause_first_request(request, session):
+        nonlocal calls
+        with call_lock:
+            calls += 1
+            is_first = calls == 1
+        if is_first:
+            a_entered.set()
+            assert release_a.wait(timeout=5), "test did not release the stale owner"
+        return original_process(request, session)
+
+    monkeypatch.setattr(api, "_process_intake", pause_first_request)
+    key = "takeover-finalize-key"
+    headers = {"Idempotency-Key": key}
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        stale_future = executor.submit(
+            client.post, "/tickets", json=VALID_REQUEST, headers=headers
+        )
+        assert a_entered.wait(timeout=5), "stale owner never claimed the reservation"
+
+        claimed = _reservation(key)
+        assert claimed["payload"]["state"] == "processing"
+        assert claimed["owner_token"]
+        _make_reservation_stale(key)
+
+        new_owner = client.post("/tickets", json=VALID_REQUEST, headers=headers)
+        assert new_owner.status_code == 201
+        after_takeover = _reservation(key)
+        assert after_takeover["payload"]["state"] == "completed"
+        # The takeover rotated the fencing token atomically.
+        assert after_takeover["owner_token"] != claimed["owner_token"]
+
+        release_a.set()
+        stale_response = stale_future.result(timeout=5)
+
+    assert stale_response.status_code == 409
+    assert "took over" in stale_response.json()["detail"]
+
+    # A's late ticket update and execution logs were rolled back with its failed
+    # finalize; only B's durable effects remain.
+    assert len(client.get("/tickets").json()) == 1
+    actions = [log["action"] for log in client.get("/execution-logs").json()]
+    assert actions.count("ticket.created") == 1
+    assert "ticket.updated" not in actions
+
+    # The reservation still belongs to B and replays B's response.
+    final = _reservation(key)
+    assert final["payload"]["state"] == "completed"
+    assert final["owner_token"] == after_takeover["owner_token"]
+    replay = client.post("/tickets", json=VALID_REQUEST, headers=headers)
+    assert replay.status_code == 200
+    assert replay.headers["Idempotency-Replayed"] == "true"
+    assert replay.json() == new_owner.json()
+
+
+def test_stale_owner_cleanup_cannot_delete_new_owner_reservation(client, monkeypatch):
+    """Cleanup is fenced too: a stale owner cannot remove a live takeover.
+
+    B reclaims the key but pauses while still processing. A resumes, fails in
+    the pipeline, and runs its error cleanup. The conditional delete must leave
+    B's processing reservation untouched so B can finish and serve replays.
+    """
+    _ensure_tables()
+    a_entered = threading.Event()
+    a_release = threading.Event()
+    b_entered = threading.Event()
+    b_release = threading.Event()
+    calls = 0
+    call_lock = threading.Lock()
+    original_process = api._process_intake
+
+    def controlled_process(request, session):
+        nonlocal calls
+        with call_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            a_entered.set()
+            assert a_release.wait(timeout=5), "test did not release the stale owner"
+            raise RuntimeError("stale owner failed after takeover")
+        if call_number == 2:
+            b_entered.set()
+            assert b_release.wait(timeout=5), "test did not release the new owner"
+        return original_process(request, session)
+
+    monkeypatch.setattr(api, "_process_intake", controlled_process)
+    key = "takeover-cleanup-key"
+    headers = {"Idempotency-Key": key}
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        stale_future = executor.submit(
+            client.post, "/tickets", json=VALID_REQUEST, headers=headers
+        )
+        assert a_entered.wait(timeout=5), "stale owner never claimed the reservation"
+        stale_token = _reservation(key)["owner_token"]
+        _make_reservation_stale(key)
+
+        new_future = executor.submit(
+            client.post, "/tickets", json=VALID_REQUEST, headers=headers
+        )
+        assert b_entered.wait(timeout=5), "new owner never reclaimed the reservation"
+        live = _reservation(key)
+        assert live["payload"]["state"] == "processing"
+        assert live["owner_token"] != stale_token
+
+        a_release.set()
+        with pytest.raises(RuntimeError, match="stale owner failed"):
+            stale_future.result(timeout=5)
+
+        # A's cleanup must not delete B's reservation.
+        still_live = _reservation(key)
+        assert still_live is not None
+        assert still_live["payload"]["state"] == "processing"
+        assert still_live["owner_token"] == live["owner_token"]
+
+        b_release.set()
+        new_owner = new_future.result(timeout=5)
+
+    assert new_owner.status_code == 201
+    completed = _reservation(key)
+    assert completed["payload"]["state"] == "completed"
+    assert completed["owner_token"] == live["owner_token"]
+
+    replay = client.post("/tickets", json=VALID_REQUEST, headers=headers)
+    assert replay.status_code == 200
+    assert replay.headers["Idempotency-Replayed"] == "true"
+    assert replay.json() == new_owner.json()
+    assert len(client.get("/tickets").json()) == 1
+
+
+def test_processing_failure_cleans_up_only_its_own_reservation(client, monkeypatch):
+    """An ordinary failure releases its own key and leaves other keys untouched."""
+    _ensure_tables()
+    session = db.SessionLocal()
+    try:
+        session.add(
+            db.IdempotencyRecord(
+                key="foreign-in-flight-key",
+                ticket_id="77",
+                response_json=json.dumps(
+                    {"request_hash": _request_hash(), "state": "processing"},
+                    separators=(",", ":"),
+                ),
+                owner_token="foreign-owner-token",
+                created_at=db.utcnow(),
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+
+    def fail_pipeline(request, session):
+        raise RuntimeError("ticket pipeline exploded")
+
+    monkeypatch.setattr(api, "_process_intake", fail_pipeline)
+    with pytest.raises(RuntimeError, match="ticket pipeline exploded"):
+        client.post(
+            "/tickets",
+            json=VALID_REQUEST,
+            headers={"Idempotency-Key": "failing-key"},
+        )
+
+    assert _reservation("failing-key") is None
+    foreign = _reservation("foreign-in-flight-key")
+    assert foreign is not None
+    assert foreign["payload"]["state"] == "processing"
+    assert foreign["owner_token"] == "foreign-owner-token"
+
+
+def test_existing_idempotency_table_gains_fencing_column(tmp_path):
+    """A pre-fencing local database is upgraded additively, not recreated."""
+    from sqlalchemy import inspect, text
+
+    db.use_database(f"sqlite:///{tmp_path}/legacy.db")
+    with db.engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE idempotency_keys ("
+                "key VARCHAR(128) PRIMARY KEY, "
+                "ticket_id VARCHAR(64) NOT NULL, "
+                "response_json TEXT NOT NULL, "
+                "created_at DATETIME)"
+            )
+        )
+
+    db._ensure_tables()
+
+    columns = {
+        column["name"]
+        for column in inspect(db.engine).get_columns("idempotency_keys")
+    }
+    assert "owner_token" in columns
 
 
 # --- Webhook intake (v0.4) ---
