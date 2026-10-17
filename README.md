@@ -21,7 +21,7 @@ FlowOps is an IT workflow automation platform. It receives support tickets and o
 | v0.4 Routing + notifications + webhooks | ✅ | Rule-based category/priority/queue routing, outbound webhook with retries, n8n-style bulk intake |
 | v0.5 Onboarding workflows + idempotency | ✅ | Onboarding/offboarding checklists with approval gates, `Idempotency-Key` support, delivery retries |
 | v1.0-preview Monitoring dashboard | ✅ | `/dashboard`: run success/failure, durations, queue/priority breakdowns, est. time saved |
-| v1.0 CI + Docker | ✅* | GitHub Actions (pytest, Python 3.10–3.13) and Docker Compose (API + PostgreSQL) — validated, Docker run pending a Docker-enabled machine |
+| v1.0 CI + Docker | ✅ | GitHub Actions runs pytest plus a Docker Compose API + PostgreSQL smoke test |
 | v0.6 Microsoft 365 actions | ⬜ | Real account creation via Power Automate / Microsoft Graph / PowerShell (needs credentials) |
 | v0.7 AI support agent | ⬜ | MCP/Claude assistance with human approval gates (needs AI credentials) |
 
@@ -93,10 +93,9 @@ Without this variable the app uses `sqlite:///data/flowops.db`. No dotenv depend
 ### Docker Compose (optional)
 
 The included compose file runs the API against PostgreSQL and exposes it at
-`http://127.0.0.1:8000`. Docker must be installed locally.
-**Note:** the files are syntax-validated but have not yet been exercised end to
-end (no Docker on the development machine) — verify with the `curl` below on
-first use.
+`http://127.0.0.1:8000`. Docker must be installed locally for this command.
+The same build and smoke test also run in the GitHub Actions
+`docker-postgres` job.
 
 ```bash
 docker compose up --build

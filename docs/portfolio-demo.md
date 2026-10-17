@@ -96,3 +96,8 @@ curl http://127.0.0.1:8000/health
 docker compose down
 ```
 
+The same build, startup, health check, and PostgreSQL-backed ticket request
+also run automatically in the `docker-postgres` GitHub Actions job. This keeps
+the deployment path verifiable even when Docker Desktop is not installed on a
+developer machine.
+

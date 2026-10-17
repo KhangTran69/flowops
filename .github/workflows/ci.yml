@@ -16,3 +16,28 @@ jobs:
         run: python -m pip install -r requirements.txt
       - name: Run offline tests
         run: pytest -q
+
+  docker-postgres:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and start the PostgreSQL demo stack
+        run: docker compose up --build --detach
+      - name: Show service status
+        run: docker compose ps
+      - name: Verify API health and PostgreSQL-backed intake
+        run: |
+          curl --fail --retry 20 --retry-delay 2 http://127.0.0.1:8000/health
+          response="$(curl --fail --silent --show-error \
+            -H 'Content-Type: application/json' \
+            -d '{"userId":7,"id":9901,"title":"VPN outage - all users cannot work","completed":false}' \
+            http://127.0.0.1:8000/tickets)"
+          echo "$response"
+          echo "$response" | grep -q '"priority":"urgent"'
+          echo "$response" | grep -q '"queue":"it-network"'
+      - name: Collect service logs
+        if: always()
+        run: docker compose logs
+      - name: Stop the stack
+        if: always()
+        run: docker compose down --volumes
