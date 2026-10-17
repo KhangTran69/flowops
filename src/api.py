@@ -1159,6 +1159,16 @@ def root(
     )
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon() -> Response:
+    """Return a minimal 1x1 transparent PNG favicon to avoid 404 noise."""
+    png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+        "0000000d49444154789c63600100000005000100c695a3d80000000049454e44ae426082"
+    )
+    return Response(content=png, media_type="image/png")
+
+
 @app.get("/health")
 def health() -> dict:
     """Liveness probe."""
