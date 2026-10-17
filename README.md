@@ -1,5 +1,7 @@
 # FlowOps
 
+[![CI](https://github.com/KhangTran69/flowops/actions/workflows/ci.yml/badge.svg)](https://github.com/KhangTran69/flowops/actions/workflows/ci.yml)
+
 FlowOps is an IT workflow automation platform. It receives support tickets and onboarding/offboarding requests, validates their data, classifies and routes them according to business rules, persists records, logs every workflow execution, and exposes a monitoring dashboard.
 
 > ⚠️ **This is a learning prototype, not a production ticketing system.** Sample data comes from [JSONPlaceholder](https://jsonplaceholder.typicode.com/), a free fake REST API. These are **simulated** tickets, not real IT support requests.
@@ -52,6 +54,7 @@ flowops/
 ├── Dockerfile                # Small API image
 ├── docker-compose.yml        # API + PostgreSQL demo stack
 ├── docs/portfolio-demo.md    # Guided interview/portfolio walkthrough
+├── docs/architecture.md      # Data flow and reliability boundaries
 ├── scripts/demo_smoke.sh     # Local end-to-end smoke test
 ├── .gitignore  .env.example  requirements.txt  README.md
 ```
@@ -80,6 +83,9 @@ the repeatable local smoke test is:
 ```bash
 ./scripts/demo_smoke.sh
 ```
+
+The high-level data flow and design boundaries are documented in
+[`docs/architecture.md`](docs/architecture.md).
 
 ### PostgreSQL (optional)
 
