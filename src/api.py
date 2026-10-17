@@ -32,6 +32,8 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from src import ai_agent, db, jobs, ui_session, web  # noqa: F401 - modules referenced at runtime
+from src import ai_agent, chatops, db, jobs, scheduler, ui_session, web, workflow, workflow_control
+from src import ai_agent, chatops, db, definitions, jobs, scheduler, timers, ui_session, web, workflow, workflow_control
 from src.actions import (
     ACTION_BY_STEP,
     ActionAdapter,
@@ -49,7 +51,7 @@ from src.auth import (
 from src import expressions, timers, workflow
 from src.m365_simulator import M365Simulator
 from src.notify import deliver_webhook
-from src.onboarding import checklist_for
+from src.onboarding import checklist_for, initial_status_for
 from src.routing import route_ticket
 from src.ticket_processor import normalize_ticket
 
@@ -742,6 +744,44 @@ class ChecklistItemOut(BaseModel):
     sla_remaining_minutes: Optional[int] = None
 
 
+class DefinitionCreateIn(BaseModel):
+    key: StrictStr
+    name: StrictStr
+    request_type: Literal["onboarding", "offboarding"]
+    steps: list[dict[str, Any]]
+
+
+class DefinitionVersionIn(BaseModel):
+    steps: list[dict[str, Any]]
+
+
+class DefinitionPublishIn(BaseModel):
+    version: StrictInt = Field(ge=1)
+
+
+class DefinitionMigrationIn(BaseModel):
+    version: StrictInt = Field(ge=1)
+    dry_run: StrictBool = True
+
+
+class DefinitionVersionOut(BaseModel):
+    version: int
+    checksum: str
+    steps: list[dict[str, Any]]
+    created_by: Optional[str] = None
+    created_at: datetime
+    published_at: Optional[datetime] = None
+
+
+class WorkflowDefinitionOut(BaseModel):
+    key: str
+    name: str
+    request_type: str
+    status: str
+    current_version: Optional[int] = None
+    versions: list[DefinitionVersionOut] = []
+
+
 class OnboardingRequestIn(BaseModel):
     """A manager's onboarding/offboarding request (v0.5)."""
 
@@ -806,6 +846,40 @@ class OnboardingRequestOut(BaseModel):
     definition_key: Optional[str] = None
     definition_version: Optional[int] = None
     checklist: list[ChecklistItemOut]
+
+
+class WorkflowStepRunOut(BaseModel):
+    id: int
+    checklist_item_id: int
+    attempt: int
+    status: str
+    job_id: Optional[int] = None
+    scheduled_at: datetime
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    output: Optional[dict] = None
+    error: Optional[str] = None
+
+
+class WorkflowEventOut(BaseModel):
+    id: int
+    event_type: str
+    step_run_id: Optional[int] = None
+    payload: Optional[dict] = None
+    created_at: datetime
+
+
+class WorkflowRunOut(BaseModel):
+    id: int
+    request_id: int
+    status: str
+    max_parallel: int
+    error: Optional[str] = None
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    steps: list[WorkflowStepRunOut] = []
+    events: list[WorkflowEventOut] = []
 
 
 class OnboardingStatusSummaryOut(BaseModel):
@@ -1128,12 +1202,15 @@ def metrics(session: Session = Depends(db.get_session)) -> Response:
     job_counts = Counter(job.status for job in job_records)
     lines.extend(
         [
-            "# HELP flowops_workflow_jobs Workflow jobs by state",
+            "flowops_workflow_jobs",
             "# TYPE flowops_workflow_jobs gauge",
         ]
     )
     for state in jobs.JOB_STATUSES:
         lines.append(f'flowops_workflow_jobs{{status="{state}"}} {job_counts.get(state, 0)}')
+    lines.append("# HELP flowops_workflow_job_attempts_total Total workflow job attempts")
+    lines.append("# TYPE flowops_workflow_job_attempts_total counter")
+    lines.append(f"flowops_workflow_job_attempts_total {sum(job.attempts for job in job_records)}")
 
     outbox = session.execute(select(db.NotificationOutboxRecord)).scalars().all()
     outbox_counts = Counter(item.status for item in outbox)
@@ -1179,6 +1256,34 @@ def metrics(session: Session = Depends(db.get_session)) -> Response:
         lines.append(
             f'flowops_ai_provider_errors_total{{provider="{provider}"}} {provider_errors[provider]}'
         )
+    runs = session.execute(select(db.WorkflowRunRecord)).scalars().all()
+    run_counts = Counter(run.status for run in runs)
+    lines.extend(
+        [
+            "# HELP flowops_dag_runs Workflow runs by status",
+            "# TYPE flowops_dag_runs gauge",
+        ]
+    )
+    for state in scheduler.RUN_STATUSES:
+        lines.append(f'flowops_dag_runs{{status="{state}"}} {run_counts.get(state, 0)}')
+    steps = session.execute(select(db.WorkflowStepRunRecord)).scalars().all()
+    step_counts = Counter(step.status for step in steps)
+    lines.extend(
+        [
+            "# HELP flowops_dag_steps Workflow step attempts by status",
+            "# TYPE flowops_dag_steps gauge",
+        ]
+    )
+    for state in ("scheduled", "running", "succeeded", "failed", "skipped", "cancelled"):
+        lines.append(f'flowops_dag_steps{{status="{state}"}} {step_counts.get(state, 0)}')
+    lines.extend(
+        [
+            "# HELP flowops_dag_scheduler_ticks_total Scheduler ticks by outcome",
+            "# TYPE flowops_dag_scheduler_ticks_total counter",
+        ]
+    )
+    for outcome, count in sorted(scheduler.TICK_COUNTS.items()):
+        lines.append(f'flowops_dag_scheduler_ticks_total{{outcome="{outcome}"}} {count}')
     lines.append(f"flowops_uptime_seconds {time.time() - _METRICS_STARTED:.1f}")
     return Response("\n".join(lines) + "\n", media_type="text/plain")
 
@@ -1523,6 +1628,122 @@ def get_ticket(
     return Ticket.model_validate(record, from_attributes=True)
 
 
+@app.post("/webhooks/actions/approve")
+def chatops_approve(
+    request: Request,
+    token: str = Query(...),
+    source: str = Query(default="webhook"),
+    session: Session = Depends(db.get_session),
+) -> dict[str, Any]:
+    """One-click ChatOps approval using a signed, single-use token."""
+    return _chatops_action(request, session, token, "approve", source, None)
+
+
+@app.post("/webhooks/actions/reject")
+def chatops_reject(
+    request: Request,
+    token: str = Query(...),
+    reason: Optional[str] = Query(default=None),
+    source: str = Query(default="webhook"),
+    session: Session = Depends(db.get_session),
+) -> dict[str, Any]:
+    """One-click ChatOps rejection with optional reason and cascade."""
+    return _chatops_action(request, session, token, "reject", source, reason)
+
+
+def _chatops_action(
+    request: Request,
+    session: Session,
+    token: str,
+    action: str,
+    source: str,
+    reason: Optional[str],
+) -> dict[str, Any]:
+    try:
+        claims = chatops.verify_token(token)
+    except chatops.ChatOpsUnavailable as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except chatops.ChatOpsError as error:
+        raise HTTPException(status_code=401, detail=str(error)) from error
+    if claims.action != action:
+        raise HTTPException(status_code=401, detail="ChatOps token is for a different action.")
+    record = session.get(db.OnboardingRequestRecord, claims.request_id)
+    item = session.get(db.ChecklistItemRecord, claims.item_id)
+    if record is None or item is None or item.request_id != record.id:
+        raise HTTPException(status_code=404, detail="Checklist item not found.")
+    if action == "approve" and item.status != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot approve an item with status '{item.status}'.",
+        )
+    if action == "reject" and item.status not in ("pending", "blocked", "approved"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot reject an item with status '{item.status}'.",
+        )
+    actor = f"chatops:{source if source in ('slack', 'teams', 'email') else 'webhook'}"
+    try:
+        session.add(
+            db.ChatOpsTokenUseRecord(
+                jti=claims.jti,
+                request_id=record.id,
+                item_id=item.id,
+                action=action,
+                actor_subject=actor,
+            )
+        )
+        session.flush()
+    except IntegrityError as error:
+        session.rollback()
+        raise HTTPException(status_code=409, detail="ChatOps token has already been used.") from error
+
+    if action == "approve":
+        item.status = "approved"
+        log_action = "onboarding.item.chatops_approved"
+    else:
+        item.status = "rejected"
+        log_action = "onboarding.item.chatops_rejected"
+    session.flush()
+    items = session.execute(
+        select(db.ChecklistItemRecord).where(
+            db.ChecklistItemRecord.request_id == record.id
+        )
+    ).scalars().all()
+    workflow.apply_graph_transitions(
+        session,
+        items,
+        request_id=record.id,
+        actor_subject=actor,
+        reason=reason,
+    )
+    timers.sync_timers(session, record.id)
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action=log_action,
+        status="success",
+        ticket_id=str(record.id),
+        duration_ms=0,
+        detail=(
+            f"step '{item.step}' via {actor}; "
+            f"status={item.status}; reason={reason or 'n/a'}"
+        ),
+        actor_subject=actor,
+        correlation_id=getattr(request.state, "correlation_id", None),
+    )
+    run = scheduler.get_run_for_request(session, record.id)
+    if run is not None:
+        scheduler.tick(session, run.id, worker_id="chatops", commit=False)
+    session.commit()
+    return {
+        "request_id": record.id,
+        "item_id": item.id,
+        "action": action,
+        "status": item.status,
+        "actor": actor,
+    }
+
+
 @app.post("/webhooks/intake")
 def webhook_intake(
     payload: TicketIntakeRequest | list[TicketIntakeRequest],
@@ -1791,6 +2012,7 @@ def _request_out(
         **{c: getattr(record, c) for c in (
             "id", "request_type", "employee_name", "employee_email",
             "department", "requester_id", "start_date", "status",
+            "definition_key", "definition_version",
         )},
         definition_key=record.definition_key,
         definition_version=record.definition_version,
@@ -1900,7 +2122,222 @@ def _load_request(
     items = session.execute(
         select(db.ChecklistItemRecord).where(db.ChecklistItemRecord.request_id == request_id)
     ).scalars().all()
+    timer_rows = session.execute(
+        select(db.WorkflowTimerRecord).where(
+            db.WorkflowTimerRecord.request_id == request_id,
+            db.WorkflowTimerRecord.status == "pending",
+        )
+    ).scalars().all()
+    by_item = {row.item_id: row for row in timer_rows}
+    now = db.utcnow()
+    for item in items:
+        timer = by_item.get(item.id)
+        if timer is not None:
+            due = timer.due_at
+            if due.tzinfo is None:
+                due = due.replace(tzinfo=timezone.utc)
+            item.overdue = due <= now
+            item.sla_remaining_minutes = max(
+                0, int((due - now).total_seconds() // 60)
+            )
+        else:
+            item.overdue = False
+            item.sla_remaining_minutes = None
     return record, list(items)
+
+
+def _definition_out(
+    session: Session, definition: db.WorkflowDefinitionRecord
+) -> WorkflowDefinitionOut:
+    versions = definitions.list_versions(session, definition.key)
+    return WorkflowDefinitionOut(
+        key=definition.key,
+        name=definition.name,
+        request_type=definition.request_type,
+        status=definition.status,
+        current_version=definition.current_version,
+        versions=[
+            DefinitionVersionOut(
+                version=row.version,
+                checksum=row.checksum,
+                steps=json.loads(row.steps_json),
+                created_by=row.created_by,
+                created_at=row.created_at,
+                published_at=row.published_at,
+            )
+            for row in versions
+        ],
+    )
+
+
+@app.post("/workflow-definitions", response_model=WorkflowDefinitionOut)
+def create_workflow_definition(
+    payload: DefinitionCreateIn,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowDefinitionOut:
+    try:
+        definition = definitions.create_definition(
+            session,
+            key=payload.key,
+            name=payload.name,
+            request_type=payload.request_type,
+            steps=payload.steps,
+            actor=actor.subject,
+        )
+    except definitions.DefinitionError as error:
+        raise HTTPException(422, str(error)) from error
+    session.commit()
+    return _definition_out(session, definition)
+
+
+@app.put("/workflow-definitions/{key}", response_model=WorkflowDefinitionOut)
+def create_workflow_definition_version(
+    key: str,
+    payload: DefinitionVersionIn,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowDefinitionOut:
+    try:
+        definitions.create_version(session, key, payload.steps, actor=actor.subject)
+        definition = definitions.get_definition(session, key)
+    except definitions.DefinitionError as error:
+        raise HTTPException(422, str(error)) from error
+    if definition is None:
+        raise HTTPException(404, "Definition not found.")
+    session.commit()
+    return _definition_out(session, definition)
+
+
+@app.post("/workflow-definitions/{key}/publish", response_model=WorkflowDefinitionOut)
+def publish_workflow_definition(
+    key: str,
+    payload: DefinitionPublishIn,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowDefinitionOut:
+    try:
+        definition = definitions.publish_version(
+            session, key, payload.version, actor=actor.subject
+        )
+    except definitions.DefinitionError as error:
+        raise HTTPException(422, str(error)) from error
+    session.commit()
+    return _definition_out(session, definition)
+
+
+@app.post("/onboarding-requests/{request_id}/definition")
+def migrate_definition(
+    request_id: int,
+    payload: DefinitionMigrationIn,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> dict[str, Any]:
+    """Preview or apply a safe move to another definition version."""
+    record, items = _load_request(session, request_id)
+    if not record.definition_key:
+        raise HTTPException(409, "Request is not pinned to a definition.")
+    definition = definitions.get_definition(session, record.definition_key)
+    target = definitions.get_version(session, record.definition_key, payload.version)
+    if definition is None or target is None:
+        raise HTTPException(404, "Definition version not found.")
+    target_steps = {step["key"]: step for step in json.loads(target.steps_json)}
+    existing = {item.step_key: item for item in items}
+    added = sorted(set(target_steps) - set(existing))
+    removed = sorted(set(existing) - set(target_steps))
+    changed = sorted(
+        key for key in set(existing) & set(target_steps)
+        if (existing[key].step, existing[key].queue, existing[key].depends_on_json)
+        != (
+            target_steps[key]["step"],
+            target_steps[key]["queue"],
+            json.dumps(target_steps[key].get("depends_on", [])),
+        )
+    )
+    diff = {
+        "from_version": record.definition_version,
+        "to_version": payload.version,
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+        "dry_run": payload.dry_run,
+        "statuses": {item.step_key: item.status for item in items},
+    }
+    if payload.dry_run:
+        return diff
+    for key in removed:
+        if existing[key].status == "completed":
+            raise HTTPException(
+                409, f"Cannot remove completed step {key!r} during migration."
+            )
+        session.delete(existing[key])
+    for key, step in target_steps.items():
+        item = existing.get(key)
+        if item is None:
+            item = db.ChecklistItemRecord(
+                request_id=record.id,
+                step_key=key,
+                step=step["step"],
+                queue=step["queue"],
+                requires_approval=bool(step.get("requires_approval", False)),
+                action=step.get("action", "none"),
+                status=initial_status_for(step),
+                depends_on_json=json.dumps(step.get("depends_on", [])),
+                join_mode=step.get("join", "all"),
+                when_json=json.dumps(step.get("when", [])),
+                sla_minutes=step.get("sla_minutes"),
+                escalation_queue=step.get("escalation_queue"),
+            )
+            session.add(item)
+        else:
+            item.step = step["step"]
+            item.queue = step["queue"]
+            item.requires_approval = bool(step.get("requires_approval", False))
+            item.action = step.get("action", "none")
+            item.depends_on_json = json.dumps(step.get("depends_on", []))
+            item.join_mode = step.get("join", "all")
+            item.when_json = json.dumps(step.get("when", []))
+            item.sla_minutes = step.get("sla_minutes")
+            item.escalation_queue = step.get("escalation_queue")
+    record.definition_version = payload.version
+    session.flush()
+    _, items = _load_request(session, record.id)
+    workflow.apply_graph_transitions(
+        session, items, request_id=record.id, actor_subject=actor.subject
+    )
+    timers.sync_timers(session, record.id)
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="onboarding.request.definition_migrated",
+        status="success",
+        ticket_id=str(record.id),
+        duration_ms=0,
+        detail=f"definition {record.definition_key} version {payload.version}",
+        actor_subject=actor.subject,
+    )
+    session.commit()
+    return diff
+
+
+@app.get("/workflow-definitions", response_model=list[WorkflowDefinitionOut])
+def list_workflow_definitions(
+    session: Session = Depends(db.get_session),
+) -> list[WorkflowDefinitionOut]:
+    return [
+        _definition_out(session, definition)
+        for definition in definitions.list_definitions(session)
+    ]
+
+
+@app.get("/workflow-definitions/{key}", response_model=WorkflowDefinitionOut)
+def get_workflow_definition(
+    key: str, session: Session = Depends(db.get_session)
+) -> WorkflowDefinitionOut:
+    definition = definitions.get_definition(session, key)
+    if definition is None:
+        raise HTTPException(404, "Definition not found.")
+    return _definition_out(session, definition)
 
 
 def _create_onboarding_request(
@@ -2129,6 +2566,142 @@ def get_onboarding_request_status(
 
 
 
+def _workflow_run_out(
+    session: Session, run: db.WorkflowRunRecord
+) -> WorkflowRunOut:
+    steps = session.execute(
+        select(db.WorkflowStepRunRecord)
+        .where(db.WorkflowStepRunRecord.run_id == run.id)
+        .order_by(db.WorkflowStepRunRecord.id)
+    ).scalars().all()
+    events = session.execute(
+        select(db.WorkflowEventRecord)
+        .where(db.WorkflowEventRecord.run_id == run.id)
+        .order_by(db.WorkflowEventRecord.id)
+    ).scalars().all()
+    return WorkflowRunOut(
+        id=run.id,
+        request_id=run.request_id,
+        status=run.status,
+        max_parallel=run.max_parallel,
+        error=run.error,
+        created_at=run.created_at,
+        started_at=run.started_at,
+        completed_at=run.completed_at,
+        steps=[
+            WorkflowStepRunOut(
+                id=row.id,
+                checklist_item_id=row.checklist_item_id,
+                attempt=row.attempt,
+                status=row.status,
+                job_id=row.job_id,
+                scheduled_at=row.scheduled_at,
+                started_at=row.started_at,
+                completed_at=row.completed_at,
+                output=json.loads(row.output_json) if row.output_json else None,
+                error=row.error,
+            )
+            for row in steps
+        ],
+        events=[
+            WorkflowEventOut(
+                id=event.id,
+                event_type=event.event_type,
+                step_run_id=event.step_run_id,
+                payload=json.loads(event.payload_json) if event.payload_json else None,
+                created_at=event.created_at,
+            )
+            for event in events
+        ],
+    )
+
+
+@app.post("/onboarding-requests/{request_id}/run", response_model=WorkflowRunOut)
+def start_workflow_run(
+    request_id: int,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowRunOut:
+    """Start the DAG orchestrator for a request (idempotent per request)."""
+    _load_request(session, request_id)
+    try:
+        run = scheduler.start_run(session, request_id, actor_subject=actor.subject)
+    except LookupError as error:
+        raise HTTPException(404, str(error)) from error
+    session.commit()
+    session.refresh(run)
+    return _workflow_run_out(session, run)
+
+
+@app.get("/onboarding-requests/{request_id}/run", response_model=WorkflowRunOut)
+def get_workflow_run(
+    request_id: int,
+    session: Session = Depends(db.get_session),
+) -> WorkflowRunOut:
+    run = scheduler.get_run_for_request(session, request_id)
+    if run is None:
+        raise HTTPException(404, "Workflow run not found.")
+    return _workflow_run_out(session, run)
+
+
+@app.get("/workflow-runs", response_model=list[WorkflowRunOut])
+def list_workflow_runs(
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    session: Session = Depends(db.get_session),
+) -> list[WorkflowRunOut]:
+    query = select(db.WorkflowRunRecord).order_by(db.WorkflowRunRecord.id.desc())
+    if status_filter:
+        query = query.where(db.WorkflowRunRecord.status == status_filter)
+    runs = session.execute(query.offset(offset).limit(limit)).scalars().all()
+    return [_workflow_run_out(session, run) for run in runs]
+
+
+def _run_action(
+    session: Session, run_id: int, actor: Actor, action: str
+) -> WorkflowRunOut:
+    try:
+        if action == "pause":
+            run = scheduler.pause_run(session, run_id, actor.subject)
+        elif action == "resume":
+            run = scheduler.resume_run(session, run_id, actor.subject)
+        else:
+            run = scheduler.cancel_run(session, run_id, actor.subject)
+    except LookupError as error:
+        raise HTTPException(404, str(error)) from error
+    session.commit()
+    session.refresh(run)
+    return _workflow_run_out(session, run)
+
+
+@app.post("/workflow-runs/{run_id}/pause", response_model=WorkflowRunOut)
+def pause_workflow_run(
+    run_id: int,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowRunOut:
+    return _run_action(session, run_id, actor, "pause")
+
+
+@app.post("/workflow-runs/{run_id}/resume", response_model=WorkflowRunOut)
+def resume_workflow_run(
+    run_id: int,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowRunOut:
+    return _run_action(session, run_id, actor, "resume")
+
+
+@app.post("/workflow-runs/{run_id}/cancel", response_model=WorkflowRunOut)
+def cancel_workflow_run(
+    run_id: int,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowRunOut:
+    return _run_action(session, run_id, actor, "cancel")
+
+
 @app.get("/ui/tickets", response_class=HTMLResponse, include_in_schema=False)
 def ui_tickets(
     request: Request, session: Session = Depends(db.get_session)
@@ -2253,16 +2826,98 @@ def ui_onboarding_request(
             )
         raise
     completed = sum(1 for item in items if item.status == "completed")
+    run = scheduler.get_run_for_request(session, record.id)
+    run_view = _workflow_run_out(session, run) if run is not None else None
+    by_key = {workflow.state_key(item): item for item in items}
+    item_views = []
+    for item in sorted(items, key=lambda entry: entry.id):
+        dependencies = workflow.dependencies_of(item)
+        links = (
+            chatops.approval_urls(record.id, item.id)
+            if item.requires_approval and item.status == "pending"
+            else {}
+        )
+        item_views.append(
+            {
+                "item": item,
+                "depends_on_names": [
+                    by_key[key].step for key in dependencies if key in by_key
+                ],
+                "missing": workflow.missing_prerequisites(item, items),
+                "output": workflow.step_output(item),
+                "chatops": links,
+            }
+        )
     return web.render(
         request,
         "onboarding_detail.html",
         {
             "active": "onboarding",
             "request_record": record,
+            "item_views": item_views,
             "items": sorted(items, key=lambda item: item.id),
             "completed": completed,
             "total": len(items),
+            "run": run_view,
         },
+    )
+
+
+@app.get("/ui/workflow-definitions", response_class=HTMLResponse, include_in_schema=False)
+def ui_workflow_definitions(
+    request: Request, session: Session = Depends(db.get_session)
+) -> HTMLResponse:
+    rows = [
+        _definition_out(session, definition)
+        for definition in definitions.list_definitions(session)
+    ]
+    return web.render(
+        request, "workflow_definitions.html", {"active": "definitions", "definitions": rows}
+    )
+
+
+@app.get(
+    "/ui/workflow-definitions/{key}",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+)
+def ui_workflow_definition(
+    request: Request, key: str, session: Session = Depends(db.get_session)
+) -> HTMLResponse:
+    definition = definitions.get_definition(session, key)
+    if definition is None:
+        return web.render(request, "404.html", {"active": "definitions"}, status_code=404)
+    return web.render(
+        request,
+        "workflow_definition.html",
+        {"active": "definitions", "definition": _definition_out(session, definition)},
+    )
+
+
+@app.get("/ui/workflow-runs", response_class=HTMLResponse, include_in_schema=False)
+def ui_workflow_runs(
+    request: Request,
+    status: Optional[str] = Query(default=None),
+    session: Session = Depends(db.get_session),
+) -> HTMLResponse:
+    """Operator view of DAG runs and their step attempts."""
+    query = select(db.WorkflowRunRecord).order_by(db.WorkflowRunRecord.id.desc())
+    if status:
+        query = query.where(db.WorkflowRunRecord.status == status)
+    runs = session.execute(query.limit(100)).scalars().all()
+    rows = []
+    for run in runs:
+        record = session.get(db.OnboardingRequestRecord, run.request_id)
+        rows.append(
+            {
+                "run": _workflow_run_out(session, run),
+                "employee_name": record.employee_name if record else "—",
+            }
+        )
+    return web.render(
+        request,
+        "workflow_runs.html",
+        {"active": "workflow_runs", "runs": rows, "status_filter": status or ""},
     )
 
 
@@ -2406,10 +3061,11 @@ def _transition_item(
     session: Session,
     request_id: int,
     item_id: int,
+    request: Request,
     action: Literal["approve", "complete"],
     actor_subject: Optional[str] = None,
 ) -> OnboardingRequestOut:
-    record, _ = _load_request(session, request_id)
+    record, items = _load_request(session, request_id)
     item = _get_item(session, record, item_id)
 
     if action == "approve":
@@ -2420,6 +3076,11 @@ def _transition_item(
         item.status = "approved"
     else:
         allowed_from = "approved" if item.requires_approval else "pending"
+        missing = workflow.missing_prerequisites(item, items)
+        if missing:
+            raise HTTPException(
+                409, workflow.blocked_status_detail(item, missing)
+            )
         if item.status != allowed_from:
             raise HTTPException(
                 409,
@@ -2428,6 +3089,12 @@ def _transition_item(
             )
         item.status = "completed"
     session.flush()
+
+    if action == "complete":
+        workflow.apply_graph_transitions(
+            session, items, request_id=record.id, actor_subject=actor_subject
+        )
+        timers.sync_timers(session, record.id)
 
     db.log_execution(
         session,
@@ -2452,17 +3119,21 @@ def _transition_item(
             actor_subject=actor_subject,
         )
     _, items = _load_request(session, record.id)
+    run = scheduler.get_run_for_request(session, record.id)
+    if run is not None:
+        scheduler.tick(session, run.id, worker_id="manual-transition", commit=False)
     return _request_out(record, items)
-
-
 
 
 def _execute_item(
     session: Session, request_id: int, item_id: int, actor: Actor
 ) -> OnboardingRequestOut:
     """Run one approved checklist action with bounded retries."""
-    record, _ = _load_request(session, request_id)
+    record, items = _load_request(session, request_id)
     item = _get_item(session, record, item_id)
+    missing = workflow.missing_prerequisites(item, items)
+    if missing:
+        raise HTTPException(409, workflow.blocked_status_detail(item, missing))
     required_status = "approved" if item.requires_approval else "pending"
     if item.status != required_status:
         raise HTTPException(
@@ -2480,6 +3151,7 @@ def _execute_item(
         "department": record.department,
         "actor_subject": actor.subject,
         "actor_roles": list(actor.roles),
+        **workflow.action_context_outputs(item, items),
     }
     correlation_id = _new_run_id()
     started_at = db.utcnow()
@@ -2505,7 +3177,11 @@ def _execute_item(
                 duration_ms=int((time.perf_counter() - started) * 1000),
             ))
             item.status = "completed"
+            workflow.record_output(item, result.output)
             session.flush()
+            workflow.apply_graph_transitions(
+                session, items, request_id=record.id, actor_subject=actor.subject
+            )
             db.log_execution(
                 session,
                 run_id=_new_run_id(),
@@ -2546,6 +3222,10 @@ def _execute_item(
                 duration_ms=int((time.perf_counter() - started) * 1000),
             ))
 
+    item.status = "failed"
+    workflow.apply_graph_transitions(
+        session, items, request_id=record.id, actor_subject=actor.subject
+    )
     _notify_action_failure(action, context, attempts_limit, last_error, session)
     db.log_execution(
         session,
@@ -2592,17 +3272,21 @@ def list_action_executions(
 def approve_item(
     request_id: int,
     item_id: int,
+    request: Request,
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
 ) -> OnboardingRequestOut:
     """Approve a checklist step that requires human sign-off."""
-    return _transition_item(session, request_id, item_id, "approve", actor.subject)
+    return _transition_item(
+        session, request_id, item_id, request, "approve", actor.subject
+    )
 
 
 @app.post("/onboarding-requests/{request_id}/items/{item_id}/complete")
 def complete_item(
     request_id: int,
     item_id: int,
+    request: Request,
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
 ) -> OnboardingRequestOut:
@@ -2625,7 +3309,7 @@ def complete_item(
             "(idempotent completion ledger).",
         )
     return _transition_item(
-        session, request_id, item_id, "complete", actor.subject
+        session, request_id, item_id, request, "complete", actor.subject
     )
 
 
@@ -2821,6 +3505,35 @@ def complete_offboarding_step(
             )
 
     item = next(i for i in items if i.step_key == step_key)
+    missing = workflow.missing_prerequisites(item, items)
+    if missing:
+        log("rejected", "failure", f"unmet prerequisites: {', '.join(missing)}")
+        session.execute(
+            delete(table).where(
+                table.id == claim.id,
+                table.status == "running",
+                table.owner_token == owner_token,
+            )
+        )
+        session.commit()
+        raise HTTPException(
+            409,
+            f"Step '{step_key}' is blocked by incomplete prerequisites: "
+            f"{', '.join(missing)}.",
+        )
+    if item.status == "skipped":
+        log("rejected", "failure", "step was skipped by a predicate")
+        session.execute(
+            delete(table).where(
+                table.id == claim.id,
+                table.status == "running",
+                table.owner_token == owner_token,
+            )
+        )
+        session.commit()
+        raise HTTPException(
+            409, f"Step '{step_key}' was skipped by a workflow predicate."
+        )
     if item.requires_approval and item.status != "approved":
         log("rejected", "failure", f"step requires approval (status '{item.status}')")
         session.execute(
@@ -2882,6 +3595,15 @@ def complete_offboarding_step(
                 db.ChecklistItemRecord.request_id == checklist_id
             )
         ).scalars().all()
+        workflow.apply_graph_transitions(
+            session, all_items, request_id=checklist_id, actor_subject=actor.subject
+        )
+        timers.sync_timers(session, checklist_id)
+        all_items = session.execute(
+            select(db.ChecklistItemRecord).where(
+                db.ChecklistItemRecord.request_id == checklist_id
+            )
+        ).scalars().all()
         if all(i.status == "completed" for i in all_items) and record.status != "completed":
             record.status = "completed"
             db.log_execution(
@@ -2938,14 +3660,18 @@ def get_m365_status(user_id: str) -> M365StatusOut:
 def enqueue_onboarding_item_job(
     request_id: int,
     item_id: int,
+    request: Request,
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
 ) -> WorkflowJobOut:
     """Queue one onboarding checklist action for a durable worker."""
-    record, _ = _load_request(session, request_id)
+    record, items = _load_request(session, request_id)
     item = _get_item(session, record, item_id)
     if item.status == "completed":
         raise HTTPException(409, "Checklist item is already completed.")
+    missing = workflow.missing_prerequisites(item, items)
+    if missing:
+        raise HTTPException(409, workflow.blocked_status_detail(item, missing))
     required_status = "approved" if item.requires_approval else "pending"
     if item.status != required_status:
         raise HTTPException(
@@ -2954,14 +3680,14 @@ def enqueue_onboarding_item_job(
             f"(current status: '{item.status}').",
         )
     action = action_for_step(item.step)
-    job = jobs.enqueue_job(
+    job = workflow_control.enqueue_onboarding_item(
         session,
-        job_type=jobs.JOB_ONBOARDING_ITEM,
-        payload={"request_id": record.id, "item_id": item.id, "action": action},
-        idempotency_key=f"onboarding:{record.id}:{item.id}",
-        resource_type="onboarding",
-        resource_id=str(record.id),
+        request_id=record.id,
+        item_id=item.id,
+        action=action,
         label=f"{record.employee_name}: {item.step}",
+        actor_subject=actor.subject,
+        correlation=getattr(request.state, "correlation_id", None),
     )
     db.log_execution(
         session,
@@ -2972,6 +3698,7 @@ def enqueue_onboarding_item_job(
         duration_ms=0,
         detail=f"job #{job.id} ({action}) queued for item #{item.id}",
         actor_subject=actor.subject,
+        correlation_id=getattr(request.state, "correlation_id", None),
     )
     session.commit()
     return WorkflowJobOut.model_validate(job)
@@ -3004,6 +3731,16 @@ def get_workflow_job(
     return WorkflowJobOut.model_validate(job)
 
 
+@app.get("/workflow-jobs/{job_id}/history", response_model=list[ActionExecutionOut])
+def workflow_job_history(
+    job_id: int, session: Session = Depends(db.get_session)
+) -> list[ActionExecutionOut]:
+    """Return every durable worker attempt for a workflow job."""
+    try:
+        records = workflow_control.history(session, job_id)
+    except LookupError as error:
+        raise HTTPException(404, str(error)) from error
+    return [ActionExecutionOut.model_validate(record, from_attributes=True) for record in records]
 @app.post("/workflow-jobs/{job_id}/retry", response_model=WorkflowJobOut)
 def retry_workflow_job(
     job_id: int,

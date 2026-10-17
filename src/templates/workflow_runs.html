@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Workflow runs — FlowOps{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div><span class="eyebrow">Orchestrator</span><h1>Workflow runs</h1><p class="muted">Automatic DAG execution, step attempts, and events.</p></div>
+</section>
+<section class="panel">
+  <div class="panel-head"><h2>Runs</h2><span class="muted small">Newest first</span></div>
+  {% if runs %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Run</th><th>Request</th><th>Employee</th><th>Status</th><th>Steps</th><th>Started</th></tr></thead>
+    <tbody>{% for row in runs %}<tr>
+      <td>#{{ row.run.id }}</td><td>#{{ row.run.request_id }}</td><td>{{ row.employee_name }}</td>
+      <td><span class="badge {{ 'ok' if row.run.status == 'completed' else ('fail' if row.run.status in ('failed','cancelled') else 'info') }}">{{ row.run.status }}</span></td>
+      <td>{{ row.run.steps | length }}</td><td>{{ row.run.started_at or '—' }}</td>
+    </tr>{% endfor %}</tbody>
+  </table></div>
+  {% else %}<p class="empty">No workflow runs yet. Start one from an onboarding request.</p>{% endif %}
+</section>
+{% endblock %}

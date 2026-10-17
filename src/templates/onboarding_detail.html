@@ -13,6 +13,29 @@
   </div>
 </section>
 
+{% if run %}
+<section class="panel">
+  <div class="panel-head">
+    <h2>Workflow run</h2>
+    <span class="badge {{ 'ok' if run.status == 'completed' else ('fail' if run.status in ('failed','cancelled') else 'info') }}">{{ run.status }}</span>
+  </div>
+  <p class="muted small">Automatic DAG scheduler · max parallel {{ run.max_parallel }} · run #{{ run.id }}</p>
+  <div class="toolbar">
+    {% if run.status == 'running' %}<button class="button small ghost" type="button" data-action-url="/workflow-runs/{{ run.id }}/pause" data-method="POST" data-reload="true">Pause</button>{% endif %}
+    {% if run.status in ('paused','failed') %}<button class="button small" type="button" data-action-url="/workflow-runs/{{ run.id }}/resume" data-method="POST" data-reload="true">Resume</button>{% endif %}
+    {% if run.status not in ('completed','cancelled') %}<button class="button small ghost" type="button" data-action-url="/workflow-runs/{{ run.id }}/cancel" data-method="POST" data-reload="true" data-confirm="Cancel this run and its queued jobs?">Cancel</button>{% endif %}
+    <a class="button small ghost" href="/ui/workflow-runs">All runs</a>
+  </div>
+  {% if run.steps %}
+  <div class="table-wrap"><table><thead><tr><th>Step item</th><th>Attempt</th><th>Status</th><th>Output / error</th></tr></thead><tbody>
+    {% for step in run.steps %}<tr><td>#{{ step.checklist_item_id }}</td><td>{{ step.attempt }}</td><td><span class="badge {{ 'ok' if step.status == 'succeeded' else ('fail' if step.status == 'failed' else 'info') }}">{{ step.status }}</span></td><td>{% if step.output %}<code>{{ step.output }}</code>{% elif step.error %}<span class="fail">{{ step.error }}</span>{% else %}—{% endif %}</td></tr>{% endfor %}
+  </tbody></table></div>
+  {% endif %}
+</section>
+{% else %}
+<section class="panel"><div class="panel-head"><h2>Workflow run</h2><button class="button small" type="button" data-action-url="/onboarding-requests/{{ request_record.id }}/run" data-method="POST" data-reload="true">Start automatic run</button></div><p class="muted small">Run the DAG automatically, respecting approval gates.</p></section>
+{% endif %}
+
 <section class="panel">
   <div class="panel-head">
     <h2>Checklist</h2>
@@ -22,26 +45,36 @@
     <table>
       <thead><tr><th>#</th><th>Step</th><th>Queue</th><th>Approval</th><th>Status</th><th>Actions</th></tr></thead>
       <tbody>
-        {% for item in items %}
+        {% for row in item_views %}
+        {% set item = row.item %}
         <tr>
           <td>{{ loop.index }}</td>
-          <td>{{ item.step }}</td>
+          <td>
+            {{ item.step }}
+            {% if row.depends_on_names %}<div class="muted small">Depends on: {{ row.depends_on_names | join(', ') }}</div>{% endif %}
+            {% if row.missing %}<div class="muted small">Waiting on prerequisites: {{ row.missing | join(', ') }}</div>{% endif %}
+            {% if row.output %}<details class="small"><summary>Step output</summary><pre>{{ row.output | tojson }}</pre></details>{% endif %}
+          </td>
           <td>{{ item.queue }}</td>
           <td>{{ 'Required' if item.requires_approval else 'Not required' }}</td>
-          <td><span class="badge {{ 'ok' if item.status == 'completed' else ('info' if item.status == 'approved' else '') }}">{{ item.status }}</span></td>
+          <td><span class="badge {{ 'ok' if item.status == 'completed' else ('info' if item.status == 'approved' else ('fail' if item.status in ('failed','rejected','cascade_blocked') else '')) }}">{{ item.status }}</span>{% if item.overdue %}<span class="badge fail">Overdue</span>{% endif %}{% if item.sla_remaining_minutes is not none and not item.overdue %}<div class="muted small">SLA: {{ item.sla_remaining_minutes }} min</div>{% endif %}{% if item.status == 'blocked' %}<div class="muted small">Waiting on prerequisites</div>{% endif %}</td>
           <td class="actions">
             {% if item.requires_approval and item.status == 'pending' %}
             <button class="button small" type="button" data-action-url="/onboarding-requests/{{ request_record.id }}/items/{{ item.id }}/approve" data-method="POST" data-reload="true">Approve</button>
+            {% if row.chatops %}
+            <form method="post" action="{{ row.chatops.approve_url }}" class="inline-form"><button class="button small ghost" type="submit">ChatOps approve</button></form>
+            <form method="post" action="{{ row.chatops.reject_url }}" class="inline-form"><button class="button small ghost" type="submit">ChatOps reject</button></form>
+            {% endif %}
             {% endif %}
             {% if request_record.request_type == 'offboarding' %}
               {% if item.step_key and ((item.requires_approval and item.status == 'approved') or (not item.requires_approval and item.status == 'pending')) %}
               {% if actor and 'automation.admin' in actor.roles %}<button class="button small" type="button" data-action-url="/offboarding-requests/{{ request_record.id }}/steps/{{ item.step_key }}/complete" data-method="POST" data-reload="true" data-confirm="Run this destructive offboarding step?">Complete</button>{% else %}<span class="muted small">admin only</span>{% endif %}
               {% endif %}
             {% else %}
-              {% if (item.requires_approval and item.status == 'approved') or (not item.requires_approval and item.status == 'pending') %}
+              {% if not row.missing and ((item.requires_approval and item.status == 'approved') or (not item.requires_approval and item.status == 'pending')) %}
               <button class="button small" type="button" data-action-url="/onboarding-requests/{{ request_record.id }}/items/{{ item.id }}/complete" data-method="POST" data-reload="true">Complete</button>
               {% endif %}
-              {% if item.status in ('approved', 'pending') %}
+              {% if not row.missing and item.status in ('approved', 'pending') %}
               <button class="button small ghost" type="button" data-action-url="/onboarding-requests/{{ request_record.id }}/items/{{ item.id }}/execute" data-method="POST" data-reload="true" data-confirm="Run the simulated action for this step?">Execute</button>
               {% endif %}
             {% endif %}

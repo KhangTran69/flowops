@@ -90,6 +90,46 @@ ticket content as untrusted data. Provider output is schema-validated and
 allowlisted; only queue/priority can become applicable. AI metrics are exposed
 at `/metrics`, and the golden evaluation suite runs offline.
 
+## Workflow DAG and ChatOps
+
+Checklist rows persist `depends_on_json` and structured `output_json`.
+`src/onboarding.py` owns pure graph rules; `src/workflow.py` applies them to
+rows and aggregates prerequisite outputs into downstream action contexts.
+Blocked steps require every prerequisite to be `completed`; terminal failures
+cascade dependents to `cascade_blocked`. ChatOps approve/reject tokens are
+HMAC-SHA256 signed, action-bound, expire after 24 hours, and are recorded once
+in `chatops_token_uses` for replay protection.
+
+`onboarding-dag` is the only selectable graph template. Offboarding keeps its
+flat template on purpose: that flow completes through the idempotent
+`offboarding_completions` ledger, which authorises a step by approval state
+rather than by graph edges, so a DAG template there would let a `blocked`
+dependent step complete out of order. Teaching the ledger about edges is the
+follow-up; `OFFBOARDING_DAG_SHAPE` records the intended graph.
+
+The built-in simulated adapter returns no structured identifiers, so a demo
+run stores `{}` outputs. The piping contract is exercised with adapter doubles
+in `tests/test_workflow_dag.py` and by the Graph / Power Automate adapters,
+which can return real payloads once credentials are configured.
+
+## Versioned definitions and SLA timers (v1.3)
+
+Workflow graphs can be stored as immutable versions in
+`workflow_definitions`/`workflow_definition_versions`; requests pin a version
+at creation. `src/expressions.py` parses predicates without `eval`, and the
+resolver supports `all`/`any` joins with false predicates becoming `skipped`.
+`workflow_timers` and `src/timers.py` use leased, conditional updates to fire
+SLA alarms once and enqueue escalation notices.
+
+## Workflow orchestrator (v1.2)
+
+`src/scheduler.py` leases a `workflow_runs` row, resolves readiness from the
+DAG, and enqueues steps via the existing `workflow_jobs` table. Every attempt
+is recorded in `workflow_step_runs`; `workflow_events` is append-only. Run
+leases fence concurrent schedulers and can be taken over after expiry. The
+scheduler never auto-approves gated steps. Worker completion/failure triggers
+immediate advancement, with polling as recovery.
+
 ## Secure operator console
 
 The JSON API keeps bearer auth. When `FLOWOPS_UI_AUTH_REQUIRED=true`, the HTML

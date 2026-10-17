@@ -21,7 +21,7 @@ from typing import Any, Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from src import db, jobs
+from src import db, jobs, scheduler, workflow
 from src.actions import (
     ActionAdapter,
     ActionResult,
@@ -138,6 +138,14 @@ def _complete_onboarding_job(
     if item.status == "completed":
         return {"already_completed": True, "item_id": item.id}
 
+    items = session.execute(
+        select(db.ChecklistItemRecord).where(
+            db.ChecklistItemRecord.request_id == request.id
+        )
+    ).scalars().all()
+    missing = workflow.missing_prerequisites(item, items)
+    if missing:
+        raise _PermanentJobError(workflow.blocked_status_detail(item, missing))
     required_status = "approved" if item.requires_approval else "pending"
     if item.status != required_status:
         raise _PermanentJobError(
@@ -155,6 +163,7 @@ def _complete_onboarding_job(
         "department": request.department,
         "idempotency_key": idempotency_key,
         "job_id": job.id,
+        **workflow.action_context_outputs(item, items),
     }
     interval = heartbeat_interval
     if interval is None:
@@ -164,7 +173,11 @@ def _complete_onboarding_job(
     ):
         adapter_result: ActionResult = ACTION_ADAPTER.execute(action, context)
     item.status = "completed"
+    workflow.record_output(item, adapter_result.output)
     session.flush()
+    workflow.apply_graph_transitions(
+        session, items, request_id=request.id, actor_subject=job.lease_owner_token
+    )
 
     items = session.execute(
         select(db.ChecklistItemRecord).where(
@@ -203,12 +216,39 @@ def _complete_onboarding_job(
     if not finished:
         session.rollback()
         return {"fenced": True, "item_id": item.id}
+    scheduler.advance_from_job(
+        session, job, success=True, output=adapter_result.output
+    )
     session.commit()
     return {"action": action, "item_id": item.id}
 
 
 class _PermanentJobError(Exception):
     """A failure that should not be retried (invalid state or missing data)."""
+
+
+def _cascade_terminal_failure(session: Session, payload: dict[str, Any]) -> None:
+    """Mark a terminally failed item and cascade its dependents."""
+    item_id = payload.get("item_id")
+    request_id = payload.get("request_id")
+    if item_id is None or request_id is None:
+        return
+    item = session.get(db.ChecklistItemRecord, int(item_id))
+    if item is None or item.status == "completed":
+        return
+    item.status = "failed"
+    items = session.execute(
+        select(db.ChecklistItemRecord).where(
+            db.ChecklistItemRecord.request_id == int(request_id)
+        )
+    ).scalars().all()
+    workflow.apply_graph_transitions(
+        session,
+        items,
+        request_id=int(request_id),
+        actor_subject="workflow-worker",
+        reason="terminal job failure",
+    )
 
 
 def _notify_worker_failure(
@@ -299,6 +339,10 @@ def _execute_job(
             retryable=True,
         )
         if status == "failed":
+            _cascade_terminal_failure(session, payload)
+            scheduler.advance_from_job(
+                session, reloaded, success=False, error=str(error)
+            )
             _notify_worker_failure(session, reloaded, payload, str(error))
         session.commit()
         return status or "fenced"

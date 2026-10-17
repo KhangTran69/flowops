@@ -29,6 +29,9 @@ FlowOps is an IT workflow automation platform. It receives support tickets and o
 | v1.0 Reliability: durable workflow jobs | ✅ | Leased worker queue with retries, dead-letter, operator retry/cancel |
 | v1.0 Security: auth, roles, audit | ✅ | Optional bearer/Entra auth, role checks, webhook API key, actor attribution |
 | v1.1 Secure operator console | ✅ | Signed session login, CSRF-protected UI actions, role-aware controls, login/logout audit |
+| v1.1 Workflow DAG engine | ✅ | Step dependencies, blocked/cascade states, output piping, signed single-use ChatOps approvals |
+| v1.2 Workflow orchestrator | ✅ | DB-backed run/step/event ledger, leased scheduler, parallel ready steps, pause/resume/cancel, DAG metrics |
+| v1.3 Versioned definitions | ✅ | Immutable workflow versions, safe predicates, all/any joins, SLA timers, runtime migration |
 | v0.6.1 Offboarding completion ledger | ✅ | Admin-only, claim-before-execute, idempotent replay, stale-claim takeover, ledger-backed offboarding |
 | v1.0 Operations: readiness, metrics, migrations | ✅ | `/ready`, `/metrics`, correlation IDs, Alembic baseline, container migration entrypoint |
 | v1.0 CI + Docker | ✅ | GitHub Actions runs pytest, a Docker Compose API + PostgreSQL smoke test, and PostgreSQL reliability tests |
@@ -313,6 +316,70 @@ Offboarding is destructive, so it uses a dedicated admin-only ledger endpoint:
   the ledger endpoint for offboarding steps, and the dashboard shows
   offboarding progress.
 
+## Workflow DAG and ChatOps approvals (v1.1)
+
+Checklist templates can declare `depends_on` prerequisites. The default
+`onboarding-standard`/`offboarding-standard` templates stay flat for backward
+compatibility; opt into `onboarding-dag` or `offboarding-dag` with
+`"template": "..."` when creating a request.
+
+- Steps with unmet prerequisites start as `blocked`; completing all
+  prerequisites promotes them to `pending` (or `approved` for gated steps).
+- A failed, rejected, or cancelled prerequisite cascades dependents to
+  `cascade_blocked`.
+- Structured action outputs are persisted in `output_json` and passed to
+  downstream actions as `context["prerequisite_outputs"]` and
+  `context["upstream_outputs"]`.
+- `POST /webhooks/actions/approve?token=...` and
+  `POST /webhooks/actions/reject?token=...` accept HMAC-SHA256 tokens bound to
+  request/item/action with a 24-hour TTL. Tokens are single-use
+  (`chatops_token_uses`) and log actor `chatops:slack`, `chatops:teams`,
+  `chatops:email`, or `chatops:webhook`.
+- Set `FLOWOPS_CHATOPS_SECRET` to enable links. The operator detail page shows
+  dependency badges, blocker state, step outputs, and ChatOps buttons.
+- Tests: `tests/test_workflow_dag.py` (offline).
+
+## Workflow orchestrator (v1.2)
+
+`src/scheduler.py` adds a DB-backed orchestrator on top of the v1.1 DAG:
+
+- `workflow_runs`, `workflow_step_runs`, and `workflow_events` are migration
+  `0007_workflow_orchestrator`.
+- Starting a run enqueues every ready non-gated step in parallel, bounded by
+  `FLOWOPS_DAG_MAX_PARALLEL`.
+- Gated steps are never auto-approved; operator/ChatOps approval makes them
+  schedulable.
+- Worker completion/failure advances the run immediately; polling is only a
+  recovery path.
+- Run leases (`FLOWOPS_DAG_LEASE_SECONDS`) fence scheduler ticks; stale leases
+  can be taken over.
+- `POST /onboarding-requests/{id}/run`, `GET .../run`,
+  `POST /workflow-runs/{id}/pause|resume|cancel`, `GET /workflow-runs`.
+- `python -m src.scheduler --once` or `--poll --interval 2`.
+- `/ui/workflow-runs` and the onboarding detail page show run/step state,
+  attempts, outputs, and pause/resume/cancel controls.
+- `/metrics` exposes `flowops_dag_runs`, `flowops_dag_steps`, and
+  `flowops_dag_scheduler_ticks_total`.
+
+## Versioned workflows and SLA timers (v1.3)
+
+Workflow definitions can be stored as immutable versions (migration `0008_workflow_definitions`):
+
+- `POST /workflow-definitions`, `PUT /workflow-definitions/{key}`,
+  `POST /workflow-definitions/{key}/publish`, `GET /workflow-definitions`.
+- Requests pin `definition_key`/`definition_version` at creation; publishing a
+  new version never mutates in-flight work.
+- Steps support `join: all|any`, safe `when` predicates evaluated by
+  `src/expressions.py`, and `sla_minutes`.
+- False predicates mark a step `skipped`; unknown identifiers fail closed.
+- `workflow_timers` plus `src/timers.py` fire leased, conditional SLA alarms,
+  write `onboarding.step.overdue`, enqueue escalation notices, and can reassign
+  the queue. Run `python -m src.timers --once` or `--poll`.
+- `POST /onboarding-requests/{id}/definition` previews/applies a safe version
+  migration while preserving completed outputs.
+- Definition pages: `/ui/workflow-definitions`; request detail shows overdue/SLA
+  badges and skip state.
+
 ## Operator UI
 
 The HTML UI is server-rendered with Jinja2 templates and local CSS/vanilla JS
@@ -391,7 +458,7 @@ No real secrets or Microsoft tenant are included.
 ## Running the tests
 
 ```bash
-pytest    # 218 passed, 13 skipped locally; the skips are PostgreSQL-only tests
+pytest    # 292 passed, 15 skipped locally; the skips are PostgreSQL-only tests
 python -m compileall -q src tests
 ```
 
