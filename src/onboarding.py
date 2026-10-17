@@ -14,27 +14,45 @@ class ChecklistStep(TypedDict):
     step: str
     queue: str
     requires_approval: bool
+    action: str  # which automation runs when this step is completed
 
 
 ONBOARDING_STEPS: tuple[ChecklistStep, ...] = (
-    {"step": "Create user account", "queue": "it-access-management", "requires_approval": True},
-    {"step": "Provision laptop and peripherals", "queue": "it-hardware", "requires_approval": False},
-    {"step": "Grant software licenses", "queue": "it-software", "requires_approval": True},
-    {"step": "Configure email mailbox", "queue": "it-messaging", "requires_approval": False},
+    {"step": "Create user account", "queue": "it-access-management", "requires_approval": True, "action": "none"},
+    {"step": "Provision laptop and peripherals", "queue": "it-hardware", "requires_approval": False, "action": "none"},
+    {"step": "Grant software licenses", "queue": "it-software", "requires_approval": True, "action": "none"},
+    {"step": "Configure email mailbox", "queue": "it-messaging", "requires_approval": False, "action": "none"},
 )
 
 OFFBOARDING_STEPS: tuple[ChecklistStep, ...] = (
-    {"step": "Disable user account", "queue": "it-access-management", "requires_approval": True},
-    {"step": "Recover laptop and peripherals", "queue": "it-hardware", "requires_approval": False},
-    {"step": "Revoke software licenses", "queue": "it-software", "requires_approval": False},
-    {"step": "Archive email mailbox", "queue": "it-messaging", "requires_approval": True},
+    {"step": "Disable user account", "queue": "it-access-management", "requires_approval": True, "action": "none"},
+    {"step": "Recover laptop and peripherals", "queue": "it-hardware", "requires_approval": False, "action": "none"},
+    {"step": "Revoke software licenses", "queue": "it-software", "requires_approval": False, "action": "none"},
+    {"step": "Archive email mailbox", "queue": "it-messaging", "requires_approval": True, "action": "none"},
 )
 
+# v0.6 placeholder: an extra onboarding step that provisions a *simulated*
+# Microsoft 365 account (src/m365_simulator.py). Added only when the request
+# carries a mail address; no real credentials are used anywhere.
+M365_PROVISION_STEP: ChecklistStep = {
+    "step": "Provision Microsoft 365 account (simulated)",
+    "queue": "it-access-management",
+    "requires_approval": False,
+    "action": "m365_provision",
+}
 
-def checklist_for(request_type: str) -> list[ChecklistStep]:
-    """Return the checklist template for a request type."""
+
+def checklist_for(request_type: str, include_m365: bool = False) -> list[ChecklistStep]:
+    """Return the checklist template for a request type.
+
+    ``include_m365`` adds the simulated M365 provisioning step, but only
+    for onboarding — offboarding never creates accounts.
+    """
     if request_type == "onboarding":
-        return list(ONBOARDING_STEPS)
+        steps = list(ONBOARDING_STEPS)
+        if include_m365:
+            steps.append(dict(M365_PROVISION_STEP))
+        return steps
     if request_type == "offboarding":
         return list(OFFBOARDING_STEPS)
     raise ValueError(
