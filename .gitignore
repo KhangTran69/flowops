@@ -1,0 +1,17 @@
+# Virtual environment
+.venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Environment variables
+.env
+
+# Generated ticket output and local database
+data/*.json
+data/tickets/
+data/*.db
+
+# pytest
+.pytest_cache/
