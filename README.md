@@ -28,11 +28,12 @@ FlowOps is an IT workflow automation platform. It receives support tickets and o
 | v1.0 UI: operator console | ✅ | Jinja2 templates, responsive dashboard, onboarding/outbox pages, theme toggle, inline actions |
 | v1.0 Reliability: durable workflow jobs | ✅ | Leased worker queue with retries, dead-letter, operator retry/cancel |
 | v1.0 Security: auth, roles, audit | ✅ | Optional bearer/Entra auth, role checks, webhook API key, actor attribution |
+| v1.1 Secure operator console | ✅ | Signed session login, CSRF-protected UI actions, role-aware controls, login/logout audit |
 | v0.6.1 Offboarding completion ledger | ✅ | Admin-only, claim-before-execute, idempotent replay, stale-claim takeover, ledger-backed offboarding |
 | v1.0 Operations: readiness, metrics, migrations | ✅ | `/ready`, `/metrics`, correlation IDs, Alembic baseline, container migration entrypoint |
 | v1.0 CI + Docker | ✅ | GitHub Actions runs pytest, a Docker Compose API + PostgreSQL smoke test, and PostgreSQL reliability tests |
 | v0.6 Microsoft 365 actions | ⬜ | Real account creation via Power Automate / Microsoft Graph / PowerShell (needs credentials) |
-| v0.7 AI support agent | ⬜ | MCP/Claude assistance with human approval gates (needs AI credentials) |
+| v0.7 AI support agent | ✅ | Simulated AI triage, KB search, suggest-only recommendations, human-approved apply gate |
 
 ## Technology stack
 
@@ -60,6 +61,8 @@ flowops/
 │   ├── outbox.py             # leased outbox claim/finalize helpers
 │   ├── outbox_worker.py      # automatic notification dispatcher
 │   ├── auth.py               # bearer/Entra auth and role helpers
+│   ├── ui_session.py         # signed UI sessions, cookie flags, and CSRF helpers
+│   ├── ai_agent.py           # simulated AI agent, KB search, optional LLM boundary
 │   ├── web.py                # Jinja2 rendering helpers
 │   ├── templates/            # shared layout, landing, dashboard, operator pages
 │   └── static/               # local CSS and vanilla JavaScript
@@ -70,10 +73,12 @@ flowops/
 ├── Dockerfile                # Non-root API/worker image with migration entrypoint
 ├── docker-compose.yml        # API + worker + PostgreSQL demo stack
 ├── alembic.ini               # Migration configuration
+├── src/ai_agent.py           # simulated AI agent, KB, optional LLM boundary
 ├── docs/portfolio-demo.md    # Guided interview/portfolio walkthrough
 ├── docs/architecture.md      # Data flow and reliability boundaries
 ├── scripts/demo_smoke.sh     # Local end-to-end smoke test
 ├── scripts/load_smoke.py     # Small concurrent intake/replay smoke test
+├── scripts/ai_smoke.py       # Opt-in live AI provider smoke check
 ├── .gitignore  .env.example  requirements.txt  README.md
 ```
 
@@ -163,6 +168,10 @@ services without deleting the stored PostgreSQL data. Use
 | `POST /workflow-jobs/{id}/cancel` | Cancel a queued or retry-scheduled job |
 | `GET /execution-logs?status=&actor=&limit=` | Recent workflow runs, newest first |
 | `GET /audit?limit=` | Actor-attributed execution rows |
+| `POST /tickets/{id}/ai-triage` | Summarize a ticket, search the KB, and return suggestions (no mutation) |
+| `POST /tickets/{id}/ai-recommendations/apply` | Operator-approved apply of queue/priority recommendations |
+| `GET /knowledge-base?query=&category=` | List or search the simulated IT knowledge base |
+| `GET /ui/tickets[/{id}]` | Operator ticket list/detail with an AI triage panel |
 | `GET /ready` | Readiness probe including database connectivity |
 | `GET /metrics` | Prometheus-style request, job, and outbox metrics |
 | `GET /dashboard` | Server-rendered HTML monitoring dashboard |
@@ -198,6 +207,52 @@ A failed in-request webhook delivery is stored in `notification_outbox` as `pend
 - `POST /notifications/retry` never selects `failed` rows; an operator must requeue them first.
 
 Requeue preserves the attempt history and last error, so each requeue grants one more delivery attempt and a still-failing delivery returns to `failed`. The conditional transition prevents two operators from requeueing the same row twice. Delivery remains **at-least-once**: the outbox prevents silent loss, but receivers should deduplicate using the ticket ID or event data.
+
+### AI support agent (v0.7)
+
+The AI boundary is suggest-only by default:
+
+- `POST /tickets/{id}/ai-triage` returns a structured summary, urgency signals,
+  ranked knowledge-base matches, and recommendations. It never mutates the
+  ticket.
+- Recommendations are stable IDs such as `queue-reassign`, `priority-upgrade`,
+  `reply-draft`, and `onboarding-checklist`. Only queue/priority are applicable.
+- `POST /tickets/{id}/ai-recommendations/apply` requires an operator actor and
+  an explicit list of recommendation IDs. It re-runs triage server-side and
+  applies only those IDs; status is never changed by AI.
+- The simulated adapter is deterministic and credential-free. `FLOWOPS_AI_ADAPTER`
+  can select an OpenAI-compatible provider: `gemini`, `groq`, `openai`,
+  `openrouter`, `ollama`, or generic `llm`. Set `FLOWOPS_AI_API_KEY` plus
+  optional `FLOWOPS_AI_BASE_URL`, `FLOWOPS_AI_MODEL`, and `FLOWOPS_AI_TIMEOUT`.
+  The built-in client calls `/chat/completions`; tests inject
+  `httpx.MockTransport` and never touch the network. `ollama` runs locally and
+  needs no key.
+- Every triage and apply action writes `ai.summarize`, `ai.recommend`, or
+  `ai.recommendation_applied` execution logs with actor, duration, and
+  correlation ID.
+- `/ui/tickets/{id}?triage=1` renders the summary, KB guidance, and approval
+  checkboxes; the Apply button calls the approval endpoint.
+
+AI safety guardrails:
+
+- Ticket text is redacted (emails, phone numbers, tokens, credentialed URLs)
+  and truncated before an LLM prompt. Ticket content is delimited as untrusted
+  data with explicit instructions to ignore embedded instructions.
+- LLM output is schema-validated: only known recommendation kinds are kept,
+  queue/priority suggestions must use known values, confidence is clamped, and
+  only queue/priority may be applicable. Status/title/requester changes are
+  impossible through the apply endpoint.
+- Provider failures return `503` and write an `ai.error` log with actor and
+  correlation ID.
+- `tests/test_ai_eval.py` runs a deterministic golden evaluation over 12
+  synthetic tickets (top-1 KB accuracy threshold, queue/priority recall,
+  workflow suggestions never applicable, no false positives on correct
+  tickets).
+- `/metrics` exposes `flowops_ai_triage_total`, `flowops_ai_apply_total`, and
+  `flowops_ai_provider_errors_total`; the dashboard has an AI activity panel.
+- `scripts/ai_smoke.py` is an opt-in live provider smoke check. It reads
+  `FLOWOPS_AI_*` from the environment, never prints the key, and is not part of
+  CI.
 
 ## How routing works
 
@@ -298,7 +353,19 @@ retry/requeue endpoints remain available.
 
 `src/auth.py` supports optional Entra JWT or a local development bearer token.
 Set `FLOWOPS_AUTH_REQUIRED=true` to protect mutating routes; the default local
-mode is unauthenticated for beginner-friendly development. Operator routes
+mode is unauthenticated for beginner-friendly development.
+
+The browser console adds a separate session layer. Set
+`FLOWOPS_UI_AUTH_REQUIRED=true`, `FLOWOPS_AUTH_REQUIRED=true`, and a random
+`FLOWOPS_SESSION_SECRET`; then
+`/dashboard` and `/ui/*` redirect to `/login`, where an operator pastes a dev
+bearer token or Entra access token. The signed, HttpOnly, SameSite=Lax cookie
+carries subject/roles and a per-session CSRF token. UI fetch actions send
+`X-CSRF-Token`; cookie-authenticated mutations without it return `403`. Bearer
+API clients remain CSRF-exempt. Set `FLOWOPS_SESSION_COOKIE_SECURE=true` behind
+HTTPS. This is a prototype token-paste login, not full SSO or user management.
+
+Operator routes
 require `automation.operator` or `automation.admin`. `POST /webhooks/intake`
 can additionally require `X-API-Key` via `FLOWOPS_WEBHOOK_API_KEY`.
 Authenticated actions write `actor_subject` to execution logs; `GET /audit` and
@@ -324,7 +391,7 @@ No real secrets or Microsoft tenant are included.
 ## Running the tests
 
 ```bash
-pytest    # 145 passed, 8 skipped locally; the skips are PostgreSQL-only tests
+pytest    # 218 passed, 13 skipped locally; the skips are PostgreSQL-only tests
 python -m compileall -q src tests
 ```
 
@@ -334,7 +401,7 @@ The default suite is fully offline: mocked HTTP and temporary SQLite databases. 
 FLOWOPS_TEST_POSTGRES_URL="postgresql+psycopg://flowops:flowops@127.0.0.1:5432/flowops" \
   pytest -q tests/test_idempotency_postgres.py tests/test_outbox_postgres.py \
            tests/test_jobs_postgres.py tests/test_outbox_worker_postgres.py \
-           tests/test_offboarding_postgres.py
+           tests/test_offboarding_postgres.py tests/test_ai_postgres.py
 ```
 
 The CI `postgres-idempotency` job supplies a `postgres:16` service, runs
@@ -348,7 +415,7 @@ a live local API (not a benchmark).
 
 - ✅ v0.1–v0.5 and the monitoring dashboard (see table above)
 - ⬜ v0.6 — Power Automate / Microsoft Graph / PowerShell behind the onboarding checklists (needs real credentials)
-- ⬜ v0.7 — Controlled MCP and Claude-powered ticket assistance with human approval gates (needs AI credentials)
+- ✅ v0.7 — Simulated AI triage, KB search, and human-approved recommendations (optional pluggable LLM boundary)
 - ✅ v1.0 foundation — Offline CI workflow and Docker Compose PostgreSQL demo
 - ✅ v1.0 reliability — Fenced idempotency ownership with stale-takeover protection on SQLite and PostgreSQL
 - ✅ v1.0 reliability — Onboarding idempotency and notification dead-letter/requeue workflow

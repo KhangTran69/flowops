@@ -32,7 +32,7 @@
             <button class="button small" type="button" data-action-url="/workflow-jobs/{{ job.id }}/retry" data-method="POST" data-reload="true">Retry</button>
             {% endif %}
             {% if job.status in ('queued', 'retry_scheduled') %}
-            <button class="button small ghost" type="button" data-action-url="/workflow-jobs/{{ job.id }}/cancel" data-method="POST" data-reload="true" data-confirm="Cancel this queued job?">Cancel</button>
+            {% if actor and 'automation.admin' in actor.roles %}<button class="button small ghost" type="button" data-action-url="/workflow-jobs/{{ job.id }}/cancel" data-method="POST" data-reload="true" data-confirm="Cancel this queued job?">Cancel</button>{% endif %}
             {% endif %}
           </td>
         </tr>

@@ -2,6 +2,10 @@ x-flowops-env: &flowops-env
   FLOWOPS_DATABASE_URL: postgresql+psycopg://flowops:flowops@postgres:5432/flowops
   FLOWOPS_ENVIRONMENT: ${FLOWOPS_ENVIRONMENT:-development}
   FLOWOPS_AUTH_REQUIRED: ${FLOWOPS_AUTH_REQUIRED:-false}
+  FLOWOPS_UI_AUTH_REQUIRED: ${FLOWOPS_UI_AUTH_REQUIRED:-false}
+  FLOWOPS_SESSION_SECRET: ${FLOWOPS_SESSION_SECRET:-}
+  FLOWOPS_SESSION_MAX_AGE_SECONDS: ${FLOWOPS_SESSION_MAX_AGE_SECONDS:-3600}
+  FLOWOPS_SESSION_COOKIE_SECURE: ${FLOWOPS_SESSION_COOKIE_SECURE:-false}
   FLOWOPS_DEV_BEARER_TOKEN: ${FLOWOPS_DEV_BEARER_TOKEN:-}
   FLOWOPS_ENTRA_ISSUER: ${FLOWOPS_ENTRA_ISSUER:-}
   FLOWOPS_ENTRA_AUDIENCE: ${FLOWOPS_ENTRA_AUDIENCE:-}
@@ -16,6 +20,11 @@ x-flowops-env: &flowops-env
   FLOWOPS_ACTION_FAILURE_WEBHOOK_URL: ${FLOWOPS_ACTION_FAILURE_WEBHOOK_URL:-}
   FLOWOPS_NOTIFICATION_MAX_ATTEMPTS: ${FLOWOPS_NOTIFICATION_MAX_ATTEMPTS:-5}
   FLOWOPS_RATE_LIMIT_PER_MINUTE: ${FLOWOPS_RATE_LIMIT_PER_MINUTE:-0}
+  FLOWOPS_AI_ADAPTER: ${FLOWOPS_AI_ADAPTER:-simulated}
+  FLOWOPS_AI_API_KEY: ${FLOWOPS_AI_API_KEY:-}
+  FLOWOPS_AI_BASE_URL: ${FLOWOPS_AI_BASE_URL:-}
+  FLOWOPS_AI_MODEL: ${FLOWOPS_AI_MODEL:-}
+  FLOWOPS_AI_TIMEOUT: ${FLOWOPS_AI_TIMEOUT:-30}
 
 services:
   app:
@@ -75,6 +84,76 @@ services:
       timeout: 3s
       retries: 3
 
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    ports:
+      - "${FLOWOPS_PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1:9090/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    restart: unless-stopped
+    ports:
+      - "${FLOWOPS_GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${FLOWOPS_GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${FLOWOPS_GRAFANA_ADMIN_PASSWORD:-flowops-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - flowops-grafana:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1:3000/api/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  test-postgres:
+    image: postgres:16-alpine
+    profiles: ["test"]
+    environment:
+      POSTGRES_DB: flowops_test
+      POSTGRES_USER: flowops
+      POSTGRES_PASSWORD: flowops
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flowops -d flowops_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  test-runner:
+    build: .
+    profiles: ["test"]
+    environment:
+      FLOWOPS_DATABASE_URL: postgresql+psycopg://flowops:flowops@test-postgres:5432/flowops_test
+      FLOWOPS_TEST_POSTGRES_URL: postgresql+psycopg://flowops:flowops@test-postgres:5432/flowops_test
+      FLOWOPS_ENVIRONMENT: development
+      FLOWOPS_AUTH_REQUIRED: "false"
+      FLOWOPS_RUN_MIGRATIONS: "true"
+    depends_on:
+      test-postgres:
+        condition: service_healthy
+    command: ["pytest", "-q"]
+
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
@@ -92,3 +171,4 @@ services:
 
 volumes:
   flowops-postgres:
+  flowops-grafana:

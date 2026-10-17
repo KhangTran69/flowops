@@ -167,3 +167,61 @@ def test_action_execution_audit_records_retries(client, monkeypatch):
     assert [entry["status"] for entry in executions] == ["retrying", "retrying", "failed"]
     assert [entry["attempt"] for entry in executions] == [1, 2, 3]
     assert all(entry["error_category"] == "adapter_error" for entry in executions)
+
+
+def test_powershell_adapter_dry_run():
+    from src.actions import PowerShellAdapter
+
+    adapter = PowerShellAdapter(dry_run=True)
+    res = adapter.execute("create_user_account", {"employee_email": "jane@example.com"})
+    assert res.action == "create_user_account"
+    assert "simulated PowerShell execution" in res.detail
+    assert "jane@example.com" in res.detail
+
+
+def test_powershell_adapter_execution(monkeypatch):
+    from src.actions import PowerShellAdapter
+
+    class FakeCompletedProcess:
+        stdout = "PowerShell executed action 'create_user_account' for jane@example.com\n"
+        stderr = ""
+
+    calls = []
+
+    def fake_run(args, input, capture_output, text, timeout, check):
+        calls.append((args, input, timeout))
+        return FakeCompletedProcess()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    adapter = PowerShellAdapter(command_path="/usr/local/bin/pwsh", dry_run=False, timeout=10.0)
+    res = adapter.execute("create_user_account", {"employee_email": "jane@example.com"})
+    assert res.action == "create_user_account"
+    assert "PowerShell executed action" in res.detail
+    assert calls[0][0][0] == "/usr/local/bin/pwsh"
+    assert calls[0][2] == 10.0
+
+
+def test_powershell_adapter_failure(monkeypatch):
+    import subprocess
+    from src.actions import PowerShellAdapter
+
+    def fake_run(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, ["pwsh"], stderr="ExecutionPolicy restriction")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    adapter = PowerShellAdapter(dry_run=False)
+    with pytest.raises(RuntimeError, match="ExecutionPolicy restriction"):
+        adapter.execute("create_user_account", {"employee_email": "jane@example.com"})
+
+
+def test_powershell_adapter_from_environment():
+    from src.actions import PowerShellAdapter, adapter_from_environment
+
+    adapter = adapter_from_environment({
+        "FLOWOPS_ACTION_ADAPTER": "powershell",
+        "FLOWOPS_POWERSHELL_PATH": "pwsh.exe",
+        "FLOWOPS_POWERSHELL_DRY_RUN": "true",
+    })
+    assert isinstance(adapter, PowerShellAdapter)
+    assert adapter.command_path == "pwsh.exe"
+    assert adapter.dry_run is True

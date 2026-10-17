@@ -75,6 +75,31 @@ require a dev bearer token or Entra JWT and record the actor on execution logs.
 `/ready` checks the database; `/metrics` exposes request, job, and outbox
 gauges; every response carries a correlation ID.
 
+## AI assistance boundary
+
+The AI layer is intentionally suggest-only. `src/ai_agent.py` produces a
+deterministic summary, keyword-ranked KB matches, and stable recommendation
+IDs. `POST /tickets/{id}/ai-recommendations/apply` re-runs triage and only
+applies the IDs an operator explicitly approves, and only queue/priority
+fields. The optional LLM adapter is an OpenAI-compatible client boundary for Gemini,
+Groq, OpenRouter, OpenAI, or local Ollama; the default simulated adapter needs
+no credentials and is what tests exercise. Every AI
+action is written to the execution log with actor and correlation ID.
+Before provider calls, ticket text is redacted and bounded, and the prompt labels
+ticket content as untrusted data. Provider output is schema-validated and
+allowlisted; only queue/priority can become applicable. AI metrics are exposed
+at `/metrics`, and the golden evaluation suite runs offline.
+
+## Secure operator console
+
+The JSON API keeps bearer auth. When `FLOWOPS_UI_AUTH_REQUIRED=true`, the HTML
+console uses a signed `itsdangerous` cookie containing subject, roles, and a
+per-session CSRF token. `/login` validates a dev bearer/Entra token through the
+existing auth path; `/dashboard` and `/ui/*` redirect unauthenticated requests.
+Cookie-authenticated mutations require `X-CSRF-Token`; bearer routes remain
+CSRF-exempt. Cookies are HttpOnly, SameSite=Lax, and optionally Secure, with a
+bounded max-age. This is a prototype token-paste login, not an SSO/user store.
+
 ## Deliberate limits
 
 This is a localhost learning prototype. Real Microsoft 365 actions and

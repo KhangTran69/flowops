@@ -18,6 +18,7 @@ COPY --chown=flowops:flowops src ./src
 COPY --chown=flowops:flowops data/.gitkeep ./data/.gitkeep
 COPY --chown=flowops:flowops alembic.ini ./
 COPY --chown=flowops:flowops migrations ./migrations
+COPY --chown=flowops:flowops tests ./tests
 COPY --chown=flowops:flowops scripts/entrypoint.sh /usr/local/bin/flowops-entrypoint
 RUN chmod +x /usr/local/bin/flowops-entrypoint \
     && mkdir -p /app/data \

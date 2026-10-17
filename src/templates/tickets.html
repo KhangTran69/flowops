@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Tickets — FlowOps{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <span class="eyebrow">Operator UI</span>
+    <h1>Tickets</h1>
+    <p class="muted">Read tickets and run AI triage before applying any change.</p>
+  </div>
+  <a class="button primary" href="/docs">Create via API</a>
+</section>
+<section class="panel">
+  {% if tickets %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Title</th><th>Status</th><th>Priority</th><th>Category</th><th>Queue</th><th>AI</th></tr></thead>
+      <tbody>
+        {% for ticket in tickets %}
+        <tr>
+          <td>{{ ticket.ticket_id }}</td>
+          <td><a href="/ui/tickets/{{ ticket.ticket_id }}">{{ ticket.title }}</a></td>
+          <td><span class="badge {{ 'ok' if ticket.status == 'closed' else 'info' }}">{{ ticket.status }}</span></td>
+          <td>{{ ticket.priority }}</td>
+          <td>{{ ticket.category or '—' }}</td>
+          <td>{{ ticket.queue or '—' }}</td>
+          <td><a class="button small" href="/ui/tickets/{{ ticket.ticket_id }}?triage=1">Triage</a></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">No tickets yet. Create one with <code>POST /tickets</code>.</p>
+  {% endif %}
+</section>
+{% endblock %}
