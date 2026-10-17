@@ -145,6 +145,12 @@ class ChecklistItemRecord(Base):
     queue: Mapped[str] = mapped_column(String(64), nullable=False)
     requires_approval: Mapped[bool] = mapped_column(Boolean, nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    # v0.6 placeholder: which automation runs when this step completes
+    # ("none" for manual steps, "m365_provision" for the simulated one).
+    # Both new columns are nullable so older rows stay valid; the API fills
+    # them in, and _add_missing_columns() migrates pre-existing SQLite files.
+    action: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    result: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON from the action
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )

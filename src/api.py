@@ -4,7 +4,9 @@ v0.3 adds database persistence and execution logs; v0.4 adds rule-based
 routing, outbound notifications, and an n8n-friendly webhook; v0.5 adds
 onboarding/offboarding checklists, idempotency keys, and delivery retries;
 the v1.0 preview keeps failed webhook deliveries in a retryable outbox and
-adds explicit ticket closing (POST /tickets/{id}/close).
+adds explicit ticket closing (POST /tickets/{id}/close); the v0.6 placeholder
+provisions *simulated* Microsoft 365 accounts during onboarding
+(src/m365_simulator.py) — no real credentials or network calls are involved.
 """
 
 import hashlib
@@ -25,10 +27,15 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src import db
+from src.m365_simulator import M365Simulator
 from src.notify import deliver_webhook
 from src.onboarding import checklist_for
 from src.routing import route_ticket
 from src.ticket_processor import normalize_ticket
+
+# v0.6 placeholder: module-level simulated Microsoft 365 backend so tests
+# (and, later, a real Graph client) can swap it via monkeypatching.
+m365_simulator = M365Simulator()
 
 app = FastAPI(
     title="FlowOps",
@@ -113,6 +120,10 @@ class ChecklistItemOut(BaseModel):
     queue: str
     requires_approval: bool
     status: str
+    action: Optional[str] = None
+    # v0.6 placeholder: result of an executed step action, e.g. the JSON
+    # returned by the *simulated* M365 provisioning backend.
+    result: Optional[dict] = None
 
 
 class OnboardingRequestIn(BaseModel):
@@ -125,6 +136,12 @@ class OnboardingRequestIn(BaseModel):
     requester_id: StrictInt = Field(ge=1)
     start_date: Optional[StrictStr] = Field(
         default=None, description="ISO date (YYYY-MM-DD) the employee starts or leaves."
+    )
+    # v0.6 placeholder: when both are present on an onboarding request, a
+    # simulated Microsoft 365 provisioning step is added to the checklist.
+    # ``mail`` is the mailbox address to simulate; no real account is created.
+    mail: Optional[StrictStr] = Field(
+        default=None, description="Mailbox for the simulated M365 provisioning step."
     )
 
     @field_validator("employee_name", "department")
@@ -140,6 +157,19 @@ class OnboardingRequestIn(BaseModel):
         if "@" not in value or " " in value:
             raise ValueError("employee_email must be a valid email address")
         return value.lower()
+
+    @field_validator("mail")
+    @classmethod
+    def mail_must_be_valid(cls, value: Optional[str]) -> Optional[str]:
+        import re
+
+        if value is None:
+            return None
+        value = value.strip().lower()
+        # Strict but dependency-free shape check: local@domain.tld, no spaces.
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}", value):
+            raise ValueError("mail must be a valid email address")
+        return value
 
     @field_validator("start_date")
     @classmethod
@@ -513,7 +543,9 @@ def _request_out(
             ChecklistItemOut(
                 **{c: getattr(item, c) for c in (
                     "id", "step", "queue", "requires_approval", "status",
-                )}
+                    "action",
+                )},
+                result=json.loads(item.result) if item.result else None,
             )
             for item in sorted(items, key=lambda i: i.id)
         ],
@@ -540,7 +572,13 @@ def _load_request(
 def create_onboarding_request(
     request: OnboardingRequestIn, session: Session = Depends(db.get_session)
 ) -> OnboardingRequestOut:
-    """Create an onboarding/offboarding request and generate its checklist."""
+    """Create an onboarding/offboarding request and generate its checklist.
+
+    v0.6 placeholder: when an *onboarding* request includes ``mail``, a
+    simulated Microsoft 365 provisioning step is appended to the checklist.
+    The account is only created when that step is completed (see
+    ``POST .../items/{item_id}/complete``); nothing talks to real M365.
+    """
     started = time.perf_counter()
     record = db.OnboardingRequestRecord(
         request_type=request.request_type,
@@ -552,18 +590,22 @@ def create_onboarding_request(
     )
     session.add(record)
     session.flush()
-    steps = checklist_for(request.request_type)
+    include_m365 = request.request_type == "onboarding" and request.mail is not None
+    steps = checklist_for(request.request_type, include_m365=include_m365)
     for template in steps:
         session.add(db.ChecklistItemRecord(request_id=record.id, **template))
     session.flush()
+    detail = f"{request.request_type} for {request.employee_name}: " \
+             f"{len(steps)} checklist steps generated"
+    if include_m365:
+        detail += f"; simulated M365 step added for {request.mail}"
     db.log_execution(
         session,
         run_id=_new_run_id(),
         action="onboarding.request.created",
         status="success",
         duration_ms=int((time.perf_counter() - started) * 1000),
-        detail=f"{request.request_type} for {request.employee_name}: "
-               f"{len(steps)} checklist steps generated",
+        detail=detail,
     )
     _, items = _load_request(session, record.id)
     return _request_out(record, items)
@@ -599,6 +641,54 @@ def _get_item(
     return item
 
 
+def _run_step_action(
+    session: Session, record: db.OnboardingRequestRecord, item: db.ChecklistItemRecord
+) -> None:
+    """Execute the automation attached to a checklist step, if any.
+
+    v0.6 placeholder: ``m365_provision`` calls the *simulated* Microsoft 365
+    backend (never the network). The simulator is module-level so tests can
+    monkeypatch it with their own fake. If provisioning fails, the whole
+    transaction rolls back (the step stays in its previous state, retryable
+    later) and a failure log is persisted in a fresh transaction before a
+    502 response is returned — the request itself stays open.
+    """
+    if item.action != "m365_provision":
+        return
+    started = time.perf_counter()
+    try:
+        result = m365_simulator.create_user(
+            display_name=record.employee_name,
+            mail=record.employee_email,
+            department=record.department,
+        )
+    except Exception as error:  # simulated failures must not corrupt state
+        session.rollback()  # discard the pending status change
+        db.log_execution(
+            session,
+            run_id=_new_run_id(),
+            action="onboarding.m365_provision",
+            status="failure",
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            detail=f"simulated M365 provisioning failed: {error}",
+        )
+        session.commit()  # persist the failure log on its own
+        raise HTTPException(
+            status_code=502, detail="Simulated M365 provisioning failed."
+        ) from error
+    item.result = json.dumps(result, separators=(",", ":"))
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="onboarding.m365_provision",
+        status="success",
+        duration_ms=int((time.perf_counter() - started) * 1000),
+        detail=(
+            f"simulated M365 user id {result['id']} for {record.employee_email}"
+        ),
+    )
+
+
 def _transition_item(
     session: Session,
     request_id: int,
@@ -623,6 +713,7 @@ def _transition_item(
                 f"(current status: '{item.status}').",
             )
         item.status = "completed"
+        _run_step_action(session, record, item)
     session.flush()
 
     db.log_execution(
@@ -661,8 +752,31 @@ def approve_item(
 def complete_item(
     request_id: int, item_id: int, session: Session = Depends(db.get_session)
 ) -> OnboardingRequestOut:
-    """Mark a checklist step completed (after approval if required)."""
+    """Mark a checklist step completed (after approval if required).
+
+    v0.6 placeholder: steps with an attached automation run it now — e.g.
+    ``m365_provision`` calls the simulated Microsoft 365 backend and stores
+    the returned (simulated) user id in the step's result.
+    """
     return _transition_item(session, request_id, item_id, "complete")
+
+
+class M365StatusOut(BaseModel):
+    """Shape of the *simulated* M365 status response (v0.6 placeholder)."""
+
+    simulated: StrictBool
+    id: StrictStr
+    provisioning_state: StrictStr
+    last_sync: StrictStr
+
+
+@app.get("/onboarding-requests/m365-status/{user_id}", response_model=M365StatusOut)
+def get_m365_status(user_id: str) -> M365StatusOut:
+    """Look up a *simulated* M365 provisioning status by user id.
+
+    This never contacts real Microsoft services; see src/m365_simulator.py.
+    """
+    return M365StatusOut.model_validate(m365_simulator.get_status(user_id))
 
 
 # ---------------------------------------------------------------------------
@@ -838,6 +952,39 @@ list with <code>GET /notifications/pending</code>.</p>
 </section>
 """
 
+    # v0.6 placeholder: simulated M365 user ids recorded by completed
+    # provisioning steps, clearly labelled so nobody mistakes them for real.
+    m365_lines: list[str] = []
+    for onb_record in session.execute(
+        select(db.OnboardingRequestRecord)
+    ).scalars().all():
+        onb_items = session.execute(
+            select(db.ChecklistItemRecord).where(
+                db.ChecklistItemRecord.request_id == onb_record.id
+            )
+        ).scalars().all()
+        for onb_item in sorted(onb_items, key=lambda i: i.id):
+            if onb_item.action == "m365_provision" and onb_item.result:
+                try:
+                    sim_user_id = json.loads(onb_item.result).get("id", "?")
+                except (ValueError, TypeError):
+                    sim_user_id = "?"
+                m365_lines.append(
+                    "<li>"
+                    f"request #{onb_record.id} &middot; {html.escape(onb_record.employee_name)} "
+                    f"&middot; simulated M365 id <code>{html.escape(str(sim_user_id))}</code> "
+                    "(simulated)"
+                    "</li>"
+                )
+    m365_section = (
+        "<section><h2>Simulated Microsoft 365 provisioning</h2>"
+        "<p>v0.6 placeholder &mdash; these accounts are fake; no real "
+        "Microsoft 365 tenant is touched.</p>"
+        f"<ul>{''.join(m365_lines)}</ul></section>\n"
+        if m365_lines
+        else ""
+    )
+
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -880,7 +1027,7 @@ list with <code>GET /notifications/pending</code>.</p>
   <section><h2>Tickets by queue</h2><table>{counter_rows(by_queue)}</table></section>
   <section><h2>Tickets by priority</h2><table>{counter_rows(by_priority)}</table></section>
 </div>
-{outbox_section}<section>
+{outbox_section}{m365_section}<section>
   <h2>Recent workflow runs</h2>
   <table><tr><th>run</th><th>time</th><th>action</th><th>status</th><th>ticket</th><th>duration</th></tr>{recent_rows}</table>
 </section>
