@@ -40,12 +40,21 @@ def _csrf(html: str) -> str:
     return match.group(1)
 
 
-def _login(client, token="dev-secret", next_path="/dashboard"):
+def _login(client, password="admin", next_path="/dashboard", username="admin"):
     return client.post(
         "/login",
-        data={"token": token, "next": next_path},
+        data={"username": username, "password": password, "next": next_path},
         follow_redirects=False,
     )
+
+
+def _operator_cookie(client):
+    session = ui_session.create_session(
+        Actor("operator-test", ("automation.operator",), source="session")
+    )
+    client.cookies.clear()
+    client.cookies.set(ui_session.SESSION_COOKIE, ui_session.encode_session(session))
+    return session
 
 
 def _admin_cookie(client):
@@ -73,9 +82,10 @@ def test_unauthenticated_ui_redirects_and_login_sets_cookie(client):
     assert denied.headers["location"].startswith("/login?next=")
     assert client.get("/login").status_code == 200
 
-    wrong = _login(client, token="wrong")
+    wrong = _login(client, password="wrong")
     assert wrong.status_code == 401
-    assert "Invalid access token." in wrong.text
+    assert "Invalid username or password." in wrong.text
+    assert _login(client, username="dev-secret", password="dev-secret").status_code == 401
 
     response = _login(client)
     assert response.status_code == 303
@@ -87,10 +97,10 @@ def test_unauthenticated_ui_redirects_and_login_sets_cookie(client):
     page = client.get("/dashboard")
     assert page.status_code == 200
     assert "csrf-token" in page.text
-    assert "configured-bearer" in page.text
+    assert "admin" in page.text
     me = client.get("/auth/me").json()
     assert me["source"] == "session"
-    assert me["subject"] == "configured-bearer"
+    assert me["subject"] == "admin"
 
 
 def test_open_redirects_are_rejected(client):
@@ -167,6 +177,7 @@ def test_logout_clears_session_and_writes_audit(client):
 
 def test_admin_only_controls_are_hidden_from_operators(client):
     _login(client)
+    _operator_cookie(client)
     session = db.SessionLocal()
     try:
         session.add(
@@ -193,7 +204,7 @@ def test_admin_only_controls_are_hidden_from_operators(client):
 
 
 def test_operator_cannot_call_admin_endpoint_with_session(client):
-    _login(client)
+    _operator_cookie(client)
     token = _csrf(client.get("/dashboard").text)
     response = client.post(
         "/notifications/1/requeue",
