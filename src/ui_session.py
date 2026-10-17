@@ -106,6 +106,23 @@ def validate_ui_auth_configuration(
         )
 
 
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "admin"
+
+
+def authenticate_admin(username: str, password: str) -> Optional[Actor]:
+    """Accept only the single admin account for the operator console."""
+    username_ok = secrets.compare_digest(username.encode(), ADMIN_USERNAME.encode())
+    password_ok = secrets.compare_digest(password.encode(), ADMIN_PASSWORD.encode())
+    if not (username_ok and password_ok):
+        return None
+    return Actor(
+        subject=ADMIN_USERNAME,
+        roles=("automation.operator", "automation.admin"),
+        source="session",
+    )
+
+
 def create_session(actor: Actor) -> UISession:
     return UISession(
         subject=actor.subject,

@@ -71,6 +71,54 @@ class MicrosoftGraphAdapter:
         )
         response.raise_for_status()
         return ActionResult(action=action, detail="Microsoft Graph action accepted")
+
+
+
+class GraphClientActionAdapter:
+    """Uses the client-credentials GraphClient for real user/license actions."""
+
+    def __init__(self, client, *, sku_id: str = "") -> None:
+        self.client = client
+        self.sku_id = sku_id
+
+    def execute(self, action: str, context: dict[str, Any]) -> ActionResult:
+        email = str(context.get("employee_email") or "")
+        if action == "create_user_account":
+            password = context.get("temporary_password")
+            if not password:
+                raise ValueError("temporary_password is required to create a Graph user")
+            payload = {
+                "accountEnabled": True,
+                "displayName": context.get("employee_name") or email.split("@")[0],
+                "mailNickname": email.split("@")[0],
+                "userPrincipalName": email,
+                "passwordProfile": {"forceChangePasswordNextSignIn": True, "password": password},
+            }
+            output = self.client.create_user(payload)
+            return ActionResult(action=action, detail="Graph user created", output=output)
+        if action == "grant_software_licenses":
+            if not self.sku_id:
+                raise ValueError("FLOWOPS_GRAPH_SKU_ID is required to assign licenses")
+            user_id = context.get("user_id") or context.get("graph_user_id")
+            if not user_id:
+                users = self.client.list_users(f"userPrincipalName eq '{email}'")
+                if not users:
+                    raise ValueError(f"Graph user not found: {email}")
+                user_id = users[0]["id"]
+            output = self.client.assign_license(str(user_id), self.sku_id)
+            return ActionResult(action=action, detail="Graph license assigned", output=output or {})
+        if action in ("disable_user_account", "revoke_software_licenses"):
+            user_id = context.get("user_id") or context.get("graph_user_id")
+            if not user_id:
+                users = self.client.list_users(f"userPrincipalName eq '{email}'")
+                if not users:
+                    raise ValueError(f"Graph user not found: {email}")
+                user_id = users[0]["id"]
+            output = self.client.request("PATCH", f"/users/{user_id}", json={"accountEnabled": False})
+            return ActionResult(action=action, detail="Graph user disabled", output=output or {})
+        raise ValueError(f"Graph client action is not implemented: {action!r}")
+
+
 class PowerAutomateAdapter:
     """POSTs sanitized checklist context to a Power Automate trigger."""
 
@@ -158,11 +206,24 @@ def adapter_from_environment(environ: dict[str, str] | None = None) -> ActionAda
             raise ValueError("FLOWOPS_POWER_AUTOMATE_URL is required for power_automate")
         return PowerAutomateAdapter(url)
     if name == "graph":
+        tenant = values.get("FLOWOPS_GRAPH_TENANT_ID")
+        client_id = values.get("FLOWOPS_GRAPH_CLIENT_ID")
+        client_secret = values.get("FLOWOPS_GRAPH_CLIENT_SECRET")
+        if tenant and client_id and client_secret:
+            from src.graph import GraphClient
+            return GraphClientActionAdapter(
+                GraphClient(tenant_id=tenant, client_id=client_id, client_secret=client_secret,
+                            base_url=values.get("FLOWOPS_GRAPH_URL", "https://graph.microsoft.com/v1.0")),
+                sku_id=values.get("FLOWOPS_GRAPH_SKU_ID", ""),
+            )
         url = values.get("FLOWOPS_GRAPH_URL", "https://graph.microsoft.com/v1.0")
         token = values.get("FLOWOPS_GRAPH_ACCESS_TOKEN")
         if not token:
-            raise ValueError("FLOWOPS_GRAPH_ACCESS_TOKEN is required for graph")
+            raise ValueError("Set graph client credentials or FLOWOPS_GRAPH_ACCESS_TOKEN")
         return MicrosoftGraphAdapter(url, token)
+    if name == "connectwise_mock":
+        from src.connectwise import ConnectWiseMockAdapter
+        return ConnectWiseMockAdapter(base_url=values.get("FLOWOPS_CONNECTWISE_URL", "https://api.connectwise.com"))
     if name == "powershell":
         command_path = values.get("FLOWOPS_POWERSHELL_PATH", "pwsh")
         dry_run = values.get("FLOWOPS_POWERSHELL_DRY_RUN", "").lower() in ("true", "1", "yes")

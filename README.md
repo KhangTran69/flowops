@@ -380,6 +380,34 @@ Workflow definitions can be stored as immutable versions (migration `0008_workfl
 - Definition pages: `/ui/workflow-definitions`; request detail shows overdue/SLA
   badges and skip state.
 
+## Integration pack (v2.0)
+
+- **n8n workflows** — importable exports in [`flows/`](flows): ticket intake,
+  onboarding request + auto-run, and a ChatOps Slack approval card. Set
+  `FLOWOPS_API_URL` and `SLACK_WEBHOOK_URL` in n8n. Screenshots are not
+  fabricated; capture them after importing locally.
+- **Real Graph client** — [`src/graph.py`](src/graph.py) implements OAuth2
+  client credentials, `/users`, `assignLicense`, `$filter` with `@odata.nextLink`
+  paging, and 429 `Retry-After` retries. Configure
+  `FLOWOPS_GRAPH_TENANT_ID/CLIENT_ID/CLIENT_SECRET/SKU_ID`; tests use a fake
+  session. A real token still requires tenant credentials.
+- **Exchange Online** — [`scripts/exchange/Set-MailboxForwarding.ps1`](scripts/exchange/Set-MailboxForwarding.ps1)
+  performs real `Get-Mailbox`, forwarding and auto-reply changes and emits JSON;
+  [`src/powershell.py`](src/powershell.py) parses the JSON.
+- **ConnectWise mock** — [`src/connectwise.py`](src/connectwise.py) models
+  conditions queries, PATCH ticket operations, and ticket/time-entry payloads.
+- **MCP server** — [`src/mcp_server.py`](src/mcp_server.py) uses the official
+  Python SDK with `list_tickets`, `triage_ticket`, and `request_approval`.
+  Install `requirements-mcp.txt`; no Claude Desktop/video was recorded here.
+- **Reporting** — [`sql/reporting.sql`](sql/reporting.sql) and migration
+  `0009_reporting_view` add a ticket queue summary view.
+- **Runbooks** — [`docs/runbooks/`](docs/runbooks) covers failed onboarding
+  runs, ChatOps replay, and SLA overdue handling.
+- **Multi-tenancy** — deferred with a concrete migration plan in
+  [`docs/multi-tenancy-plan.md`](docs/multi-tenancy-plan.md); it is not
+  implemented in this pass.
+- **Prompt tidy-up** — historical prompts moved to [`docs/prompts/`](docs/prompts).
+
 ## Operator UI
 
 The HTML UI is server-rendered with Jinja2 templates and local CSS/vanilla JS
@@ -458,7 +486,7 @@ No real secrets or Microsoft tenant are included.
 ## Running the tests
 
 ```bash
-pytest    # 293 passed, 15 skipped locally; the skips are PostgreSQL-only tests
+pytest    # 298 passed, 15 skipped locally; the skips are PostgreSQL-only tests
 python -m compileall -q src tests
 ```
 

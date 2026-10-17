@@ -1113,23 +1113,23 @@ def login_page(
 @app.post("/login", response_class=HTMLResponse, include_in_schema=False)
 def login_submit(
     request: Request,
-    token: str = Form(default=""),
+    username: str = Form(default=""),
+    password: str = Form(default=""),
     next: str = Form(default=""),
     db_session: Session = Depends(db.get_session),
 ) -> Response:
-    """Validate a bearer token and create a signed browser session."""
+    """Validate the admin username and password and create a signed browser session."""
     if not ui_session.ui_auth_required():
         return RedirectResponse("/dashboard", status_code=303)
-    try:
-        actor = authenticate_bearer(f"Bearer {token.strip()}")
-    except AuthenticationError:
+    actor = ui_session.authenticate_admin(username.strip(), password)
+    if actor is None:
         return web.render(
             request,
             "login.html",
             {
                 "active": "login",
                 "next": ui_session.safe_next(next),
-                "error": "Invalid access token.",
+                "error": "Invalid username or password.",
             },
             status_code=401,
         )

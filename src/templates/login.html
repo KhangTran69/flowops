@@ -5,7 +5,7 @@
   <div>
     <span class="eyebrow">Operator console</span>
     <h1>Sign in</h1>
-    <p class="muted">Paste a development bearer token or Entra access token.</p>
+    <p class="muted">Sign in with the admin account.</p>
   </div>
 </section>
 <section class="panel" style="max-width: 34rem;">
@@ -13,14 +13,17 @@
   <form method="post" action="/login">
     <input type="hidden" name="next" value="{{ next }}">
     <label class="field">
-      <span>Access token</span>
-      <input type="password" name="token" autocomplete="off" required>
+      <span>Username</span>
+      <input type="text" name="username" autocomplete="username" required autofocus>
+    </label>
+    <label class="field">
+      <span>Password</span>
+      <input type="password" name="password" autocomplete="current-password" required>
     </label>
     <div class="toolbar" style="margin-top: 0.9rem;">
       <button class="button primary" type="submit">Sign in</button>
       <a class="button ghost" href="/">Home</a>
     </div>
   </form>
-  <p class="muted small" style="margin-top: 1rem;">Local demos can run with UI auth disabled; protected deployments must set UI auth, a session secret, and a token source.</p>
 </section>
 {% endblock %}
