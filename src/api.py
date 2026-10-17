@@ -20,7 +20,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi import status as http_status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, StrictBool, StrictInt, StrictStr, field_validator
-from sqlalchemy import and_, select
+from sqlalchemy import and_, delete, select, update
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
@@ -937,11 +937,12 @@ def dashboard(session: Session = Depends(db.get_session)) -> str:
     logs = session.execute(
         select(db.ExecutionLogRecord).order_by(db.ExecutionLogRecord.id.desc()).limit(200)
     ).scalars().all()
-    pending_deliveries = session.execute(
-        select(db.NotificationOutboxRecord).where(
-            db.NotificationOutboxRecord.status == "pending"
-        )
+    outbox_records = session.execute(
+        select(db.NotificationOutboxRecord)
     ).scalars().all()
+    pending_deliveries = [
+        item for item in outbox_records if item.status == "pending"
+    ]
 
     total = len(tickets)
     open_count = sum(1 for t in tickets if t.status == "open")
@@ -954,7 +955,13 @@ def dashboard(session: Session = Depends(db.get_session)) -> str:
         round(sum(log.duration_ms for log in logs) / len(logs)) if logs else 0
     )
     auto_routed = sum(1 for t in tickets if t.queue and t.queue != "it-service-desk")
-    hours_saved = round(auto_routed * 15 / 60, 1)  # 15 min of triage saved per ticket
+    hours_saved = round(auto_routed * 15 / 60, 1)
+    outbox_counts = Counter(item.status for item in outbox_records)
+    outbox_pending = outbox_counts.get("pending", 0)
+    outbox_delivered = outbox_counts.get("delivered", 0)
+    outbox_failed = outbox_counts.get("failed", 0)
+    outbox_attempts = sum(item.attempts for item in outbox_records)
+    outbox_retries = sum(max(item.attempts - 1, 0) for item in outbox_records)
 
     def counter_rows(counter: Counter) -> str:
         return "".join(
@@ -973,9 +980,9 @@ def dashboard(session: Session = Depends(db.get_session)) -> str:
     )
 
     outbox_card = (
-        f'<div class="card"><div class="value fail">{len(pending_deliveries)}'
+        f'<div class="card"><div class="value fail">{outbox_pending}'
         '</div><div class="label">pending webhook retries</div></div>'
-        if pending_deliveries
+        if outbox_pending
         else ""
     )
     outbox_section = ""
@@ -991,7 +998,7 @@ def dashboard(session: Session = Depends(db.get_session)) -> str:
             for item in pending_deliveries[:15]
         )
         outbox_section = f"""<section>
-<h2>Failed webhook deliveries ({len(pending_deliveries)} pending)</h2>
+        <h2>Failed webhook deliveries ({outbox_pending} pending)</h2>
 <p>Retry them with <code>POST /notifications/retry</code> &middot;
 list with <code>GET /notifications/pending</code>.</p>
 <table><tr><th>#</th><th>ticket</th><th>url</th><th>attempts</th><th>last error</th></tr>{outbox_rows}</table>
@@ -1034,7 +1041,11 @@ list with <code>GET /notifications/pending</code>.</p>
   <div class="card"><div class="value">{failure_count}</div><div class="label">failed runs</div></div>
   <div class="card"><div class="value">{avg_duration} ms</div><div class="label">avg run duration</div></div>
   <div class="card"><div class="value">{hours_saved} h</div><div class="label">est. staff time saved</div></div>
-  {outbox_card}
+  <div class="card"><div class="value">{outbox_pending}</div><div class="label">pending notifications</div></div>
+  <div class="card"><div class="value">{outbox_pending}</div><div class="label">pending webhook retries</div></div>
+  <div class="card"><div class="value">{outbox_delivered}</div><div class="label">delivered notifications</div></div>
+  <div class="card"><div class="value">{outbox_failed}</div><div class="label">failed notifications</div></div>
+  <div class="card"><div class="value">{outbox_retries}</div><div class="label">notification retries</div></div>
 </div>
 <div class="cols">
   <section><h2>Tickets by queue</h2><table>{counter_rows(by_queue)}</table></section>

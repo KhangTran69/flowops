@@ -545,3 +545,7 @@ def test_dashboard_renders_stats(client):
     assert "text/html" in response.headers["content-type"]
     assert "FlowOps monitoring dashboard" in response.text
     assert "ticket.created" in response.text
+    assert "pending notifications" in response.text
+    assert "delivered notifications" in response.text
+    assert "failed notifications" in response.text
+    assert "notification retries" in response.text
