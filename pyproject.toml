@@ -1,0 +1,4 @@
+# FastAPI CLI / FastAPI Cloud entrypoint configuration.
+# The application object lives in src/api.py as ``app``.
+[tool.fastapi]
+entrypoint = "src.api:app"
