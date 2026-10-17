@@ -5,12 +5,14 @@ routing, outbound notifications, and an n8n-friendly webhook; v0.5 adds
 onboarding/offboarding checklists, idempotency keys, and delivery retries.
 """
 
+import hashlib
 import html
+import json
 import os
 import time
 import uuid
 from collections import Counter
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
@@ -33,7 +35,7 @@ app = FastAPI(
         "onboarding workflows, and monitoring. Learning prototype; "
         "ticket data is simulated, not real support tickets."
     ),
-    version="0.5.0",
+    version="1.0.0-preview",
 )
 
 
@@ -123,8 +125,13 @@ class OnboardingRequestIn(BaseModel):
     def iso_date(cls, value: Optional[str]) -> Optional[str]:
         import re
 
-        if value is not None and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
-            raise ValueError("start_date must be an ISO date (YYYY-MM-DD)")
+        if value is not None:
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                raise ValueError("start_date must be an ISO date (YYYY-MM-DD)")
+            try:
+                date.fromisoformat(value)
+            except ValueError as error:
+                raise ValueError("start_date must be a valid calendar date") from error
         return value
 
 
@@ -227,7 +234,7 @@ LANDING_PAGE = """<!doctype html>
 <body>
 <main>
   <h1>FlowOps</h1>
-  <p class="tagline">IT workflow automation &mdash; tickets, routing, onboarding (v0.5)</p>
+  <p class="tagline">IT workflow automation &mdash; tickets, routing, onboarding (v1.0 preview)</p>
   <ul>
     <li>GET /health</li>
     <li>POST /tickets &nbsp;(supports Idempotency-Key)</li>
@@ -276,9 +283,18 @@ def create_ticket(
         raise HTTPException(
             status_code=422, detail="Idempotency-Key must be at most 128 characters."
         )
+    request_hash = hashlib.sha256(
+        json.dumps(request.model_dump(), sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     if idempotency_key:
         stored = session.get(db.IdempotencyRecord, idempotency_key)
         if stored:
+            stored_payload = json.loads(stored.response_json)
+            if stored_payload.get("request_hash") != request_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Idempotency-Key was already used with a different request.",
+                )
             response.status_code = http_status.HTTP_200_OK
             response.headers["Idempotency-Replayed"] = "true"
             db.log_execution(
@@ -289,7 +305,7 @@ def create_ticket(
                 ticket_id=stored.ticket_id,
                 detail="replayed stored response without re-executing",
             )
-            return Ticket.model_validate_json(stored.response_json)
+            return Ticket.model_validate(stored_payload["ticket"])
 
     if session.get(db.TicketRecord, str(request.id)) is not None:
         response.status_code = http_status.HTTP_200_OK
@@ -299,7 +315,10 @@ def create_ticket(
             db.IdempotencyRecord(
                 key=idempotency_key,
                 ticket_id=result.ticket_id,
-                response_json=result.model_dump_json(),
+                response_json=json.dumps(
+                    {"request_hash": request_hash, "ticket": result.model_dump()},
+                    separators=(",", ":"),
+                ),
             )
         )
     return result

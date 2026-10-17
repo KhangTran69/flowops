@@ -121,7 +121,7 @@ services without deleting the stored PostgreSQL data. Use
 | Method & path | Purpose |
 |---|---|
 | `GET /health` | Liveness probe |
-| `POST /tickets` | Validate, route, store a ticket. `201` new / `200` update. Supports `Idempotency-Key` header: replays return the stored response with `Idempotency-Replayed: true` and do **not** re-execute |
+| `POST /tickets` | Validate, route, store a ticket. `201` new / `200` update. Supports `Idempotency-Key`: same-payload replays return the stored response with `Idempotency-Replayed: true`; reusing a key with a different payload returns `409` |
 | `GET /tickets`, `GET /tickets/{id}` | Read tickets (sorted by ID; unknown/non-numeric ID → 404) |
 | `POST /webhooks/intake` | n8n-friendly intake: single ticket or bulk list; always `200` on success, `422` rejects the whole batch if any item is invalid |
 | `POST /onboarding-requests` | Create onboarding/offboarding request → generates its checklist |
@@ -160,7 +160,8 @@ curl -X POST http://127.0.0.1:8000/onboarding-requests -H 'Content-Type: applica
 - **Intake validation** — strict Pydantic types (`StrictInt`/`StrictStr`/`StrictBool`, positive IDs, non-blank titles) → `422` with field details; wrong top-level structure rejected.
 - **HTTP/network (CLI & webhooks)** — `raise_for_status()`, 10s CLI timeout, webhook deliveries retried 3× with exponential backoff (0.5s → 1s) and reported to the execution log instead of raising, so a flaky webhook never fails intake.
 - **Workflow state** — invalid checklist transitions return `409` with a clear reason (e.g. completing an unapproved gated step).
-- **Idempotency** — replayed keys return the original response without re-execution; keys over 128 chars → `422`.
+- **Idempotency** — same-payload replays return the original response without re-execution; using the key with a different payload returns `409`; keys over 128 chars → `422`.
+- **Onboarding dates** — `start_date` must be both ISO-formatted and a real calendar date.
 - `main()` (CLI) catches specific exception families only — no blanket `except`, no silent failures.
 
 ## Security considerations
