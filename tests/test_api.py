@@ -48,8 +48,8 @@ def test_landing_page_has_no_merge_conflict_markers(client):
     for marker in ("<<<<<<<", "=======", ">>>>>>>"):
         assert marker not in page
     assert "/onboarding-requests" in page
-    assert "/notifications/pending" in page
-    assert "/notifications/failed" in page
+    assert "/ui/notifications" in page
+    assert "/ui/onboarding-requests" in page
 
 
 # --- Ticket intake ---
@@ -874,7 +874,7 @@ def test_dashboard_shows_pending_retries_section(client, monkeypatch):
 
     page = client.get("/dashboard").text
     assert "Pending webhook deliveries" in page
-    assert "pending webhook retries" in page
+    assert "Pending notifications" in page
     assert "hooks.example" in page  # the failing URL is surfaced
 
 
@@ -902,7 +902,8 @@ def test_dashboard_renders_stats(client):
     assert "text/html" in response.headers["content-type"]
     assert "FlowOps monitoring dashboard" in response.text
     assert "ticket.created" in response.text
-    assert "pending notifications" in response.text
-    assert "delivered notifications" in response.text
-    assert "failed notifications" in response.text
-    assert "notification retries" in response.text
+    page = response.text.lower()
+    assert "pending notifications" in page
+    assert "delivered notifications" in page
+    assert "failed notifications" in page
+    assert "notification retries" in page

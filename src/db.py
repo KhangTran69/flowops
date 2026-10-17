@@ -89,6 +89,8 @@ class IdempotencyRecord(Base):
     owner_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     resource_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class ActionExecutionRecord(Base):
     """Durable audit record for one onboarding action attempt."""
 
@@ -109,6 +111,51 @@ class ActionExecutionRecord(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     duration_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+
+class WorkflowJobRecord(Base):
+    """A durable, leased unit of workflow work.
+
+    ``lease_owner_token`` and ``lease_expires_at`` fence completion: a worker
+    that lost its lease cannot mark the job succeeded or schedule a retry.
+    """
+
+    __tablename__ = "workflow_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    idempotency_key: Mapped[Optional[str]] = mapped_column(
+        String(200), nullable=True, unique=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="queued"
+    )  # queued|running|succeeded|retry_scheduled|failed|cancelled
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+    lease_owner_token: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    result_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    resource_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    resource_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    label: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class NotificationOutboxRecord(Base):
