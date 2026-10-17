@@ -1,0 +1,17 @@
+{
+  "name": "FlowOps — Onboarding request and auto-run",
+  "nodes": [
+    { "parameters": { "httpMethod": "POST", "path": "flowops-onboarding", "responseMode": "lastNode", "options": {} }, "id": "webhook-onboarding", "name": "Onboarding webhook", "type": "n8n-nodes-base.webhook", "typeVersion": 2, "position": [-220, 0], "webhookId": "flowops-onboarding" },
+    { "parameters": { "method": "POST", "url": "={{$env.FLOWOPS_API_URL}}/onboarding-requests", "sendBody": true, "specifyBody": "json", "jsonBody": "={{JSON.stringify($json.body)}}", "options": {} }, "id": "create-request", "name": "Create request", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [20, 0] },
+    { "parameters": { "method": "POST", "url": "={{$env.FLOWOPS_API_URL}}/onboarding-requests/{{$json.id}}/run", "sendBody": true, "specifyBody": "json", "jsonBody": "={}", "options": {} }, "id": "start-run", "name": "Start DAG run", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [260, 0] }
+  ],
+  "connections": {
+    "Onboarding webhook": { "main": [[{ "node": "Create request", "type": "main", "index": 0 }]] },
+    "Create request": { "main": [[{ "node": "Start DAG run", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "versionId": "flowops-onboarding-v1",
+  "meta": { "templateCredsSetupCompleted": false },
+  "tags": []
+}

@@ -1,0 +1,39 @@
+{
+  "name": "FlowOps — Ticket intake to notification",
+  "nodes": [
+    {
+      "parameters": { "httpMethod": "POST", "path": "flowops-ticket", "responseMode": "lastNode", "options": {} },
+      "id": "webhook-ticket", "name": "Ticket webhook", "type": "n8n-nodes-base.webhook", "typeVersion": 2, "position": [-200, 0], "webhookId": "flowops-ticket"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.FLOWOPS_API_URL}}/webhooks/intake",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "X-API-Key", "value": "={{$env.FLOWOPS_WEBHOOK_API_KEY}}" }] },
+        "sendBody": true, "specifyBody": "json", "jsonBody": "={{$json.body}}", "options": {}
+      },
+      "id": "flowops-intake", "name": "FlowOps intake", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [40, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.SLACK_WEBHOOK_URL}}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"text\":\"New FlowOps ticket accepted: \" + ($json.ticket_id || \"unknown\")}",
+        "options": {}
+      },
+      "id": "notify", "name": "Notify channel", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [280, 0]
+    }
+  ],
+  "connections": {
+    "Ticket webhook": { "main": [[{ "node": "FlowOps intake", "type": "main", "index": 0 }]] },
+    "FlowOps intake": { "main": [[{ "node": "Notify channel", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "versionId": "flowops-ticket-intake-v1",
+  "meta": { "templateCredsSetupCompleted": false },
+  "tags": []
+}
