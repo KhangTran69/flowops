@@ -83,6 +83,19 @@
   {% endif %}
 </section>
 
+<section class="panel" aria-labelledby="ai-heading">
+  <div class="panel-head">
+    <h2 id="ai-heading">AI activity</h2>
+    <a class="button small ghost" href="/ui/tickets">Open tickets</a>
+  </div>
+  <div class="kpi-grid">
+    <div class="kpi"><span class="kpi-value">{{ ai_stats.triage }}</span><span class="kpi-label">Triage calls</span></div>
+    <div class="kpi"><span class="kpi-value">{{ ai_stats.applies }}</span><span class="kpi-label">Applied recommendations</span></div>
+    <div class="kpi"><span class="kpi-value {% if ai_stats.errors %}fail{% endif %}">{{ ai_stats.errors }}</span><span class="kpi-label">Provider errors</span></div>
+  </div>
+  <p class="muted small">AI is suggest-only; only operator-approved queue/priority changes are applied.</p>
+</section>
+
 <section class="panel" aria-labelledby="runs-heading">
   <div class="panel-head">
     <h2 id="runs-heading">Recent workflow runs</h2>
@@ -151,7 +164,7 @@
         {% for item in failed %}
         <tr>
           <td>#{{ item.id }}</td><td>{{ item.ticket_id or '—' }}</td><td class="mono">{{ item.url }}</td><td>{{ item.attempts }}</td><td class="fail">{{ item.last_error or '—' }}</td>
-          <td><button class="button small" type="button" data-action-url="/notifications/{{ item.id }}/requeue" data-method="POST" data-reload="true" data-confirm="Requeue this dead-letter delivery?">Requeue</button></td>
+          <td>{% if actor and 'automation.admin' in actor.roles %}<button class="button small" type="button" data-action-url="/notifications/{{ item.id }}/requeue" data-method="POST" data-reload="true" data-confirm="Requeue this dead-letter delivery?">Requeue</button>{% else %}<span class="muted small">admin only</span>{% endif %}</td>
         </tr>
         {% endfor %}
       </tbody>

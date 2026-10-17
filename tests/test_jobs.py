@@ -238,3 +238,60 @@ def test_heartbeat_rejects_a_lost_lease(client):
         session.commit()
     finally:
         session.close()
+
+
+def test_worker_terminal_failure_triggers_notification_webhook(client, monkeypatch):
+    from src.notify import DeliveryResult
+
+    request_id, item_id = _create_onboarding_item(client)
+    job = client.post(
+        f"/onboarding-requests/{request_id}/items/{item_id}/jobs"
+    ).json()
+
+    class AlwaysFailingAdapter:
+        def execute(self, action, context):
+            raise RuntimeError("adapter critical failure")
+
+    webhook_calls = []
+
+    def fake_deliver(url, payload):
+        webhook_calls.append((url, payload))
+        return DeliveryResult(success=True, attempts=1, last_error=None)
+
+    monkeypatch.setattr(worker, "ACTION_ADAPTER", AlwaysFailingAdapter())
+    monkeypatch.setenv("FLOWOPS_ACTION_FAILURE_WEBHOOK_URL", "https://alert.example/worker-fail")
+    monkeypatch.setattr("src.notify.deliver_webhook", fake_deliver)
+
+    session = db.SessionLocal()
+    try:
+        row = session.get(db.WorkflowJobRecord, job["id"])
+        row.max_attempts = 2
+        session.commit()
+    finally:
+        session.close()
+
+    # Exhaust retries (max_attempts=2)
+    first = worker.run_once(worker_id="fail-worker-1")
+    assert first is not None and first.status == "retry_scheduled"
+    assert len(webhook_calls) == 0  # not terminal yet
+
+    # Advance availability
+    session = db.SessionLocal()
+    try:
+        row = session.get(db.WorkflowJobRecord, job["id"])
+        row.available_at = db.utcnow() - timedelta(seconds=1)
+        session.commit()
+    finally:
+        session.close()
+
+    second = worker.run_once(worker_id="fail-worker-2")
+    assert second is not None and second.status == "failed"
+    assert len(webhook_calls) == 1
+    url, payload = webhook_calls[0]
+    assert url == "https://alert.example/worker-fail"
+    assert payload["event"] == "workflow.job.failed"
+    assert payload["job_id"] == job["id"]
+    assert "critical failure" in payload["error"]
+
+    logs = client.get("/execution-logs").json()
+    assert any(log["action"] == "notification.action_failure" for log in logs)

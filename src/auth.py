@@ -14,6 +14,7 @@ import requests
 class Actor:
     subject: str
     roles: tuple[str, ...]
+    source: str = "local"  # local | bearer | session
 
 
 class AuthenticationError(ValueError):

@@ -1,0 +1,39 @@
+{
+  "uid": "flowops-overview",
+  "title": "FlowOps Overview",
+  "tags": ["flowops", "automation"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "HTTP requests / second",
+      "gridPos": {"h": 5, "w": 8, "x": 0, "y": 0},
+      "targets": [{"expr": "sum(rate(flowops_http_requests_total[1m]))", "legendFormat": "requests/s"}]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Workflow jobs by state",
+      "gridPos": {"h": 8, "w": 12, "x": 8, "y": 0},
+      "targets": [{"expr": "flowops_workflow_jobs", "legendFormat": "{{status}}"}]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Notification outbox by state",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 5},
+      "targets": [{"expr": "flowops_notification_outbox", "legendFormat": "{{status}}"}]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Application uptime",
+      "gridPos": {"h": 5, "w": 8, "x": 12, "y": 8},
+      "targets": [{"expr": "flowops_uptime_seconds", "legendFormat": "seconds"}]
+    }
+  ]
+}

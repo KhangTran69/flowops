@@ -130,7 +130,7 @@ def test_operator_dependency_rejects_viewer_role():
     from src.auth import Actor
 
     with pytest.raises(HTTPException) as error:
-        _operator_actor(Actor(subject="viewer", roles=("automation.viewer",)))
+        _operator_actor(None, Actor(subject="viewer", roles=("automation.viewer",)))
     assert error.value.status_code == 403
 
 

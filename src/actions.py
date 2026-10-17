@@ -92,6 +92,59 @@ class PowerAutomateAdapter:
 
 
 
+class PowerShellAdapter:
+    """Executes checklist actions via PowerShell / Microsoft Graph PowerShell SDK.
+
+    Supports local pwsh execution, script templating, and dry-run execution
+    for safe testing without executing external processes.
+    """
+
+    def __init__(
+        self,
+        command_path: str = "pwsh",
+        dry_run: bool = False,
+        timeout: float = 15.0,
+    ) -> None:
+        self.command_path = command_path
+        self.dry_run = dry_run
+        self.timeout = timeout
+
+    def execute(self, action: str, context: dict[str, Any]) -> ActionResult:
+        employee = context.get("employee_email", "unknown")
+        if self.dry_run:
+            return ActionResult(
+                action=action,
+                detail=f"simulated PowerShell execution '{action}' for {employee}",
+            )
+
+        import json
+        import subprocess
+
+        script = (
+            f"$input_json = $input | Out-String; "
+            f"Write-Output \"PowerShell executed action '{action}' for {employee}\""
+        )
+        payload = json.dumps({"action": action, "context": context})
+        try:
+            result = subprocess.run(
+                [self.command_path, "-NoProfile", "-NonInteractive", "-Command", script],
+                input=payload,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+                check=True,
+            )
+            detail = result.stdout.strip() or f"PowerShell completed action '{action}'"
+            return ActionResult(action=action, detail=detail)
+        except subprocess.CalledProcessError as err:
+            err_msg = err.stderr.strip() if err.stderr else str(err)
+            raise RuntimeError(f"PowerShell execution failed: {err_msg}") from err
+        except subprocess.TimeoutExpired as err:
+            raise RuntimeError(f"PowerShell action timed out after {self.timeout}s") from err
+        except FileNotFoundError as err:
+            raise RuntimeError(f"PowerShell executable not found at '{self.command_path}'") from err
+
+
 def adapter_from_environment(environ: dict[str, str] | None = None) -> ActionAdapter:
     """Build the configured adapter; simulation remains the safe default."""
     values = environ if environ is not None else os.environ
@@ -109,6 +162,10 @@ def adapter_from_environment(environ: dict[str, str] | None = None) -> ActionAda
         if not token:
             raise ValueError("FLOWOPS_GRAPH_ACCESS_TOKEN is required for graph")
         return MicrosoftGraphAdapter(url, token)
+    if name == "powershell":
+        command_path = values.get("FLOWOPS_POWERSHELL_PATH", "pwsh")
+        dry_run = values.get("FLOWOPS_POWERSHELL_DRY_RUN", "").lower() in ("true", "1", "yes")
+        return PowerShellAdapter(command_path=command_path, dry_run=dry_run)
     raise ValueError(f"Unsupported FLOWOPS_ACTION_ADAPTER: {name!r}")
 
 

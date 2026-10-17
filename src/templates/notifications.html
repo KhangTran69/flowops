@@ -46,7 +46,7 @@
         {% for item in failed %}
         <tr>
           <td>#{{ item.id }}</td><td>{{ item.ticket_id or '—' }}</td><td class="mono">{{ item.url }}</td><td>{{ item.attempts }}</td><td class="fail">{{ item.last_error or '—' }}</td><td>{{ item.created_at }}</td>
-          <td><button class="button small" type="button" data-action-url="/notifications/{{ item.id }}/requeue" data-method="POST" data-reload="true" data-confirm="Requeue this dead-letter delivery?">Requeue</button></td>
+          <td>{% if actor and 'automation.admin' in actor.roles %}<button class="button small" type="button" data-action-url="/notifications/{{ item.id }}/requeue" data-method="POST" data-reload="true" data-confirm="Requeue this dead-letter delivery?">Requeue</button>{% else %}<span class="muted small">admin only</span>{% endif %}</td>
         </tr>
         {% endfor %}
       </tbody>

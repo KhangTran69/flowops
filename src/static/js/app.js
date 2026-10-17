@@ -28,6 +28,11 @@
     });
   }
 
+  function csrfToken() {
+    var meta = document.querySelector('meta[name="csrf-token"]');
+    return meta ? meta.getAttribute("content") : "";
+  }
+
   function toast(message, kind) {
     var node = document.getElementById("toast");
     if (!node) {
@@ -71,6 +76,8 @@
       button.textContent = "Working…";
 
       var options = { method: method, headers: { "Accept": "application/json" } };
+      var csrf = csrfToken();
+      if (csrf) options.headers["X-CSRF-Token"] = csrf;
       var body = button.getAttribute("data-body");
       if (body) {
         options.headers["Content-Type"] = "application/json";
@@ -134,4 +141,45 @@
       })
       .catch(function () { status.textContent = "API unavailable"; });
   }
+  document.querySelectorAll("[data-ai-apply]").forEach(function (button) {
+    button.addEventListener("click", function () {
+      var url = button.getAttribute("data-ai-apply");
+      var ids = Array.prototype.map.call(
+        document.querySelectorAll('input[name="ai-recommendation"]:checked'),
+        function (input) { return input.value; }
+      );
+      if (!ids.length) {
+        toast("Select at least one applicable recommendation.", "error");
+        return;
+      }
+      button.disabled = true;
+      button.setAttribute("aria-busy", "true");
+      var headers = { "Content-Type": "application/json", "Accept": "application/json" };
+      var csrf = csrfToken();
+      if (csrf) headers["X-CSRF-Token"] = csrf;
+      fetch(url, {
+        method: "POST",
+        headers: headers,
+        body: JSON.stringify({ recommendation_ids: ids })
+      }).then(function (response) {
+        return response.text().then(function (text) {
+          var payload = null;
+          try { payload = text ? JSON.parse(text) : null; } catch (error) { payload = null; }
+          if (!response.ok) {
+            var detail = payload && payload.detail ? payload.detail : ("HTTP " + response.status);
+            throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+          }
+          return payload;
+        });
+      }).then(function () {
+        toast("AI recommendations applied.", "success");
+        window.location.reload();
+      }).catch(function (error) {
+        toast(error.message || "Could not apply recommendations.", "error");
+        button.disabled = false;
+        button.removeAttribute("aria-busy");
+      });
+    });
+  });
+
 })();
