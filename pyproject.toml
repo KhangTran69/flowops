@@ -2,3 +2,8 @@
 # The application object lives in src/api.py as ``app``.
 [tool.fastapi]
 entrypoint = "src.api:app"
+
+# Vercel's Python/FastAPI runtime also needs an explicit entrypoint because
+# docker/webhook-sink/app.py exports a second ASGI callable (Handler).
+[tool.vercel]
+entrypoint = "src.api:app"
