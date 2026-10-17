@@ -6,10 +6,20 @@ postgresql+psycopg:// connection string.
 """
 
 import os
+import threading
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text, create_engine
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Integer,
+    String,
+    Text,
+    create_engine,
+    inspect,
+    text,
+)
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
@@ -75,13 +85,20 @@ class ExecutionLogRecord(Base):
 
 
 class IdempotencyRecord(Base):
-    """Stores the response produced for an Idempotency-Key (v0.5)."""
+    """Reservation and stored response for an Idempotency-Key (v0.5, fenced).
+
+    ``owner_token`` is the fencing token of the request that currently owns the
+    reservation. A stale takeover replaces it atomically, so the previous owner
+    can no longer finalize or delete the row. ``created_at`` is the start of the
+    current five-minute recovery lease and is refreshed on every takeover.
+    """
 
     __tablename__ = "idempotency_keys"
 
     key: Mapped[str] = mapped_column(String(128), primary_key=True)
     ticket_id: Mapped[str] = mapped_column(String(64), nullable=False)
     response_json: Mapped[str] = mapped_column(Text, nullable=False)
+    owner_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
@@ -157,6 +174,7 @@ class ChecklistItemRecord(Base):
 
 
 _tables_ready = False
+_tables_lock = threading.Lock()
 engine = create_engine(
     DEFAULT_DATABASE_URL,
     connect_args={"check_same_thread": False}
@@ -216,14 +234,45 @@ def _add_missing_columns() -> None:
                 )
 
 
-def get_session():
-    """FastAPI dependency yielding a session; commits on success."""
+def _ensure_idempotency_owner_token() -> None:
+    """Add the fencing column to databases created before it existed.
+
+    ``create_all`` only creates missing tables, so an existing local
+    ``idempotency_keys`` table needs a small, additive migration. The column is
+    nullable so pre-fencing rows remain readable and can be taken over.
+    """
+    inspector = inspect(engine)
+    if "idempotency_keys" not in inspector.get_table_names():
+        return
+    column_names = {
+        column["name"] for column in inspector.get_columns("idempotency_keys")
+    }
+    if "owner_token" in column_names:
+        return
+    with engine.begin() as connection:
+        connection.execute(
+            text("ALTER TABLE idempotency_keys ADD COLUMN owner_token VARCHAR(64)")
+        )
+
+
+def _ensure_tables() -> None:
+    """Create missing tables once and apply additive compatibility migrations."""
     global _tables_ready
-    if not _tables_ready:
+    if _tables_ready:
+        return
+    with _tables_lock:
+        if _tables_ready:
+            return
         _ensure_sqlite_dir()
         Base.metadata.create_all(engine)
         _add_missing_columns()
+        _ensure_idempotency_owner_token()
         _tables_ready = True
+
+
+def get_session():
+    """FastAPI dependency yielding a session; commits on success."""
+    _ensure_tables()
     session = SessionLocal()
     try:
         yield session
