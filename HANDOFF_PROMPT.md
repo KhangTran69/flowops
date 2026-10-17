@@ -31,7 +31,7 @@ Milestones v0.1–v0.5 plus the monitoring dashboard are implemented and tested 
 
 ## Next steps (in order)
 
-1. **v1.0 polish** (done 2026-10-17 except what needs external services): GitHub Actions CI (`.github/workflows/ci.yml`, pytest on 3.10–3.13) and Docker Compose (`Dockerfile`, `docker-compose.yml` — API + PostgreSQL 16, `FLOWOPS_DATABASE_URL` prewired, `psycopg[binary]` in requirements). YAML syntax-validated; **Docker build not yet executed** (no Docker on the dev machine) — first task on a Docker-enabled machine is `docker compose up --build` + curl `/health`. The repo has local git commits (branch `main`); nothing pushed.
+1. **v1.0 polish** (done 2026-10-17): GitHub Actions CI (`.github/workflows/ci.yml`, pytest on 3.10–3.13, plus a PostgreSQL deployment job) and Docker Compose (`Dockerfile`, `docker-compose.yml` — API + PostgreSQL 16, `FLOWOPS_DATABASE_URL` prewired, `psycopg[binary]` in requirements). **Docker Compose verified end to end on 2026-10-17**: `docker compose up --build` succeeded, all 5 tables created in Postgres, ticket POST/GET and execution logs verified against the containerized database. The repo is pushed to https://github.com/KhangTran69/flowops.git (private) with green CI.
 2. **v0.6 Microsoft actions** (needs real credentials from the user — ask before starting): wire onboarding checklist steps to real actions via Microsoft Graph / Power Automate / PowerShell; add per-step retry + failure alerts; keep everything behind approval gates.
 3. **v0.7 AI support agent** (needs AI credentials from the user): MCP/Claude-powered ticket assistance — summarize history, suggest knowledge-base solutions, recommend actions; sensitive actions require explicit human approval in the workflow.
 
