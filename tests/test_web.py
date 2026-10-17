@@ -176,3 +176,26 @@ def test_job_detail_missing_renders_404(client):
     response = client.get("/ui/workflow-jobs/999")
     assert response.status_code == 404
     assert "Page not found" in response.text
+
+
+def test_offboarding_detail_uses_ledger_completion_endpoint(client):
+    created = client.post(
+        "/onboarding-requests",
+        json={**ONBOARDING, "request_type": "offboarding"},
+    )
+    assert created.status_code == 201
+    body = created.json()
+    page = client.get(f"/ui/onboarding-requests/{body['id']}").text
+    assert f"/offboarding-requests/{body['id']}/steps/recover_laptop/complete" in page
+    assert f"/offboarding-requests/{body['id']}/steps/disable_user_account/complete" not in page
+
+
+def test_dashboard_shows_offboarding_progress(client):
+    created = client.post(
+        "/onboarding-requests",
+        json={**ONBOARDING, "request_type": "offboarding", "employee_name": "Leaving Person"},
+    )
+    assert created.status_code == 201
+    page = client.get("/dashboard").text
+    assert "Offboarding progress" in page
+    assert "Leaving Person" in page

@@ -280,6 +280,12 @@ class OffboardingCompletionRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     checklist_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     step_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    # NULL means a legacy completed row (the table predates status tracking).
+    status: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    owner_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     completed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )

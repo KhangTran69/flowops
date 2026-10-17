@@ -38,6 +38,9 @@ local verification and GitHub Actions.
   token. A stale owner that loses its lease to a takeover cannot finalize or
   delete the new reservation, and its resource/log writes roll back with a
   retryable 409. Keys are scoped to their resource type.
+- Offboarding completions use an admin-only append-only ledger. The ledger
+  row is claimed before the simulated side effect, so concurrent callers
+  cannot execute a step twice; replays return the stored result.
 - Failed webhook deliveries move to a dead-letter state after the configured
   attempt limit. An operator can inspect failed rows and conditionally requeue
   one; delivery remains at-least-once, so receivers must deduplicate.

@@ -28,6 +28,7 @@ FlowOps is an IT workflow automation platform. It receives support tickets and o
 | v1.0 UI: operator console | ✅ | Jinja2 templates, responsive dashboard, onboarding/outbox pages, theme toggle, inline actions |
 | v1.0 Reliability: durable workflow jobs | ✅ | Leased worker queue with retries, dead-letter, operator retry/cancel |
 | v1.0 Security: auth, roles, audit | ✅ | Optional bearer/Entra auth, role checks, webhook API key, actor attribution |
+| v0.6.1 Offboarding completion ledger | ✅ | Admin-only, claim-before-execute, idempotent replay, stale-claim takeover, ledger-backed offboarding |
 | v1.0 Operations: readiness, metrics, migrations | ✅ | `/ready`, `/metrics`, correlation IDs, Alembic baseline, container migration entrypoint |
 | v1.0 CI + Docker | ✅ | GitHub Actions runs pytest, a Docker Compose API + PostgreSQL smoke test, and PostgreSQL reliability tests |
 | v0.6 Microsoft 365 actions | ⬜ | Real account creation via Power Automate / Microsoft Graph / PowerShell (needs credentials) |
@@ -154,7 +155,8 @@ services without deleting the stored PostgreSQL data. Use
 | `GET /notifications/failed` | List dead-letter deliveries that exhausted their retry budget |
 | `POST /notifications/retry?limit=` | Retry pending deliveries once each; failures become `failed` at the configured attempt limit |
 | `POST /notifications/{id}/requeue` | Return one `failed` delivery to `pending`; `409` unless still failed |
-| `POST .../items/{item}/execute` | Synchronous action execution (kept for compatibility; optional auth) |
+| `POST .../items/{item}/execute` | Synchronous onboarding action execution (kept for compatibility; optional auth) |
+| `POST /offboarding-requests/{checklist_id}/steps/{step_key}/complete` | Admin-only, idempotent offboarding completion via the claim ledger |
 | `POST .../items/{item}/jobs` | Enqueue a durable workflow job and return `202` |
 | `GET /workflow-jobs?status=&limit=` | List durable jobs; `GET /workflow-jobs/{id}` for one |
 | `POST /workflow-jobs/{id}/retry` | Return a failed job to the queue with a fresh attempt budget |
@@ -235,8 +237,26 @@ curl -X POST http://127.0.0.1:8000/onboarding-requests -H 'Content-Type: applica
 
 - No credentials in code; `.env` git-ignored; no dotenv dependency.
 - All input untrusted: strict type validation, ticket IDs must be numeric before any lookup (blocks path traversal), dashboard HTML output escaped (`html.escape`).
-- **Authentication is optional** — local development defaults to no auth; set `FLOWOPS_AUTH_REQUIRED=true` and configure a dev bearer token or Entra JWT before exposing the service. Bind to localhost for demos.
+- **Authentication is optional** — local development defaults to no auth; set `FLOWOPS_AUTH_REQUIRED=true` and configure a dev bearer token or Entra JWT before exposing the service. Offboarding completion is admin-only. Bind to localhost for demos.
 - Runtime artifacts (`data/*.json`, `data/tickets/`, `data/*.db`) git-ignored.
+
+### Offboarding completion ledger
+
+Offboarding is destructive, so it uses a dedicated admin-only ledger endpoint:
+`POST /offboarding-requests/{checklist_id}/steps/{step_key}/complete`.
+
+- The ledger row is **claimed before the side effect runs**, so concurrent
+  callers cannot execute the same step twice.
+- The first completion returns `201`; a replay returns `200` with
+  `X-Offboarding-Replayed: true`.
+- A fresh in-flight claim returns `409`; a claim older than the five-minute
+  recovery window can be taken over with a new owner token.
+- Unknown step keys return `422`; onboarding checklists, closed/abandoned
+  checklists, and unapproved gated steps return `409`; missing checklists `404`.
+- Executor failure removes the claim so the step can be retried.
+- Every path writes an actor-attributed execution log. The operator UI uses
+  the ledger endpoint for offboarding steps, and the dashboard shows
+  offboarding progress.
 
 ## Operator UI
 
@@ -304,7 +324,7 @@ No real secrets or Microsoft tenant are included.
 ## Running the tests
 
 ```bash
-pytest    # 175 passed, 11 skipped locally; the skips are PostgreSQL-only tests
+pytest    # 183 passed, 12 skipped locally; the skips are PostgreSQL-only tests
 python -m compileall -q src tests
 ```
 
@@ -313,7 +333,8 @@ The default suite is fully offline: mocked HTTP and temporary SQLite databases. 
 ```bash
 FLOWOPS_TEST_POSTGRES_URL="postgresql+psycopg://flowops:flowops@127.0.0.1:5432/flowops" \
   pytest -q tests/test_idempotency_postgres.py tests/test_outbox_postgres.py \
-           tests/test_jobs_postgres.py tests/test_outbox_worker_postgres.py
+           tests/test_jobs_postgres.py tests/test_outbox_worker_postgres.py \
+           tests/test_offboarding_postgres.py
 ```
 
 The CI `postgres-idempotency` job supplies a `postgres:16` service, runs
@@ -336,6 +357,7 @@ a live local API (not a benchmark).
 - ✅ v1.0 security — Optional bearer/Entra auth, roles, webhook API key, and actor audit trail
 - ✅ v1.0 operations — Readiness, metrics, correlation IDs, Alembic migrations, non-root container
 - ✅ v1.0 reliability — Worker heartbeats, adapter idempotency keys, automatic outbox dispatcher
+- ✅ v0.6.1 reliability — Admin-only, claim-first offboarding completion ledger
 - ✅ v1.0 experience — Audit trail, job detail, pagination/filters, admin/rate-limit hardening
 - ✅ v1.0 foundation — Guided portfolio demo and repeatable local smoke test
 - ⬜ v1.0 — Public deployment and screenshots

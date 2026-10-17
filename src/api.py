@@ -1598,35 +1598,23 @@ def complete_offboarding_step(
     checklist_id: int,
     step_key: str,
     response: Response,
+    actor: Actor = Depends(_admin_actor),
     session: Session = Depends(db.get_session),
 ) -> OffboardingCompletionOut:
     """Idempotently complete one offboarding step (v0.6.1 hardening).
 
-    Side effects (account disable, mailbox archive, ...) must never run
-    twice for the same step, even when callers retry with different
-    request bodies or headers. The ``offboarding_completions`` table is
-    the ledger: a stored ``(checklist_id, step_key)`` row short-circuits
-    re-execution and its ``result_json`` is replayed with HTTP 200 and
-    the header ``X-Offboarding-Replayed: true``. A first execution runs
-    the module-level ``offboarding_executor`` (simulated), stores the
-    result, and returns HTTP 201.
+    The ledger row is claimed *before* the simulated side effect runs, so two
+    concurrent callers cannot both execute it. A completed row replays its
+    stored result; a fresh ``running`` row returns 409; a stale claim older
+    than the five-minute recovery window can be taken over with a new owner
+    token. On executor failure the claim is removed so a caller can retry.
 
-    Design note — why onboarding differs: onboarding steps keep their own
-    per-item state machine (pending/approved/completed plus a ``result``
-    column) because provisioning is additive and safe to re-inspect.
-    Offboarding destroys access, so it needs a separate append-only ledger
-    keyed by ``(checklist_id, step_key)`` that survives checklist edits.
-    Unifying both into one mechanism is deliberately left out of this
-    small change; see README limitations.
-
-    Validation: ``step_key`` must belong to this checklist (unknown keys
-    give 422); the checklist must be an offboarding request (otherwise
-    409); closed or abandoned checklists reject completion with 409.
-    Every path — first run, replay, rejection — writes an execution log.
+    Offboarding is destructive and therefore admin-only. Unknown step keys
+    return 422, onboarding checklists 409, missing checklists 404, and closed
+    or abandoned checklists 409. Every path writes an execution log with the
+    authenticated actor.
     """
     started = time.perf_counter()
-    # Load directly (not via _load_request) so a missing id gives 404 while
-    # an onboarding id can produce a more helpful 409 below.
     record = session.get(db.OnboardingRequestRecord, checklist_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Offboarding checklist not found.")
@@ -1644,11 +1632,19 @@ def complete_offboarding_step(
             status=status,
             duration_ms=int((time.perf_counter() - started) * 1000),
             detail=f"checklist #{checklist_id} step '{step_key}': {detail}",
+            actor_subject=actor.subject,
         )
+
+    def replay(existing: db.OffboardingCompletionRecord, reason: str) -> OffboardingCompletionOut:
+        stored = json.loads(existing.result_json)
+        log("replayed", "success", reason)
+        response.headers["X-Offboarding-Replayed"] = "true"
+        response.status_code = http_status.HTTP_200_OK
+        return OffboardingCompletionOut.model_validate(stored)
 
     if record.request_type != "offboarding":
         log("rejected", "failure", "request is not an offboarding checklist")
-        session.commit()  # persist the rejection log before raising
+        session.commit()
         raise HTTPException(
             409,
             "This checklist is an onboarding request; offboarding "
@@ -1673,22 +1669,93 @@ def complete_offboarding_step(
             f"Cannot complete steps on a '{record.status}' checklist.",
         )
 
+    table = db.OffboardingCompletionRecord
+    now = db.utcnow()
     existing = session.execute(
-        select(db.OffboardingCompletionRecord).where(
-            db.OffboardingCompletionRecord.checklist_id == checklist_id,
-            db.OffboardingCompletionRecord.step_key == step_key,
+        select(table).where(
+            table.checklist_id == checklist_id,
+            table.step_key == step_key,
         )
     ).scalar_one_or_none()
+
     if existing is not None:
-        stored = json.loads(existing.result_json)
-        log("replayed", "success", f"returning stored result from ledger #{existing.id}")
-        response.headers["X-Offboarding-Replayed"] = "true"
-        response.status_code = http_status.HTTP_200_OK
-        return OffboardingCompletionOut.model_validate(stored)
+        state = existing.status or "completed"  # NULL = legacy completed row
+        if state == "completed":
+            return replay(existing, f"returning stored result from ledger #{existing.id}")
+        if state != "running":
+            log("rejected", "failure", f"ledger row is in state '{state}'")
+            session.commit()
+            raise HTTPException(409, "Offboarding ledger is in an unexpected state.")
+        stale_before = now - IDEMPOTENCY_PROCESSING_TIMEOUT
+        claimed_at = existing.claimed_at
+        stale = claimed_at is None
+        if claimed_at is not None:
+            if claimed_at.tzinfo is None:
+                claimed_at = claimed_at.replace(tzinfo=timezone.utc)
+            stale = claimed_at < stale_before
+        if not stale:
+            log("rejected", "failure", "step is already running")
+            session.commit()
+            raise HTTPException(
+                409, "Offboarding step is already running; retry later."
+            )
+        owner_token = uuid.uuid4().hex
+        takeover = session.execute(
+            update(table)
+            .execution_options(synchronize_session=False)
+            .where(
+                table.id == existing.id,
+                table.status == "running",
+                or_(table.claimed_at.is_(None), table.claimed_at < stale_before),
+            )
+            .values(owner_token=owner_token, claimed_at=now)
+        )
+        if takeover.rowcount != 1:
+            session.rollback()
+            raise HTTPException(
+                409, "Offboarding claim changed hands; refresh and retry."
+            )
+        session.commit()
+        claim = existing
+    else:
+        owner_token = uuid.uuid4().hex
+        claim = table(
+            checklist_id=checklist_id,
+            step_key=step_key,
+            status="running",
+            owner_token=owner_token,
+            claimed_at=now,
+            result_json="{}",
+        )
+        session.add(claim)
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            winner = session.execute(
+                select(table).where(
+                    table.checklist_id == checklist_id,
+                    table.step_key == step_key,
+                )
+            ).scalar_one_or_none()
+            if winner is not None and (winner.status or "completed") == "completed":
+                return replay(winner, f"lost the claim race; replayed ledger #{winner.id}")
+            log("rejected", "failure", "lost the claim race to an in-flight request")
+            session.commit()
+            raise HTTPException(
+                409, "Offboarding step is already running; retry later."
+            )
 
     item = next(i for i in items if i.step_key == step_key)
     if item.requires_approval and item.status != "approved":
         log("rejected", "failure", f"step requires approval (status '{item.status}')")
+        session.execute(
+            delete(table).where(
+                table.id == claim.id,
+                table.status == "running",
+                table.owner_token == owner_token,
+            )
+        )
         session.commit()
         raise HTTPException(
             409,
@@ -1697,77 +1764,75 @@ def complete_offboarding_step(
             "POST /onboarding-requests/{request_id}/items/{item_id}/approve.",
         )
 
-    # First execution: run the (simulated) side effect, then claim the
-    # ledger row. If another concurrent request already claimed it, the
-    # unique constraint raises IntegrityError — we roll back (discarding
-    # this attempt's partial work) and replay the winner's stored result
-    # instead of crashing or double-executing anything durable.
-    result_payload = offboarding_executor(step_key, record.employee_email)
-    body = OffboardingCompletionOut(
-        checklist_id=checklist_id,
-        employee_name=record.employee_name,
-        step=OffboardingStepResultOut(
-            step_key=step_key,
-            status="completed",
-            executor_called=True,
-            executed_at=db.utcnow(),
-        ),
-    )
-    stored_json = json.dumps(
-        {
-            **body.model_dump(mode="json"),
-            "simulated_result": result_payload,
-        },
-        separators=(",", ":"),
-    )
-    session.add(
-        db.OffboardingCompletionRecord(
-            checklist_id=checklist_id,
-            step_key=step_key,
-            result_json=stored_json,
-        )
-    )
-    item.status = "completed"
     try:
-        session.flush()
-    except IntegrityError:
-        session.rollback()
-        competing = session.execute(
-            select(db.OffboardingCompletionRecord).where(
-                db.OffboardingCompletionRecord.checklist_id == checklist_id,
-                db.OffboardingCompletionRecord.step_key == step_key,
+        result_payload = offboarding_executor(step_key, record.employee_email)
+        body = OffboardingCompletionOut(
+            checklist_id=checklist_id,
+            employee_name=record.employee_name,
+            step=OffboardingStepResultOut(
+                step_key=step_key,
+                status="completed",
+                executor_called=True,
+                executed_at=db.utcnow(),
+            ),
+        )
+        stored_json = json.dumps(
+            {**body.model_dump(mode="json"), "simulated_result": result_payload},
+            separators=(",", ":"),
+        )
+        completed = session.execute(
+            update(table)
+            .execution_options(synchronize_session=False)
+            .where(
+                table.id == claim.id,
+                table.status == "running",
+                table.owner_token == owner_token,
             )
-        ).scalar_one()
-        log(
-            "replayed",
-            "success",
-            f"lost a race for the ledger row; replayed result #{competing.id}",
+            .values(
+                status="completed",
+                result_json=stored_json,
+                completed_at=db.utcnow(),
+                owner_token=None,
+                claimed_at=None,
+            )
         )
-        response.headers["X-Offboarding-Replayed"] = "true"
-        response.status_code = http_status.HTTP_200_OK
-        return OffboardingCompletionOut.model_validate(
-            json.loads(competing.result_json)
+        if completed.rowcount != 1:
+            session.rollback()
+            raise HTTPException(
+                409, "Offboarding claim was taken over; refresh and retry."
+            )
+        item.status = "completed"
+        log("executed", "success", f"simulated executor result: {result_payload['action']}")
+        all_items = session.execute(
+            select(db.ChecklistItemRecord).where(
+                db.ChecklistItemRecord.request_id == checklist_id
+            )
+        ).scalars().all()
+        if all(i.status == "completed" for i in all_items) and record.status != "completed":
+            record.status = "completed"
+            db.log_execution(
+                session,
+                run_id=_new_run_id(),
+                action="onboarding.request.completed",
+                status="success",
+                duration_ms=0,
+                detail=f"all checklist steps done for request #{record.id}",
+                actor_subject=actor.subject,
+            )
+        session.commit()
+        response.status_code = http_status.HTTP_201_CREATED
+        return body
+    except Exception:
+        session.rollback()
+        session.execute(
+            delete(table).where(
+                table.id == claim.id,
+                table.status == "running",
+                table.owner_token == owner_token,
+            )
         )
-
-    log("executed", "success", f"simulated executor result: {result_payload['action']}")
-    all_items = session.execute(
-        select(db.ChecklistItemRecord).where(
-            db.ChecklistItemRecord.request_id == checklist_id
-        )
-    ).scalars().all()
-    if all(i.status == "completed" for i in all_items) and record.status != "completed":
-        record.status = "completed"
-        db.log_execution(
-            session,
-            run_id=_new_run_id(),
-            action="onboarding.request.completed",
-            status="success",
-            duration_ms=0,
-            detail=f"all checklist steps done for request #{record.id}",
-        )
-    response.status_code = http_status.HTTP_201_CREATED
-    return body
-
+        session.commit()
+        raise
 
 class M365StatusOut(BaseModel):
     """Shape of the *simulated* M365 status response (v0.6 placeholder)."""
@@ -2250,6 +2315,29 @@ def dashboard(
         }
         for log in logs[:50]
     ]
+    offboarding_rows = []
+    for onboarding_record in session.execute(
+        select(db.OnboardingRequestRecord)
+    ).scalars().all():
+        if onboarding_record.request_type != "offboarding":
+            continue
+        checklist = session.execute(
+            select(db.ChecklistItemRecord).where(
+                db.ChecklistItemRecord.request_id == onboarding_record.id
+            )
+        ).scalars().all()
+        total = len(checklist)
+        completed = sum(1 for item in checklist if item.status == "completed")
+        offboarding_rows.append(
+            {
+                "id": onboarding_record.id,
+                "employee_name": onboarding_record.employee_name,
+                "status": onboarding_record.status,
+                "completed": completed,
+                "total": total,
+                "percent": round((completed / total) * 100) if total else 0,
+            }
+        )
     return web.render(
         request,
         "dashboard.html",
@@ -2264,139 +2352,6 @@ def dashboard(
             "failed": failed_deliveries,
             "auto_refresh": auto_refresh,
             "last_updated": db.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "offboarding_rows": offboarding_rows,
         },
     )
-
-    outbox_card = (
-        f'<div class="card"><div class="value fail">{outbox_pending}'
-        '</div><div class="label">pending webhook retries</div></div>'
-        if outbox_pending
-        else ""
-    )
-    outbox_section = ""
-    if pending_deliveries:
-        outbox_rows = "".join(
-            "<tr>"
-            f"<td>#{item.id}</td>"
-            f"<td>{html.escape(item.ticket_id or '')}</td>"
-            f"<td>{html.escape(item.url)}</td>"
-            f"<td>{item.attempts}</td>"
-            f"<td class=\"fail\">{html.escape(item.last_error or '')}</td>"
-            "</tr>"
-            for item in pending_deliveries[:15]
-        )
-        outbox_section = f"""<section>
-        <h2>Failed webhook deliveries ({outbox_pending} pending)</h2>
-<p>Retry them with <code>POST /notifications/retry</code> &middot;
-list with <code>GET /notifications/pending</code>.</p>
-<table><tr><th>#</th><th>ticket</th><th>url</th><th>attempts</th><th>last error</th></tr>{outbox_rows}</table>
-</section>
-"""
-
-    # v0.6 placeholder: simulated M365 user ids recorded by completed
-    # provisioning steps, clearly labelled so nobody mistakes them for real.
-    m365_lines: list[str] = []
-    # v0.6.1: offboarding progress per checklist (completed vs total steps),
-    # read from the same rows the ledger endpoint uses.
-    offboarding_progress_rows: list[str] = []
-    for onb_record in session.execute(
-        select(db.OnboardingRequestRecord)
-    ).scalars().all():
-        onb_items = session.execute(
-            select(db.ChecklistItemRecord).where(
-                db.ChecklistItemRecord.request_id == onb_record.id
-            )
-        ).scalars().all()
-        for onb_item in sorted(onb_items, key=lambda i: i.id):
-            if onb_item.action == "m365_provision" and onb_item.result:
-                try:
-                    sim_user_id = json.loads(onb_item.result).get("id", "?")
-                except (ValueError, TypeError):
-                    sim_user_id = "?"
-                m365_lines.append(
-                    "<li>"
-                    f"request #{onb_record.id} &middot; {html.escape(onb_record.employee_name)} "
-                    f"&middot; simulated M365 id <code>{html.escape(str(sim_user_id))}</code> "
-                    "(simulated)"
-                    "</li>"
-                )
-        if onb_record.request_type == "offboarding":
-            done = sum(1 for i in onb_items if i.status == "completed")
-            offboarding_progress_rows.append(
-                "<tr>"
-                f"<td>#{onb_record.id}</td>"
-                f"<td>{html.escape(onb_record.employee_name)}</td>"
-                f"<td>{html.escape(onb_record.status)}</td>"
-                f"<td>{done} / {len(onb_items)}</td>"
-                "</tr>"
-            )
-    m365_section = (
-        "<section><h2>Simulated Microsoft 365 provisioning</h2>"
-        "<p>v0.6 placeholder &mdash; these accounts are fake; no real "
-        "Microsoft 365 tenant is touched.</p>"
-        f"<ul>{''.join(m365_lines)}</ul></section>\n"
-        if m365_lines
-        else ""
-    )
-    offboarding_section = (
-        "<section><h2>Offboarding progress</h2>"
-        "<p>Completed steps per offboarding checklist (v0.6.1 ledger).</p>"
-        "<table><tr><th>#</th><th>employee</th><th>request status</th>"
-        f"<th>steps</th></tr>{''.join(offboarding_progress_rows)}</table>"
-        "</section>\n"
-        if offboarding_progress_rows
-        else ""
-    )
-
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FlowOps dashboard</title>
-<style>
-  body {{ font-family: -apple-system, system-ui, sans-serif; margin: 2rem; background: #f5f6f8; color: #1f2933; }}
-  h1 {{ font-size: 1.5rem; }}
-  .cards {{ display: flex; flex-wrap: wrap; gap: 1rem; margin: 1rem 0 2rem; }}
-  .card {{ background: #fff; border-radius: 10px; padding: 1rem 1.5rem; box-shadow: 0 1px 4px rgba(0,0,0,.08); min-width: 9rem; }}
-  .card .value {{ font-size: 1.8rem; font-weight: 600; }}
-  .card .label {{ color: #5f6b7a; font-size: .8rem; }}
-  section {{ background: #fff; border-radius: 10px; padding: 1rem 1.5rem; box-shadow: 0 1px 4px rgba(0,0,0,.08); margin-bottom: 1.5rem; overflow-x: auto; }}
-  table {{ border-collapse: collapse; width: 100%; font-size: .85rem; }}
-  th, td {{ text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #eef0f3; }}
-  th {{ color: #5f6b7a; font-weight: 600; }}
-  td.ok {{ color: #137333; }} td.fail {{ color: #c5221f; font-weight: 600; }}
-  .card .value.fail {{ color: #c5221f; }}
-  .cols {{ display: flex; gap: 1.5rem; flex-wrap: wrap; }}
-  .cols section {{ flex: 1; min-width: 16rem; }}
-  a {{ color: #2563eb; }}
-</style>
-</head>
-<body>
-<h1>FlowOps monitoring dashboard</h1>
-<p><a href="/">&larr; back</a> &middot; learning prototype, simulated data</p>
-<div class="cards">
-  <div class="card"><div class="value">{total}</div><div class="label">tickets</div></div>
-  <div class="card"><div class="value">{open_count}</div><div class="label">open</div></div>
-  <div class="card"><div class="value">{closed_count}</div><div class="label">closed</div></div>
-  <div class="card"><div class="value">{auto_routed}</div><div class="label">auto-routed</div></div>
-  <div class="card"><div class="value">{success_count}</div><div class="label">successful runs</div></div>
-  <div class="card"><div class="value">{failure_count}</div><div class="label">failed runs</div></div>
-  <div class="card"><div class="value">{avg_duration} ms</div><div class="label">avg run duration</div></div>
-  <div class="card"><div class="value">{hours_saved} h</div><div class="label">est. staff time saved</div></div>
-  <div class="card"><div class="value">{outbox_pending}</div><div class="label">pending notifications</div></div>
-  <div class="card"><div class="value">{outbox_pending}</div><div class="label">pending webhook retries</div></div>
-  <div class="card"><div class="value">{outbox_delivered}</div><div class="label">delivered notifications</div></div>
-  <div class="card"><div class="value">{outbox_failed}</div><div class="label">failed notifications</div></div>
-  <div class="card"><div class="value">{outbox_retries}</div><div class="label">notification retries</div></div>
-</div>
-<div class="cols">
-  <section><h2>Tickets by queue</h2><table>{counter_rows(by_queue)}</table></section>
-  <section><h2>Tickets by priority</h2><table>{counter_rows(by_priority)}</table></section>
-</div>
-{outbox_section}{m365_section}{offboarding_section}<section>
-  <h2>Recent workflow runs</h2>
-  <table><tr><th>run</th><th>time</th><th>action</th><th>status</th><th>ticket</th><th>duration</th></tr>{recent_rows}</table>
-</section>
-</body>
-</html>"""
