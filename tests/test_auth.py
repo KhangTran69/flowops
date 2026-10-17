@@ -31,23 +31,25 @@ def test_required_auth_rejects_missing_or_wrong_token():
     assert actor.roles == ("automation.operator",)
 
 
-def test_graph_adapter_sends_bearer_token(monkeypatch):
-    calls = []
-    class Response:
-        def raise_for_status(self): pass
-    def fake_post(url, json, headers, timeout):
-        calls.append((url, json, headers, timeout))
-        return Response()
-    monkeypatch.setattr("src.actions.requests.post", fake_post)
-    result = MicrosoftGraphAdapter("https://graph.example/v1.0", "access-token").execute(
-        "create_user_account", {"employee_email": "jane@example.com"}
+def test_graph_adapter_uses_tenant_resolver():
+    from src.tenants import GraphClientFactory, TenantSettings
+
+    settings = TenantSettings(key="acme", name="Acme", usage_location="GB", baseline={"simulated_profile": "healthy"})
+    factory = GraphClientFactory({}, simulated=True, loader=lambda key: settings)
+    result = MicrosoftGraphAdapter(factory).execute(
+        "create_user_account", {"employee_email": "jane@example.com", "tenant_key": "acme"}
     )
     assert result.action == "create_user_account"
-    assert calls[0][2] == {"Authorization": "Bearer access-token"}
+    assert result.output["tenant"] == "acme"
+    assert result.output["created"] is True
 
 
 def test_graph_adapter_selection_requires_token():
     adapter = adapter_from_environment({"FLOWOPS_ACTION_ADAPTER": "graph", "FLOWOPS_GRAPH_ACCESS_TOKEN": "token"})
+    assert isinstance(adapter, MicrosoftGraphAdapter)
+    adapter = adapter_from_environment(
+        {"FLOWOPS_ACTION_ADAPTER": "graph", "FLOWOPS_GRAPH_CLIENT_ID": "id", "FLOWOPS_GRAPH_CLIENT_SECRET": "secret"}
+    )
     assert isinstance(adapter, MicrosoftGraphAdapter)
     with pytest.raises(ValueError, match="FLOWOPS_GRAPH_ACCESS_TOKEN"):
         adapter_from_environment({"FLOWOPS_ACTION_ADAPTER": "graph"})

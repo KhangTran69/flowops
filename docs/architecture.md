@@ -148,3 +148,22 @@ credential-free scope. Authentication is optional and defaults to local
 development; configure a dev bearer token or Entra JWT before exposing the
 service. Future sensitive actions must remain behind explicit human approval
 gates.
+
+## MSP integration layer
+
+```text
+n8n / Power Automate ──webhooks──▶ FlowOps API ◀──MCP (stdio)── Claude / AI agents
+                                      │
+                         tenant_key on tickets + requests
+                                      │
+                  worker ──▶ MicrosoftGraphAdapter ──▶ GraphClientFactory(tenant)
+                                │                        └─ OAuth2 client credentials per Entra tenant
+                                └─ Exchange-only steps ──▶ Invoke-FlowOpsAction.ps1 (EXO app-only)
+                  /tickets/{id}/psa-sync ──▶ ConnectWise Manage (conditions, PATCH, time entries)
+                  /tenants/drift-check   ──▶ Graph per tenant vs. baseline
+                  /reports/*             ──▶ SQL views (migration 0009)
+```
+
+Adapters signal permanent failures with `retryable = False`; the worker sends
+those straight to `failed` (dead-letter) instead of spending retries.
+Details: [integrations.md](integrations.md).

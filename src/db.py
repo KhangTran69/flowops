@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import (
+    event,
     Boolean,
     DateTime,
     Index,
@@ -55,6 +56,7 @@ class TicketRecord(Base):
     priority: Mapped[str] = mapped_column(String(16), nullable=False)
     category: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     queue: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     # Ticket closing (v1.0 preview): both columns are nullable, so rows
     # written before this change stay valid (NULL = never closed).
     resolution_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -229,9 +231,54 @@ class OnboardingRequestRecord(Base):
     # v1.3: request is pinned to an immutable definition version.
     definition_key: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
     definition_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
+
+
+class TenantRecord(Base):
+    """A managed client tenant (MSP / GDAP context).
+
+    Secrets are never stored here: ``credential_ref`` names the environment
+    variables (``FLOWOPS_TENANT_<REF>_GRAPH_CLIENT_SECRET``) that hold them.
+    """
+
+    __tablename__ = "tenants"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    entra_tenant_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    default_domain: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    licence_sku: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    usage_location: Mapped[Optional[str]] = mapped_column(String(2), nullable=True)
+    psa_company_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    credential_ref: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    baseline_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class ExternalLinkRecord(Base):
+    """Maps a FlowOps record to its id in an external system (e.g. ConnectWise)."""
+
+    __tablename__ = "external_links"
+    __table_args__ = (
+        UniqueConstraint("system", "local_type", "local_id", name="uq_external_link_local"),
+        UniqueConstraint("system", "local_type", "external_id", name="uq_external_link_remote"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    system: Mapped[str] = mapped_column(String(32), nullable=False)
+    local_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    local_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    external_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    last_synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class ChecklistItemRecord(Base):
@@ -455,6 +502,9 @@ def _ensure_tables() -> None:
         _ensure_idempotency_resource_type()
         _ensure_execution_log_actor()
         _ensure_outbox_lease_columns()
+        from src import reports
+
+        reports.ensure_views(engine)
         _tables_ready = True
 
 
@@ -645,3 +695,11 @@ class WorkflowTimerRecord(Base):
         DateTime(timezone=True), nullable=True
     )
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+@event.listens_for(Base.metadata, "before_drop")
+def _drop_reporting_views(target, connection, **kw) -> None:
+    """Reporting views depend on the tables, so drop them first."""
+    from src import reports
+
+    reports.drop_views(connection)
