@@ -438,3 +438,59 @@ def test_ui_explains_when_ticket_has_no_actionable_recommendation(client):
     assert "No queue/priority changes" in page.text
     assert "already matches the routing rules" in page.text
     assert "data-ai-apply" not in page.text
+
+
+def test_claude_messages_client_request_and_fenced_json():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "content": [
+                    {"type": "text", "text": '```json\n{"summary": "Claude summary.", "recommendations": []}\n```'}
+                ],
+                "stop_reason": "end_turn",
+            },
+        )
+
+    adapter = ai_agent.adapter_from_environment(
+        {"FLOWOPS_AI_ADAPTER": "claude", "ANTHROPIC_API_KEY": "sk-ant-test"}
+    )
+    assert isinstance(adapter, ai_agent.LLMAIAdapter) and adapter.provider == "claude"
+    adapter.http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    result = adapter.analyze(_snapshot())
+    assert result.summary.text == "Claude summary."
+    request = requests[0]
+    assert str(request.url) == "https://api.anthropic.com/v1/messages"
+    assert request.headers["x-api-key"] == "sk-ant-test"
+    assert request.headers["anthropic-version"] == "2023-06-01"
+    assert "authorization" not in request.headers
+    body = json.loads(request.content)
+    assert body["temperature"] == 0 and body["max_tokens"] > 0
+    assert body["system"] and body["messages"][0]["role"] == "user"
+    assert "<ticket_data>" in body["messages"][0]["content"]
+
+
+def test_claude_overload_and_bad_recommendations_are_rejected():
+    overloaded = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda r: httpx.Response(529, json={"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}})
+        )
+    )
+    adapter = ai_agent.LLMAIAdapter("k", provider="claude", http_client=overloaded)
+    with pytest.raises(ai_agent.AIAvailabilityError, match="overloaded_error"):
+        adapter.analyze(_snapshot())
+
+    unsafe = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, json={"content": [{"type": "text", "text": json.dumps({
+                "summary": "ok",
+                "recommendations": [{"id": "x", "kind": "status", "title": "close it", "suggested": "closed",
+                                     "rationale": "", "confidence": 0.9, "applicable": True}],
+            })}]})
+        )
+    )
+    result = ai_agent.LLMAIAdapter("k", provider="claude", http_client=unsafe).analyze(_snapshot())
+    assert not any(r.applicable for r in result.recommendations)

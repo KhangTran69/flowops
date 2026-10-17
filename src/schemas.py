@@ -15,6 +15,9 @@ class TicketIntakeRequest(BaseModel):
     id: StrictInt = Field(ge=1, description="Upstream ticket ID.")
     title: StrictStr = Field(description="Short ticket description.")
     completed: StrictBool = Field(description="Whether the upstream item is done.")
+    tenant: Optional[StrictStr] = Field(
+        default=None, max_length=64, description="Optional client tenant key (multi-tenant MSP)."
+    )
 
     @field_validator("title")
     @classmethod
@@ -221,6 +224,9 @@ class OnboardingRequestIn(BaseModel):
         default=None,
         description="Optional named workflow template (e.g. onboarding-dag).",
     )
+    tenant_key: Optional[StrictStr] = Field(
+        default=None, max_length=64, description="Client tenant this request runs in."
+    )
 
     @field_validator("employee_name", "department")
     @classmethod
@@ -262,6 +268,7 @@ class OnboardingRequestOut(BaseModel):
     status: str
     definition_key: Optional[str] = None
     definition_version: Optional[int] = None
+    tenant_key: Optional[str] = None
     checklist: list[ChecklistItemOut]
 
 

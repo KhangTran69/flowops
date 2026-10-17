@@ -586,10 +586,12 @@ def _process_intake(
     record = session.get(db.TicketRecord, ticket["ticket_id"])
     created = record is None
     if created:
-        session.add(db.TicketRecord(**ticket))
+        session.add(db.TicketRecord(**ticket, tenant_key=request.tenant))
     else:
         for field, value in ticket.items():
             setattr(record, field, value)
+        if request.tenant:
+            record.tenant_key = request.tenant
     session.flush()
 
     action = "ticket.created" if created else "ticket.updated"
@@ -1218,7 +1220,7 @@ def _request_out(
         **{c: getattr(record, c) for c in (
             "id", "request_type", "employee_name", "employee_email",
             "department", "requester_id", "start_date", "status",
-            "definition_key", "definition_version",
+            "definition_key", "definition_version", "tenant_key",
         )},
         checklist=[
             ChecklistItemOut(
@@ -1478,6 +1480,10 @@ def _create_onboarding_request(
 ) -> OnboardingRequestOut:
     """Create the record and checklist, returning the API response shape."""
     started = time.perf_counter()
+    if request.tenant_key:
+        tenant = session.get(db.TenantRecord, request.tenant_key)
+        if tenant is None or not tenant.active:
+            raise HTTPException(422, f"Unknown or inactive tenant: {request.tenant_key}")
     record = db.OnboardingRequestRecord(
         request_type=request.request_type,
         employee_name=request.employee_name,
@@ -1485,6 +1491,7 @@ def _create_onboarding_request(
         department=request.department,
         requester_id=request.requester_id,
         start_date=request.start_date,
+        tenant_key=request.tenant_key,
     )
     session.add(record)
     session.flush()
@@ -2749,6 +2756,11 @@ def list_audit_trail(
     ]
 
 
+from src.routes import reports as _report_routes  # noqa: E402
+from src.routes import tenants as _tenant_routes  # noqa: E402
 from src.routes import ui as _ui_routes  # noqa: E402  (registered last: owns the /ui catch-all)
+
+app.include_router(_tenant_routes.router)
+app.include_router(_report_routes.router)
 
 app.include_router(_ui_routes.router)

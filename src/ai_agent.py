@@ -482,8 +482,12 @@ PROVIDER_DEFAULTS: dict[str, tuple[str, Optional[str]]] = {
     "openai": ("https://api.openai.com/v1", "gpt-4o-mini"),
     "openrouter": ("https://openrouter.ai/api/v1", None),
     "ollama": ("http://localhost:11434/v1", "llama3.2"),
+    "claude": ("https://api.anthropic.com/v1", "claude-sonnet-4-5"),
+    "anthropic": ("https://api.anthropic.com/v1", "claude-sonnet-4-5"),
     "llm": (None, None),
 }
+ANTHROPIC_PROVIDERS = frozenset({"claude", "anthropic"})
+ANTHROPIC_VERSION = "2023-06-01"
 
 
 def provider_settings(
@@ -557,6 +561,91 @@ class OpenAICompatibleClient:
         return content
 
 
+def _strip_code_fence(text: str) -> str:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = stripped.split("\n", 1)[1] if "\n" in stripped else ""
+        if stripped.rstrip().endswith("```"):
+            stripped = stripped.rstrip()[:-3]
+    return stripped.strip()
+
+
+class AnthropicMessagesClient:
+    """Minimal Claude client for the Anthropic Messages API.
+
+    Sends the triage prompt as a single user turn with a fixed system
+    prompt and ``temperature=0``; returns the concatenated text blocks.
+    Rate limits (429) and overload (529) surface as AIAvailabilityError so
+    the API falls back to a 503 instead of guessing.
+    """
+
+    SYSTEM_PROMPT = (
+        "You are FlowOps, an IT service-desk triage assistant for a managed "
+        "service provider. Reply with a single JSON object and nothing else."
+    )
+
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        *,
+        api_key: str,
+        timeout: float = 30.0,
+        max_tokens: int = 1024,
+        http_client: Optional[httpx.Client] = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.api_key = api_key
+        self.timeout = timeout
+        self.max_tokens = max_tokens
+        self.http_client = http_client
+
+    def __call__(self, prompt: str) -> str:
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": ANTHROPIC_VERSION,
+            "content-type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "temperature": 0,
+            "system": self.SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        owned_client = self.http_client is None
+        client = self.http_client or httpx.Client(timeout=self.timeout)
+        try:
+            response = client.post(f"{self.base_url}/messages", json=payload, headers=headers)
+            if response.status_code >= 400:
+                try:
+                    error = response.json().get("error", {})
+                except ValueError:
+                    error = {}
+                raise AIAvailabilityError(
+                    f"Claude request failed: HTTP {response.status_code} "
+                    f"{error.get('type', '')}: {error.get('message', response.reason_phrase)}".strip()
+                )
+            body = response.json()
+            text = "".join(
+                block.get("text", "")
+                for block in body.get("content", [])
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+        except httpx.HTTPError as error:
+            raise AIAvailabilityError(f"Claude request to {self.base_url} failed: {error}") from error
+        except (ValueError, AttributeError) as error:
+            raise AIAvailabilityError("Claude returned an unreadable response.") from error
+        finally:
+            if owned_client:
+                client.close()
+        text = _strip_code_fence(text)
+        if not text:
+            raise AIAvailabilityError("Claude response did not contain text content.")
+        return text
+
+
 class LLMAIAdapter:
     """Optional pluggable LLM boundary.
 
@@ -599,6 +688,14 @@ class LLMAIAdapter:
             raise AIAvailabilityError(
                 "LLM adapter requires FLOWOPS_AI_BASE_URL and FLOWOPS_AI_MODEL "
                 f"for provider {self.provider!r}."
+            )
+        if self.provider in ANTHROPIC_PROVIDERS:
+            return AnthropicMessagesClient(
+                base_url,
+                model,
+                api_key=self.api_key,
+                timeout=timeout,
+                http_client=self.http_client,
             )
         return OpenAICompatibleClient(
             base_url,
@@ -669,6 +766,8 @@ def adapter_from_environment(environ: Optional[Mapping[str, str]] = None) -> AIA
     values = values or process_environ
     name = values.get("FLOWOPS_AI_ADAPTER", "simulated").lower()
     api_key = values.get("FLOWOPS_AI_API_KEY", "")
+    if name in ANTHROPIC_PROVIDERS:
+        api_key = api_key or values.get("ANTHROPIC_API_KEY", "")
     if name == "ollama":
         return LLMAIAdapter("", provider="ollama")
     if name in PROVIDER_DEFAULTS and api_key:
