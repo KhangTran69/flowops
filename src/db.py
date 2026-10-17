@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import (
+    event,
     Boolean,
     DateTime,
     Index,
@@ -694,3 +695,11 @@ class WorkflowTimerRecord(Base):
         DateTime(timezone=True), nullable=True
     )
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+@event.listens_for(Base.metadata, "before_drop")
+def _drop_reporting_views(target, connection, **kw) -> None:
+    """Reporting views depend on the tables, so drop them first."""
+    from src import reports
+
+    reports.drop_views(connection)

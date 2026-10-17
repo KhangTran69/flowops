@@ -7,24 +7,21 @@ the v1.0 preview keeps failed webhook deliveries in a retryable outbox.
 """
 
 import hashlib
-import html
 import json
 import os
-import secrets
 import threading
 import time
 import uuid
 from collections import Counter
-from dataclasses import replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Optional
 from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi import status as http_status
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, field_validator
+from pydantic import BaseModel
 from sqlalchemy import and_, delete, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
@@ -33,17 +30,12 @@ from sqlalchemy.orm import Session
 
 from src import ai_agent, chatops, db, definitions, jobs, scheduler, timers, ui_session, web, workflow, workflow_control
 from src.actions import (
-    ACTION_BY_STEP,
     ActionAdapter,
-    ActionResult,
-    SimulatedMicrosoftAdapter,
     action_for_step,
     adapter_from_environment,
 )
 from src.auth import (
-    AuthenticationError,
     Actor,
-    authenticate_bearer,
     validate_auth_configuration,
 )
 from src.m365_simulator import M365Simulator
@@ -54,14 +46,11 @@ from src.ticket_processor import normalize_ticket
 from src.deps import (
     _local_ui_actor,
     _actor_from_header,
-    _enforce_csrf,
     _operator_actor,
     _admin_actor,
     _webhook_actor,
-    _RATE_LIMIT_LOCK,
-    _RATE_LIMIT_BUCKETS,
-    _enforce_rate_limit,
     _new_run_id,
+    _RATE_LIMIT_BUCKETS,  # noqa: F401  (re-exported for tests)
 )
 from src.schemas import (
     TicketIntakeRequest,
