@@ -48,7 +48,7 @@ flowops/
 │   ├── routing.py            # pure classification/priority/queue rules
 │   ├── notify.py             # webhook delivery with exponential-backoff retries
 │   └── onboarding.py         # checklist templates
-├── tests/                    # 89 offline tests (test_*.py)
+├── tests/                    # 92 offline tests (test_*.py)
 ├── data/                     # runtime artifacts (git-ignored): flowops.db, ticket.json
 ├── .github/workflows/ci.yml  # GitHub Actions: install dependencies and run pytest
 ├── Dockerfile                # Small API image
@@ -174,7 +174,7 @@ curl -X POST http://127.0.0.1:8000/onboarding-requests -H 'Content-Type: applica
 ## Running the tests
 
 ```bash
-pytest    # 89 tests, fully offline: mocked HTTP, SQLite in tmp dirs
+pytest    # 92 tests, fully offline: mocked HTTP, SQLite in tmp dirs
 python -m compileall -q src tests
 ```
 
