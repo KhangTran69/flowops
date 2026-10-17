@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from src import db
 
 JOB_ONBOARDING_ITEM = "onboarding.item.execute"
+JOB_TRIGGER_EXECUTE = "trigger.execute"
 
 JOB_STATUSES = (
     "queued",

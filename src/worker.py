@@ -10,6 +10,7 @@ Or as a polling daemon:
 """
 
 import argparse
+import hashlib
 import json
 import signal
 import threading
@@ -21,7 +22,7 @@ from typing import Any, Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from src import db, jobs, scheduler, workflow
+from src import db, definitions, jobs, scheduler, triggers, workflow
 from src.actions import (
     ActionAdapter,
     ActionResult,
@@ -31,6 +32,7 @@ from src.actions import (
 
 ACTION_ADAPTER: ActionAdapter = adapter_from_environment()
 JOB_ONBOARDING_ITEM = jobs.JOB_ONBOARDING_ITEM
+JOB_TRIGGER_EXECUTE = jobs.JOB_TRIGGER_EXECUTE
 
 
 def _new_run_id() -> str:
@@ -288,6 +290,131 @@ def _notify_worker_failure(
     )
 
 
+def _complete_trigger_job(
+    session: Session,
+    job: db.WorkflowJobRecord,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Execute a trigger delivery and create the target resource."""
+    delivery_id = payload.get("delivery_id")
+    trigger_key = payload.get("trigger_key")
+    event_payload = payload.get("event_payload", {})
+
+    delivery = session.get(db.TriggerDeliveryRecord, delivery_id)
+    if delivery is None:
+        raise _PermanentJobError("Trigger delivery not found.")
+    trigger = session.get(db.TriggerRecord, trigger_key)
+    if trigger is None:
+        raise _PermanentJobError("Trigger not found.")
+
+    try:
+        mapped = triggers.apply_mapping(
+            json.loads(trigger.mapping_json), event_payload, trigger
+        )
+    except (triggers.MappingError, json.JSONDecodeError) as error:
+        raise _PermanentJobError(f"Mapping failed: {error}") from error
+
+    request_id = None
+    error = None
+
+    if trigger.target_type == "ticket":
+        # Create ticket using existing intake path
+        from src.ticket_processor import normalize_ticket
+        from src.routing import route_ticket
+
+        ticket_id = f"trig-{trigger.key}-{delivery.event_id[:8]}"
+        normalized = normalize_ticket(
+            {
+                "userId": mapped.get("requester_id", 1),
+                "id": int(hashlib.sha256(ticket_id.encode()).hexdigest()[:9], 16),
+                "title": mapped.get("title", f"Trigger: {trigger.name}"),
+                "completed": False,
+            }
+        )
+        category, queue = route_ticket(normalized)
+        ticket = db.TicketRecord(
+            ticket_id=ticket_id,
+            requester_id=normalized.userId,
+            title=normalized.title,
+            status="open",
+            priority=normalized.priority,
+            category=category,
+            queue=queue,
+        )
+        session.add(ticket)
+        request_id = ticket_id
+
+    elif trigger.target_type in ("onboarding_request", "offboarding_request"):
+        # Create onboarding/offboarding request pinned to definition
+        if not trigger.definition_key:
+            raise _PermanentJobError("Definition key is required for onboarding/offboarding triggers.")
+        definition, version = definitions.published_version(session, trigger.definition_key)
+        if definition.request_type != trigger.target_type.replace("_request", ""):
+            raise _PermanentJobError("Definition request type mismatch.")
+
+        record = db.OnboardingRequestRecord(
+            request_type=definition.request_type,
+            employee_name=mapped.get("employee_name", "Trigger Employee"),
+            employee_email=mapped.get("employee_email", "trigger@example.com"),
+            department=mapped.get("department", "IT"),
+            requester_id=mapped.get("requester_id", 1),
+            start_date=mapped.get("start_date"),
+            definition_key=definition.key,
+            definition_version=version.version,
+        )
+        session.add(record)
+        session.flush()
+
+        steps = json.loads(version.steps_json)
+        for template in steps:
+            from src.onboarding import initial_status_for
+            session.add(
+                db.ChecklistItemRecord(
+                    request_id=record.id,
+                    step_key=template["key"],
+                    step=template["step"],
+                    queue=template["queue"],
+                    requires_approval=template["requires_approval"],
+                    action=template.get("action"),
+                    status=initial_status_for(template),
+                    depends_on_json=json.dumps(template.get("depends_on", [])),
+                    join_mode=template.get("join", "all"),
+                    when_json=json.dumps(template.get("when", [])),
+                    sla_minutes=template.get("sla_minutes"),
+                    escalation_queue=template.get("escalation_queue"),
+                )
+            )
+        session.flush()
+        from src import timers
+        timers.sync_timers(session, record.id)
+        request_id = str(record.id)
+
+    else:
+        raise _PermanentJobError(f"Unsupported target type: {trigger.target_type}")
+
+    # Update delivery
+    triggers.update_delivery(
+        session,
+        delivery,
+        status="succeeded",
+        request_id=request_id,
+    )
+
+    # Log audit
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="trigger.delivery.succeeded",
+        status="success",
+        ticket_id=request_id,
+        duration_ms=0,
+        detail=f"trigger={trigger.key}, event_id={delivery.event_id}",
+        actor_subject=f"trigger:{trigger.key}",
+    )
+
+    return {"request_id": request_id}
+
+
 def _execute_job(
     session: Session,
     job: db.WorkflowJobRecord,
@@ -295,6 +422,47 @@ def _execute_job(
     lease_seconds: int = jobs.DEFAULT_LEASE_SECONDS,
     heartbeat_interval: Optional[float] = None,
 ) -> str:
+    if job.job_type == JOB_TRIGGER_EXECUTE:
+        payload = json.loads(job.payload_json)
+        try:
+            _complete_trigger_job(session, job, payload)
+            jobs.complete_job(
+                session,
+                job.id,
+                job.lease_owner_token or "",
+                result={"delivery_id": payload.get("delivery_id")},
+            )
+            session.commit()
+            return "succeeded"
+        except _PermanentJobError as error:
+            session.rollback()
+            reloaded = session.get(db.WorkflowJobRecord, job.id)
+            if reloaded is None:
+                return "missing"
+            status = jobs.fail_job(
+                session,
+                reloaded.id,
+                reloaded.lease_owner_token or "",
+                str(error),
+                retryable=False,
+            )
+            session.commit()
+            return status or "fenced"
+        except Exception as error:
+            session.rollback()
+            reloaded = session.get(db.WorkflowJobRecord, job.id)
+            if reloaded is None:
+                return "missing"
+            status = jobs.fail_job(
+                session,
+                reloaded.id,
+                reloaded.lease_owner_token or "",
+                str(error),
+                retryable=True,
+            )
+            session.commit()
+            return status or "fenced"
+
     if job.job_type != JOB_ONBOARDING_ITEM:
         jobs.fail_job(
             session,
