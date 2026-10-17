@@ -18,7 +18,7 @@ from typing import Any, Iterable, Optional, Sequence
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
 
-from src import db, jobs, timers, workflow
+from src import db, jobs, timers, triggers, workflow
 
 RUN_STATUSES = ("pending", "running", "paused", "cancelled", "completed", "failed")
 ACTIVE_STEP_STATUSES = ("scheduled", "running")
@@ -26,6 +26,7 @@ TERMINAL_RUN_STATUSES = ("cancelled", "completed", "failed")
 DEFAULT_MAX_PARALLEL = 4
 DEFAULT_LEASE_SECONDS = 60
 TICK_COUNTS = {"claimed": 0, "empty": 0}
+TRIGGER_TICK_COUNTS = {"fired": 0, "skipped": 0}
 
 
 def _env_int(name: str, default: int) -> int:
@@ -430,6 +431,45 @@ def tick_all(*, now: Optional[datetime] = None, worker_id: str = "scheduler") ->
             if run is None:
                 break
             claimed.append(run)
+
+        # Tick trigger scheduler
+        from src import jobs
+        trigger_ticks = triggers.tick_scheduler(session, now=now)
+        for tick in trigger_ticks:
+            TRIGGER_TICK_COUNTS["fired"] = TRIGGER_TICK_COUNTS.get("fired", 0) + 1
+            # Enqueue trigger execution job
+            jobs.enqueue_job(
+                session,
+                job_type=jobs.JOB_TRIGGER_EXECUTE,
+                payload={
+                    "trigger_key": tick.trigger_key,
+                    "event_id": tick.event_id,
+                    "event_payload": {},
+                },
+                label=f"trigger:{tick.trigger_key}",
+            )
+            # Record delivery
+            triggers.record_delivery(
+                session,
+                trigger_key=tick.trigger_key,
+                event_id=tick.event_id,
+                payload={},
+                status="queued",
+            )
+            db.log_execution(
+                session,
+                run_id=uuid.uuid4().hex[:12],
+                action="trigger.delivery.received",
+                status="success",
+                ticket_id=None,
+                duration_ms=0,
+                detail=f"scheduled trigger={tick.trigger_key}, event_id={tick.event_id}",
+                actor_subject=f"trigger:{tick.trigger_key}",
+            )
+        if not trigger_ticks:
+            TRIGGER_TICK_COUNTS["skipped"] = TRIGGER_TICK_COUNTS.get("skipped", 0) + 1
+        session.commit()
+
         return claimed
     finally:
         session.close()
