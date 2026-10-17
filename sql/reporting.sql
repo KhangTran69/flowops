@@ -28,7 +28,7 @@ WHERE status IN ('failure', 'retrying')
 GROUP BY action, status
 ORDER BY occurrences DESC;
 
--- 5. The reporting view created by migration 0009.
-SELECT queue, priority, status, ticket_count
-FROM flowops_ticket_queue_summary
+-- 5. The reporting function created by migration 0009 (PostgreSQL).
+-- SQLite uses the equivalent view.
+SELECT * FROM flowops_ticket_queue_summary()
 ORDER BY ticket_count DESC;

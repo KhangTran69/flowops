@@ -25,10 +25,30 @@ FROM tickets
 GROUP BY COALESCE(queue, 'unassigned'), priority, status
 """
 
+FUNCTION_SQL = """
+CREATE OR REPLACE FUNCTION flowops_ticket_queue_summary()
+RETURNS TABLE(queue text, priority text, status text, ticket_count bigint)
+LANGUAGE sql STABLE AS $$
+  SELECT COALESCE(queue, 'unassigned')::text,
+         priority::text,
+         status::text,
+         COUNT(*)::bigint
+  FROM tickets
+  GROUP BY COALESCE(queue, 'unassigned'), priority, status
+$$
+"""
+
 
 def upgrade() -> None:
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        # A function, not a view: PostgreSQL drop_all() fixtures must be able to
+        # drop the tickets table without CASCADE.
+        op.execute("DROP FUNCTION IF EXISTS flowops_ticket_queue_summary()")
+        op.execute(FUNCTION_SQL)
+        return
     if not op.get_context().as_sql:
-        inspector = sa.inspect(op.get_bind())
+        inspector = sa.inspect(bind)
         if "flowops_ticket_queue_summary" in inspector.get_view_names():
             return
     op.execute("DROP VIEW IF EXISTS flowops_ticket_queue_summary")
@@ -36,4 +56,5 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.execute("DROP FUNCTION IF EXISTS flowops_ticket_queue_summary()")
     op.execute("DROP VIEW IF EXISTS flowops_ticket_queue_summary")
