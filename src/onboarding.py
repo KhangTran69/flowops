@@ -12,23 +12,24 @@ VALID_REQUEST_TYPES = ("onboarding", "offboarding")
 
 class ChecklistStep(TypedDict):
     step: str
+    key: str  # stable identifier used by the offboarding completion ledger
     queue: str
     requires_approval: bool
     action: str  # which automation runs when this step is completed
 
 
 ONBOARDING_STEPS: tuple[ChecklistStep, ...] = (
-    {"step": "Create user account", "queue": "it-access-management", "requires_approval": True, "action": "none"},
-    {"step": "Provision laptop and peripherals", "queue": "it-hardware", "requires_approval": False, "action": "none"},
-    {"step": "Grant software licenses", "queue": "it-software", "requires_approval": True, "action": "none"},
-    {"step": "Configure email mailbox", "queue": "it-messaging", "requires_approval": False, "action": "none"},
+    {"step": "Create user account", "key": "create_user_account", "queue": "it-access-management", "requires_approval": True, "action": "none"},
+    {"step": "Provision laptop and peripherals", "key": "provision_laptop", "queue": "it-hardware", "requires_approval": False, "action": "none"},
+    {"step": "Grant software licenses", "key": "grant_licenses", "queue": "it-software", "requires_approval": True, "action": "none"},
+    {"step": "Configure email mailbox", "key": "configure_mailbox", "queue": "it-messaging", "requires_approval": False, "action": "none"},
 )
 
 OFFBOARDING_STEPS: tuple[ChecklistStep, ...] = (
-    {"step": "Disable user account", "queue": "it-access-management", "requires_approval": True, "action": "none"},
-    {"step": "Recover laptop and peripherals", "queue": "it-hardware", "requires_approval": False, "action": "none"},
-    {"step": "Revoke software licenses", "queue": "it-software", "requires_approval": False, "action": "none"},
-    {"step": "Archive email mailbox", "queue": "it-messaging", "requires_approval": True, "action": "none"},
+    {"step": "Disable user account", "key": "disable_user_account", "queue": "it-access-management", "requires_approval": True, "action": "none"},
+    {"step": "Recover laptop and peripherals", "key": "recover_laptop", "queue": "it-hardware", "requires_approval": False, "action": "none"},
+    {"step": "Revoke software licenses", "key": "revoke_licenses", "queue": "it-software", "requires_approval": False, "action": "none"},
+    {"step": "Archive email mailbox", "key": "archive_mailbox", "queue": "it-messaging", "requires_approval": True, "action": "none"},
 )
 
 # v0.6 placeholder: an extra onboarding step that provisions a *simulated*
@@ -36,6 +37,7 @@ OFFBOARDING_STEPS: tuple[ChecklistStep, ...] = (
 # carries a mail address; no real credentials are used anywhere.
 M365_PROVISION_STEP: ChecklistStep = {
     "step": "Provision Microsoft 365 account (simulated)",
+    "key": "m365_provision",
     "queue": "it-access-management",
     "requires_approval": False,
     "action": "m365_provision",

@@ -16,6 +16,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     create_engine,
     inspect,
     text,
@@ -219,6 +220,11 @@ class ChecklistItemRecord(Base):
         Integer, nullable=False, index=True
     )
     step: Mapped[str] = mapped_column(String(200), nullable=False)
+    # v0.6.1: stable identifier for the step (e.g. "disable_user_account").
+    # Nullable so rows written before this change stay valid; the API fills
+    # it in for every new checklist, and _add_missing_columns() migrates
+    # pre-existing SQLite files additively (no data is touched).
+    step_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     queue: Mapped[str] = mapped_column(String(64), nullable=False)
     requires_approval: Mapped[bool] = mapped_column(Boolean, nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
@@ -231,6 +237,33 @@ class ChecklistItemRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
+
+
+class OffboardingCompletionRecord(Base):
+    """Idempotent completion ledger for offboarding steps (v0.6.1).
+
+    One row per ``(checklist_id, step_key)`` records that an offboarding
+    step was executed and stores its result. The unique constraint is the
+    hard guarantee: even if two requests race past the pre-check, only one
+    row can exist, so account-disable side effects never run twice.
+
+    Onboarding uses a different mechanism (the checklist item's own status
+    plus ``result`` column) — see the note in src/api.py near
+    ``complete_offboarding_step`` for why they are not unified yet.
+    """
+
+    __tablename__ = "offboarding_completions"
+    __table_args__ = (
+        UniqueConstraint("checklist_id", "step_key", name="uq_offboarding_completion_step"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    checklist_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    step_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    completed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    result_json: Mapped[str] = mapped_column(Text, nullable=False)  # stored response body
 
 
 _tables_ready = False
