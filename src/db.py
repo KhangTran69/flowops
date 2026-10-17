@@ -255,6 +255,10 @@ class ChecklistItemRecord(Base):
     # them in, and _add_missing_columns() migrates pre-existing SQLite files.
     action: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     result: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON from the action
+    # v1.1 DAG: prerequisite step keys and structured action output.
+    # Both nullable so pre-v1.1 rows stay valid and SQLite can add them.
+    depends_on_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    output_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
@@ -486,3 +490,17 @@ def log_execution(
             correlation_id=correlation_id,
         )
     )
+
+
+class ChatOpsTokenUseRecord(Base):
+    """Single-use record for signed ChatOps approval tokens (v1.1)."""
+
+    __tablename__ = "chatops_token_uses"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    jti: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    request_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    item_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    actor_subject: Mapped[str] = mapped_column(String(120), nullable=False)
+    used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

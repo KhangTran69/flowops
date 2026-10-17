@@ -31,7 +31,7 @@ from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
-from src import ai_agent, db, jobs, ui_session, web
+from src import ai_agent, chatops, db, jobs, ui_session, web, workflow, workflow_control
 from src.actions import (
     ACTION_BY_STEP,
     ActionAdapter,
@@ -48,7 +48,7 @@ from src.auth import (
 )
 from src.m365_simulator import M365Simulator
 from src.notify import deliver_webhook
-from src.onboarding import checklist_for
+from src.onboarding import checklist_for, initial_status_for
 from src.routing import route_ticket
 from src.ticket_processor import normalize_ticket
 
@@ -730,6 +730,10 @@ class ChecklistItemOut(BaseModel):
     queue: str
     requires_approval: bool
     status: str
+    action: Optional[str] = None
+    result: Optional[dict | list | str | int | float | bool | None] = None
+    depends_on: list[str] = []
+    output: Optional[dict] = None
 
 
 
@@ -744,6 +748,10 @@ class OnboardingRequestIn(BaseModel):
     requester_id: StrictInt = Field(ge=1)
     start_date: Optional[StrictStr] = Field(
         default=None, description="ISO date (YYYY-MM-DD) the employee starts or leaves."
+    )
+    template: Optional[StrictStr] = Field(
+        default=None,
+        description="Optional named workflow template (e.g. onboarding-dag).",
     )
 
     @field_validator("employee_name", "department")
@@ -1042,12 +1050,15 @@ def metrics(session: Session = Depends(db.get_session)) -> Response:
     job_counts = Counter(job.status for job in job_records)
     lines.extend(
         [
-            "# HELP flowops_workflow_jobs Workflow jobs by state",
+            "flowops_workflow_jobs",
             "# TYPE flowops_workflow_jobs gauge",
         ]
     )
     for state in jobs.JOB_STATUSES:
         lines.append(f'flowops_workflow_jobs{{status="{state}"}} {job_counts.get(state, 0)}')
+    lines.append("# HELP flowops_workflow_job_attempts_total Total workflow job attempts")
+    lines.append("# TYPE flowops_workflow_job_attempts_total counter")
+    lines.append(f"flowops_workflow_job_attempts_total {sum(job.attempts for job in job_records)}")
 
     outbox = session.execute(select(db.NotificationOutboxRecord)).scalars().all()
     outbox_counts = Counter(item.status for item in outbox)
@@ -1437,6 +1448,118 @@ def get_ticket(
     return Ticket.model_validate(record, from_attributes=True)
 
 
+@app.post("/webhooks/actions/approve")
+def chatops_approve(
+    request: Request,
+    token: str = Query(...),
+    source: str = Query(default="webhook"),
+    session: Session = Depends(db.get_session),
+) -> dict[str, Any]:
+    """One-click ChatOps approval using a signed, single-use token."""
+    return _chatops_action(request, session, token, "approve", source, None)
+
+
+@app.post("/webhooks/actions/reject")
+def chatops_reject(
+    request: Request,
+    token: str = Query(...),
+    reason: Optional[str] = Query(default=None),
+    source: str = Query(default="webhook"),
+    session: Session = Depends(db.get_session),
+) -> dict[str, Any]:
+    """One-click ChatOps rejection with optional reason and cascade."""
+    return _chatops_action(request, session, token, "reject", source, reason)
+
+
+def _chatops_action(
+    request: Request,
+    session: Session,
+    token: str,
+    action: str,
+    source: str,
+    reason: Optional[str],
+) -> dict[str, Any]:
+    try:
+        claims = chatops.verify_token(token)
+    except chatops.ChatOpsUnavailable as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except chatops.ChatOpsError as error:
+        raise HTTPException(status_code=401, detail=str(error)) from error
+    if claims.action != action:
+        raise HTTPException(status_code=401, detail="ChatOps token is for a different action.")
+    record = session.get(db.OnboardingRequestRecord, claims.request_id)
+    item = session.get(db.ChecklistItemRecord, claims.item_id)
+    if record is None or item is None or item.request_id != record.id:
+        raise HTTPException(status_code=404, detail="Checklist item not found.")
+    if action == "approve" and item.status != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot approve an item with status '{item.status}'.",
+        )
+    if action == "reject" and item.status not in ("pending", "blocked", "approved"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot reject an item with status '{item.status}'.",
+        )
+    actor = f"chatops:{source if source in ('slack', 'teams', 'email') else 'webhook'}"
+    try:
+        session.add(
+            db.ChatOpsTokenUseRecord(
+                jti=claims.jti,
+                request_id=record.id,
+                item_id=item.id,
+                action=action,
+                actor_subject=actor,
+            )
+        )
+        session.flush()
+    except IntegrityError as error:
+        session.rollback()
+        raise HTTPException(status_code=409, detail="ChatOps token has already been used.") from error
+
+    if action == "approve":
+        item.status = "approved"
+        log_action = "onboarding.item.chatops_approved"
+    else:
+        item.status = "rejected"
+        log_action = "onboarding.item.chatops_rejected"
+    session.flush()
+    items = session.execute(
+        select(db.ChecklistItemRecord).where(
+            db.ChecklistItemRecord.request_id == record.id
+        )
+    ).scalars().all()
+    workflow.apply_graph_transitions(
+        session,
+        items,
+        request_id=record.id,
+        actor_subject=actor,
+        reason=reason,
+    )
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action=log_action,
+        status="success",
+        ticket_id=str(record.id),
+        duration_ms=0,
+        detail=(
+            f"step '{item.step}' via {actor}; "
+            f"status={item.status}; reason={reason or 'n/a'}"
+        ),
+        actor_subject=actor,
+        correlation_id=getattr(request.state, "correlation_id", None),
+    )
+    session.commit()
+    return {
+        "request_id": record.id,
+        "item_id": item.id,
+        "action": action,
+        "status": item.status,
+        "actor": actor,
+    }
+
+
 @app.post("/webhooks/intake")
 def webhook_intake(
     payload: TicketIntakeRequest | list[TicketIntakeRequest],
@@ -1473,6 +1596,12 @@ def _request_out(
                     "status", "action",
                 )},
                 result=json.loads(item.result) if item.result else None,
+                depends_on=json.loads(item.depends_on_json)
+                if item.depends_on_json
+                else [],
+                output=json.loads(item.output_json)
+                if item.output_json
+                else None,
             )
             for item in sorted(items, key=lambda i: i.id)
         ],
@@ -1508,13 +1637,20 @@ def _create_onboarding_request(
     )
     session.add(record)
     session.flush()
-    steps = checklist_for(request.request_type)
+    steps = checklist_for(request.request_type, template=request.template)
     for template in steps:
-        # The template's ``key`` becomes the row's ``step_key`` column.
+        # The template's ``key`` becomes the row's ``step_key`` column;
+        # depends_on is persisted as JSON for the graph resolver.
         session.add(
             db.ChecklistItemRecord(
-                request_id=record.id, step_key=template["key"],
-                **{k: v for k, v in template.items() if k != "key"},
+                request_id=record.id,
+                step_key=template["key"],
+                step=template["step"],
+                queue=template["queue"],
+                requires_approval=template["requires_approval"],
+                action=template.get("action"),
+                status=initial_status_for(template),
+                depends_on_json=json.dumps(template.get("depends_on", [])),
             )
         )
     session.flush()
@@ -1766,12 +1902,33 @@ def ui_onboarding_request(
             )
         raise
     completed = sum(1 for item in items if item.status == "completed")
+    by_key = {workflow.state_key(item): item for item in items}
+    item_views = []
+    for item in sorted(items, key=lambda entry: entry.id):
+        dependencies = workflow.dependencies_of(item)
+        links = (
+            chatops.approval_urls(record.id, item.id)
+            if item.requires_approval and item.status == "pending"
+            else {}
+        )
+        item_views.append(
+            {
+                "item": item,
+                "depends_on_names": [
+                    by_key[key].step for key in dependencies if key in by_key
+                ],
+                "missing": workflow.missing_prerequisites(item, items),
+                "output": workflow.step_output(item),
+                "chatops": links,
+            }
+        )
     return web.render(
         request,
         "onboarding_detail.html",
         {
             "active": "onboarding",
             "request_record": record,
+            "item_views": item_views,
             "items": sorted(items, key=lambda item: item.id),
             "completed": completed,
             "total": len(items),
@@ -1919,10 +2076,11 @@ def _transition_item(
     session: Session,
     request_id: int,
     item_id: int,
+    request: Request,
     action: Literal["approve", "complete"],
     actor_subject: Optional[str] = None,
 ) -> OnboardingRequestOut:
-    record, _ = _load_request(session, request_id)
+    record, items = _load_request(session, request_id)
     item = _get_item(session, record, item_id)
 
     if action == "approve":
@@ -1933,6 +2091,11 @@ def _transition_item(
         item.status = "approved"
     else:
         allowed_from = "approved" if item.requires_approval else "pending"
+        missing = workflow.missing_prerequisites(item, items)
+        if missing:
+            raise HTTPException(
+                409, workflow.blocked_status_detail(item, missing)
+            )
         if item.status != allowed_from:
             raise HTTPException(
                 409,
@@ -1941,6 +2104,11 @@ def _transition_item(
             )
         item.status = "completed"
     session.flush()
+
+    if action == "complete":
+        workflow.apply_graph_transitions(
+            session, items, request_id=record.id, actor_subject=actor_subject
+        )
 
     db.log_execution(
         session,
@@ -1968,14 +2136,15 @@ def _transition_item(
     return _request_out(record, items)
 
 
-
-
 def _execute_item(
     session: Session, request_id: int, item_id: int, actor: Actor
 ) -> OnboardingRequestOut:
     """Run one approved checklist action with bounded retries."""
-    record, _ = _load_request(session, request_id)
+    record, items = _load_request(session, request_id)
     item = _get_item(session, record, item_id)
+    missing = workflow.missing_prerequisites(item, items)
+    if missing:
+        raise HTTPException(409, workflow.blocked_status_detail(item, missing))
     required_status = "approved" if item.requires_approval else "pending"
     if item.status != required_status:
         raise HTTPException(
@@ -1993,6 +2162,7 @@ def _execute_item(
         "department": record.department,
         "actor_subject": actor.subject,
         "actor_roles": list(actor.roles),
+        **workflow.action_context_outputs(item, items),
     }
     correlation_id = _new_run_id()
     started_at = db.utcnow()
@@ -2018,7 +2188,11 @@ def _execute_item(
                 duration_ms=int((time.perf_counter() - started) * 1000),
             ))
             item.status = "completed"
+            workflow.record_output(item, result.output)
             session.flush()
+            workflow.apply_graph_transitions(
+                session, items, request_id=record.id, actor_subject=actor.subject
+            )
             db.log_execution(
                 session,
                 run_id=_new_run_id(),
@@ -2059,6 +2233,10 @@ def _execute_item(
                 duration_ms=int((time.perf_counter() - started) * 1000),
             ))
 
+    item.status = "failed"
+    workflow.apply_graph_transitions(
+        session, items, request_id=record.id, actor_subject=actor.subject
+    )
     _notify_action_failure(action, context, attempts_limit, last_error, session)
     db.log_execution(
         session,
@@ -2105,17 +2283,21 @@ def list_action_executions(
 def approve_item(
     request_id: int,
     item_id: int,
+    request: Request,
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
 ) -> OnboardingRequestOut:
     """Approve a checklist step that requires human sign-off."""
-    return _transition_item(session, request_id, item_id, "approve", actor.subject)
+    return _transition_item(
+        session, request_id, item_id, request, "approve", actor.subject
+    )
 
 
 @app.post("/onboarding-requests/{request_id}/items/{item_id}/complete")
 def complete_item(
     request_id: int,
     item_id: int,
+    request: Request,
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
 ) -> OnboardingRequestOut:
@@ -2138,7 +2320,7 @@ def complete_item(
             "(idempotent completion ledger).",
         )
     return _transition_item(
-        session, request_id, item_id, "complete", actor.subject
+        session, request_id, item_id, request, "complete", actor.subject
     )
 
 
@@ -2395,6 +2577,14 @@ def complete_offboarding_step(
                 db.ChecklistItemRecord.request_id == checklist_id
             )
         ).scalars().all()
+        workflow.apply_graph_transitions(
+            session, all_items, request_id=checklist_id, actor_subject=actor.subject
+        )
+        all_items = session.execute(
+            select(db.ChecklistItemRecord).where(
+                db.ChecklistItemRecord.request_id == checklist_id
+            )
+        ).scalars().all()
         if all(i.status == "completed" for i in all_items) and record.status != "completed":
             record.status = "completed"
             db.log_execution(
@@ -2451,14 +2641,18 @@ def get_m365_status(user_id: str) -> M365StatusOut:
 def enqueue_onboarding_item_job(
     request_id: int,
     item_id: int,
+    request: Request,
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
 ) -> WorkflowJobOut:
     """Queue one onboarding checklist action for a durable worker."""
-    record, _ = _load_request(session, request_id)
+    record, items = _load_request(session, request_id)
     item = _get_item(session, record, item_id)
     if item.status == "completed":
         raise HTTPException(409, "Checklist item is already completed.")
+    missing = workflow.missing_prerequisites(item, items)
+    if missing:
+        raise HTTPException(409, workflow.blocked_status_detail(item, missing))
     required_status = "approved" if item.requires_approval else "pending"
     if item.status != required_status:
         raise HTTPException(
@@ -2467,14 +2661,14 @@ def enqueue_onboarding_item_job(
             f"(current status: '{item.status}').",
         )
     action = action_for_step(item.step)
-    job = jobs.enqueue_job(
+    job = workflow_control.enqueue_onboarding_item(
         session,
-        job_type=jobs.JOB_ONBOARDING_ITEM,
-        payload={"request_id": record.id, "item_id": item.id, "action": action},
-        idempotency_key=f"onboarding:{record.id}:{item.id}",
-        resource_type="onboarding",
-        resource_id=str(record.id),
+        request_id=record.id,
+        item_id=item.id,
+        action=action,
         label=f"{record.employee_name}: {item.step}",
+        actor_subject=actor.subject,
+        correlation=getattr(request.state, "correlation_id", None),
     )
     db.log_execution(
         session,
@@ -2485,6 +2679,7 @@ def enqueue_onboarding_item_job(
         duration_ms=0,
         detail=f"job #{job.id} ({action}) queued for item #{item.id}",
         actor_subject=actor.subject,
+        correlation_id=getattr(request.state, "correlation_id", None),
     )
     session.commit()
     return WorkflowJobOut.model_validate(job)
@@ -2517,6 +2712,16 @@ def get_workflow_job(
     return WorkflowJobOut.model_validate(job)
 
 
+@app.get("/workflow-jobs/{job_id}/history", response_model=list[ActionExecutionOut])
+def workflow_job_history(
+    job_id: int, session: Session = Depends(db.get_session)
+) -> list[ActionExecutionOut]:
+    """Return every durable worker attempt for a workflow job."""
+    try:
+        records = workflow_control.history(session, job_id)
+    except LookupError as error:
+        raise HTTPException(404, str(error)) from error
+    return [ActionExecutionOut.model_validate(record, from_attributes=True) for record in records]
 @app.post("/workflow-jobs/{job_id}/retry", response_model=WorkflowJobOut)
 def retry_workflow_job(
     job_id: int,

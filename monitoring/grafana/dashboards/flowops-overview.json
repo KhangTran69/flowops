@@ -29,11 +29,18 @@
       "targets": [{"expr": "flowops_notification_outbox", "legendFormat": "{{status}}"}]
     },
     {
-      "id": 4,
-      "type": "stat",
-      "title": "Application uptime",
-      "gridPos": {"h": 5, "w": 8, "x": 12, "y": 8},
-      "targets": [{"expr": "flowops_uptime_seconds", "legendFormat": "seconds"}]
+      "id": 5,
+      "type": "timeseries",
+      "title": "Workflow attempt volume",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [{"expr": "flowops_workflow_job_attempts_total", "legendFormat": "attempts"}]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Queue depth",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 13},
+      "targets": [{"expr": "flowops_workflow_jobs{status=\"queued\"}", "legendFormat": "queued"}, {"expr": "flowops_workflow_jobs{status=\"running\"}", "legendFormat": "running"}, {"expr": "flowops_workflow_jobs{status=\"failed\"}", "legendFormat": "failed"}]
     }
   ]
 }

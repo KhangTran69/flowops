@@ -90,6 +90,28 @@ ticket content as untrusted data. Provider output is schema-validated and
 allowlisted; only queue/priority can become applicable. AI metrics are exposed
 at `/metrics`, and the golden evaluation suite runs offline.
 
+## Workflow DAG and ChatOps
+
+Checklist rows persist `depends_on_json` and structured `output_json`.
+`src/onboarding.py` owns pure graph rules; `src/workflow.py` applies them to
+rows and aggregates prerequisite outputs into downstream action contexts.
+Blocked steps require every prerequisite to be `completed`; terminal failures
+cascade dependents to `cascade_blocked`. ChatOps approve/reject tokens are
+HMAC-SHA256 signed, action-bound, expire after 24 hours, and are recorded once
+in `chatops_token_uses` for replay protection.
+
+`onboarding-dag` is the only selectable graph template. Offboarding keeps its
+flat template on purpose: that flow completes through the idempotent
+`offboarding_completions` ledger, which authorises a step by approval state
+rather than by graph edges, so a DAG template there would let a `blocked`
+dependent step complete out of order. Teaching the ledger about edges is the
+follow-up; `OFFBOARDING_DAG_SHAPE` records the intended graph.
+
+The built-in simulated adapter returns no structured identifiers, so a demo
+run stores `{}` outputs. The piping contract is exercised with adapter doubles
+in `tests/test_workflow_dag.py` and by the Graph / Power Automate adapters,
+which can return real payloads once credentials are configured.
+
 ## Secure operator console
 
 The JSON API keeps bearer auth. When `FLOWOPS_UI_AUTH_REQUIRED=true`, the HTML

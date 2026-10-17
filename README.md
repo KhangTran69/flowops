@@ -29,6 +29,7 @@ FlowOps is an IT workflow automation platform. It receives support tickets and o
 | v1.0 Reliability: durable workflow jobs | ✅ | Leased worker queue with retries, dead-letter, operator retry/cancel |
 | v1.0 Security: auth, roles, audit | ✅ | Optional bearer/Entra auth, role checks, webhook API key, actor attribution |
 | v1.1 Secure operator console | ✅ | Signed session login, CSRF-protected UI actions, role-aware controls, login/logout audit |
+| v1.1 Workflow DAG engine | ✅ | Step dependencies, blocked/cascade states, output piping, signed single-use ChatOps approvals |
 | v0.6.1 Offboarding completion ledger | ✅ | Admin-only, claim-before-execute, idempotent replay, stale-claim takeover, ledger-backed offboarding |
 | v1.0 Operations: readiness, metrics, migrations | ✅ | `/ready`, `/metrics`, correlation IDs, Alembic baseline, container migration entrypoint |
 | v1.0 CI + Docker | ✅ | GitHub Actions runs pytest, a Docker Compose API + PostgreSQL smoke test, and PostgreSQL reliability tests |
@@ -313,6 +314,29 @@ Offboarding is destructive, so it uses a dedicated admin-only ledger endpoint:
   the ledger endpoint for offboarding steps, and the dashboard shows
   offboarding progress.
 
+## Workflow DAG and ChatOps approvals (v1.1)
+
+Checklist templates can declare `depends_on` prerequisites. The default
+`onboarding-standard`/`offboarding-standard` templates stay flat for backward
+compatibility; opt into `onboarding-dag` or `offboarding-dag` with
+`"template": "..."` when creating a request.
+
+- Steps with unmet prerequisites start as `blocked`; completing all
+  prerequisites promotes them to `pending` (or `approved` for gated steps).
+- A failed, rejected, or cancelled prerequisite cascades dependents to
+  `cascade_blocked`.
+- Structured action outputs are persisted in `output_json` and passed to
+  downstream actions as `context["prerequisite_outputs"]` and
+  `context["upstream_outputs"]`.
+- `POST /webhooks/actions/approve?token=...` and
+  `POST /webhooks/actions/reject?token=...` accept HMAC-SHA256 tokens bound to
+  request/item/action with a 24-hour TTL. Tokens are single-use
+  (`chatops_token_uses`) and log actor `chatops:slack`, `chatops:teams`,
+  `chatops:email`, or `chatops:webhook`.
+- Set `FLOWOPS_CHATOPS_SECRET` to enable links. The operator detail page shows
+  dependency badges, blocker state, step outputs, and ChatOps buttons.
+- Tests: `tests/test_workflow_dag.py` (offline).
+
 ## Operator UI
 
 The HTML UI is server-rendered with Jinja2 templates and local CSS/vanilla JS
@@ -391,7 +415,7 @@ No real secrets or Microsoft tenant are included.
 ## Running the tests
 
 ```bash
-pytest    # 218 passed, 13 skipped locally; the skips are PostgreSQL-only tests
+pytest    # 250 passed, 13 skipped locally; the skips are PostgreSQL-only tests
 python -m compileall -q src tests
 ```
 
