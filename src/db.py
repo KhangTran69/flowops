@@ -15,6 +15,7 @@ from sqlalchemy import (
     DateTime,
     Index,
     Integer,
+    PrimaryKeyConstraint,
     String,
     Text,
     UniqueConstraint,
@@ -211,6 +212,57 @@ class NotificationOutboxRecord(Base):
     )
 
 
+class WorkflowDefinitionRecord(Base):
+    """A named workflow graph with a current published version (v1.3).
+
+    ``key`` is a stable slug (e.g. "standard-onboarding").  The definition
+    row itself only tracks identity/status; the actual step graphs live in
+    immutable WorkflowDefinitionVersion rows.
+    """
+
+    __tablename__ = "workflow_definitions"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    request_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="draft", index=True
+    )  # draft | published | archived
+    current_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class WorkflowDefinitionVersionRecord(Base):
+    """One immutable snapshot of a workflow graph (v1.3).
+
+    Published versions are NEVER mutated — editing means creating a new
+    version row.  ``checksum`` is a SHA-256 over the canonical steps JSON so
+    identical graphs are detectable and corruption is obvious.
+    """
+
+    __tablename__ = "workflow_definition_versions"
+    __table_args__ = (
+        PrimaryKeyConstraint("definition_key", "version"),
+    )
+
+    definition_key: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    steps_json: Mapped[str] = mapped_column(Text, nullable=False)
+    checksum: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_by: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    published_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class OnboardingRequestRecord(Base):
     """An onboarding or offboarding request (v0.5)."""
 
@@ -229,6 +281,11 @@ class OnboardingRequestRecord(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
+    # v1.3: requests are PINNED to a definition version at creation time.
+    # Editing/publishing definitions never changes an in-flight request.
+    # Nullable: legacy rows used the hard-coded Python templates.
+    definition_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    definition_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
 
 class ChecklistItemRecord(Base):
@@ -255,6 +312,15 @@ class ChecklistItemRecord(Base):
     # them in, and _add_missing_columns() migrates pre-existing SQLite files.
     action: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     result: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON from the action
+    # v1.1/v1.3: DAG metadata copied from the pinned definition version at
+    # request creation. All nullable so legacy rows keep working (they behave
+    # like v1.0: join=all, no conditions, no SLA).
+    depends_on: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON list of step keys
+    join_mode: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)  # "all" | "any" (default all)
+    when_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON list of predicates
+    sla_minutes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    escalation_queue: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    skip_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
@@ -291,6 +357,36 @@ class OffboardingCompletionRecord(Base):
         DateTime(timezone=True), default=utcnow
     )
     result_json: Mapped[str] = mapped_column(Text, nullable=False)  # stored response body
+
+
+class WorkflowTimerRecord(Base):
+    """SLA timer with the same lease/fencing pattern as workflow jobs (v1.3).
+
+    A timer is created when a step enters "pending", cancelled when it leaves
+    pending, and fired by ``python -m src.timers``.  Firing uses a conditional
+    UPDATE on ``status='pending'`` plus a lease token, so two concurrent
+    timer processes can never double-fire the same deadline.
+    """
+
+    __tablename__ = "workflow_timers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    request_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    item_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="step_sla")
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", index=True
+    )  # pending | fired | cancelled
+    lease_owner_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    fired_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
 
 
 _tables_ready = False

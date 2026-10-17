@@ -46,6 +46,7 @@ from src.auth import (
     authenticate_bearer,
     validate_auth_configuration,
 )
+from src import expressions, timers, workflow
 from src.m365_simulator import M365Simulator
 from src.notify import deliver_webhook
 from src.onboarding import checklist_for
@@ -730,12 +731,21 @@ class ChecklistItemOut(BaseModel):
     queue: str
     requires_approval: bool
     status: str
-
-
+    # v1.3 DAG fields (None on legacy rows -> behave like v1.0).
+    depends_on: list[str] = []
+    join: str = "all"
+    when: list[str] = []
+    sla_minutes: Optional[int] = None
+    escalation_queue: Optional[str] = None
+    skip_reason: Optional[str] = None
+    overdue: bool = False
+    sla_remaining_minutes: Optional[int] = None
 
 
 class OnboardingRequestIn(BaseModel):
     """A manager's onboarding/offboarding request (v0.5)."""
+
+    model_config = ConfigDict(extra="forbid")
 
     request_type: Literal["onboarding", "offboarding"]
     employee_name: StrictStr
@@ -744,6 +754,13 @@ class OnboardingRequestIn(BaseModel):
     requester_id: StrictInt = Field(ge=1)
     start_date: Optional[StrictStr] = Field(
         default=None, description="ISO date (YYYY-MM-DD) the employee starts or leaves."
+    )
+    # v1.3: optional data-driven graph.  When set, the request is pinned at
+    # creation to the definition's CURRENT published version; omit it to use
+    # the built-in hard-coded checklist (v0.5 behaviour, unchanged).
+    definition_key: Optional[StrictStr] = Field(
+        default=None, min_length=1, max_length=64,
+        description="Slug of a PUBLISHED workflow definition to build the checklist from.",
     )
 
     @field_validator("employee_name", "department")
@@ -784,6 +801,10 @@ class OnboardingRequestOut(BaseModel):
     requester_id: int
     start_date: Optional[str] = None
     status: str
+    # v1.3: the workflow definition version this request was pinned to at
+    # creation (None for legacy requests built from hard-coded checklists).
+    definition_key: Optional[str] = None
+    definition_version: Optional[int] = None
     checklist: list[ChecklistItemOut]
 
 
@@ -796,6 +817,71 @@ class OnboardingStatusSummaryOut(BaseModel):
     completed_steps: int
     pending_approval_steps: int
     percent_complete: int
+
+
+# ---------------------------------------------------------------------------
+# v1.3: versioned workflow definitions (schemas)
+
+
+class WorkflowStepIn(BaseModel):
+    """One step of a workflow definition graph (v1.3).
+
+    Field names match the documented step object; ``step`` is the human label.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: StrictStr
+    step: StrictStr
+    queue: StrictStr = "general"
+    requires_approval: StrictBool = False
+    action: Optional[StrictStr] = None
+    depends_on: list[StrictStr] = []
+    join: Literal["all", "any"] = "all"
+    when: list[StrictStr] = []
+    sla_minutes: Optional[StrictInt] = None
+    escalation_queue: Optional[StrictStr] = None
+
+
+class WorkflowDefinitionCreateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: StrictStr
+    name: StrictStr
+    request_type: Literal["onboarding", "offboarding"]
+    steps: list[WorkflowStepIn] = Field(min_length=1)
+
+
+class WorkflowDefinitionEditIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: StrictStr
+    request_type: Literal["onboarding", "offboarding"]
+    steps: list[WorkflowStepIn] = Field(min_length=1)
+
+
+class WorkflowDefinitionPublishIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: StrictInt = Field(ge=1)
+
+
+class WorkflowDefinitionVersionOut(BaseModel):
+    version: int
+    checksum: str
+    created_at: Optional[str] = None
+    published_at: Optional[str] = None
+    created_by: Optional[str] = None
+
+
+class WorkflowDefinitionOut(BaseModel):
+    key: str
+    name: str
+    request_type: str
+    status: str
+    current_version: int
+    steps: list[dict] = []
+    versions: list[WorkflowDefinitionVersionOut] = []
 
 
 # ---------------------------------------------------------------------------
@@ -1454,6 +1540,200 @@ def webhook_intake(
     return _process_intake(payload, session, actor_subject)
 
 
+def _definition_version_row(
+    session: Session, key: str, version: int
+) -> db.WorkflowDefinitionVersionRecord:
+    row = session.get(db.WorkflowDefinitionVersionRecord, (key, version))
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Workflow definition '{key}' has no version {version}.",
+        )
+    return row
+
+
+def _definition_out(
+    session: Session, record: db.WorkflowDefinitionRecord, *, include_versions: bool = False
+) -> WorkflowDefinitionOut:
+    versions = session.execute(
+        select(db.WorkflowDefinitionVersionRecord)
+        .where(db.WorkflowDefinitionVersionRecord.definition_key == record.key)
+        .order_by(db.WorkflowDefinitionVersionRecord.version)
+    ).scalars().all()
+    current_steps: list[dict] = []
+    if record.current_version:
+        current = _definition_version_row(session, record.key, record.current_version)
+        current_steps = json.loads(current.steps_json)
+    return WorkflowDefinitionOut(
+        key=record.key,
+        name=record.name,
+        request_type=record.request_type,
+        status=record.status,
+        current_version=record.current_version,
+        steps=current_steps,
+        versions=[
+            WorkflowDefinitionVersionOut(
+                version=v.version, checksum=v.checksum,
+                published_at=v.published_at.isoformat() if v.published_at else None,
+                created_at=v.created_at.isoformat() if v.created_at else None,
+                created_by=v.created_by,
+            )
+            for v in versions
+        ] if include_versions else [],
+    )
+
+
+@app.post(
+    "/workflow-definitions",
+    response_model=WorkflowDefinitionOut,
+    status_code=http_status.HTTP_201_CREATED,
+)
+def create_workflow_definition(
+    payload: WorkflowDefinitionCreateIn,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowDefinitionOut:
+    """Create a draft definition with immutable version 1.
+
+    Drafts are never selectable by requests; publish a version first.
+    """
+    try:
+        specs = workflow.validate_graph(payload.steps, payload.request_type)
+    except workflow.GraphValidationError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if session.get(db.WorkflowDefinitionRecord, payload.key) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A workflow definition named '{payload.key}' already exists.",
+        )
+    steps_json = workflow.canonical_steps_json(specs)
+    record = db.WorkflowDefinitionRecord(
+        key=payload.key, name=payload.name, request_type=payload.request_type,
+        status="draft", current_version=0,
+    )
+    session.add(record)
+    session.add(
+        db.WorkflowDefinitionVersionRecord(
+            definition_key=payload.key, version=1, steps_json=steps_json,
+            checksum=workflow.steps_checksum(specs), created_by=actor.subject,
+        )
+    )
+    session.flush()
+    db.log_execution(
+        session, run_id=_new_run_id(), action="workflow.definition.created",
+        status="success", duration_ms=0,
+        detail=f"draft '{payload.key}' v1 ({len(specs)} steps)",
+        actor_subject=actor.subject,
+    )
+    return _definition_out(session, record)
+
+
+@app.put("/workflow-definitions/{key}", response_model=WorkflowDefinitionOut)
+def edit_workflow_definition(
+    key: str,
+    payload: WorkflowDefinitionEditIn,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowDefinitionOut:
+    """Add a NEW immutable version; published versions are never mutated.
+
+    The new version stays unpublished until /publish is called, so editing a
+    live definition can never change an in-flight or future request silently.
+    """
+    record = session.get(db.WorkflowDefinitionRecord, key)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"No workflow definition '{key}'.")
+    if record.status == "archived":
+        raise HTTPException(
+            status_code=409, detail=f"Workflow definition '{key}' is archived."
+        )
+    if payload.request_type != record.request_type:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"request_type '{payload.request_type}' does not match the "
+                f"definition's '{record.request_type}'."
+            ),
+        )
+    try:
+        specs = workflow.validate_graph(payload.steps, payload.request_type)
+    except workflow.GraphValidationError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    latest = session.execute(
+        select(db.WorkflowDefinitionVersionRecord.version)
+        .where(db.WorkflowDefinitionVersionRecord.definition_key == key)
+        .order_by(db.WorkflowDefinitionVersionRecord.version.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    version = (latest or 0) + 1
+    session.add(
+        db.WorkflowDefinitionVersionRecord(
+            definition_key=key, version=version,
+            steps_json=workflow.canonical_steps_json(specs),
+            checksum=workflow.steps_checksum(specs), created_by=actor.subject,
+        )
+    )
+    record.name = payload.name
+    session.flush()
+    db.log_execution(
+        session, run_id=_new_run_id(), action="workflow.definition.version_added",
+        status="success", duration_ms=0,
+        detail=f"'{key}' v{version} ({len(specs)} steps, pending publish)",
+        actor_subject=actor.subject,
+    )
+    return _definition_out(session, record)
+
+
+@app.post("/workflow-definitions/{key}/publish", response_model=WorkflowDefinitionOut)
+def publish_workflow_definition(
+    key: str,
+    payload: WorkflowDefinitionPublishIn,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowDefinitionOut:
+    """Mark one existing version as current/published (versions stay immutable)."""
+    record = session.get(db.WorkflowDefinitionRecord, key)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"No workflow definition '{key}'.")
+    if record.status == "archived":
+        raise HTTPException(
+            status_code=409, detail=f"Workflow definition '{key}' is archived."
+        )
+    version_row = _definition_version_row(session, key, payload.version)
+    version_row.published_at = db.utcnow()
+    record.current_version = payload.version
+    record.status = "published"
+    session.flush()
+    db.log_execution(
+        session, run_id=_new_run_id(), action="workflow.definition.published",
+        status="success", duration_ms=0,
+        detail=f"'{key}' now serves v{payload.version}",
+        actor_subject=actor.subject,
+    )
+    return _definition_out(session, record)
+
+
+@app.get("/workflow-definitions", response_model=list[WorkflowDefinitionOut])
+def list_workflow_definitions(
+    session: Session = Depends(db.get_session),
+) -> list[WorkflowDefinitionOut]:
+    records = session.execute(
+        select(db.WorkflowDefinitionRecord).order_by(db.WorkflowDefinitionRecord.key)
+    ).scalars().all()
+    return [_definition_out(session, r) for r in records]
+
+
+@app.get("/workflow-definitions/{key}", response_model=WorkflowDefinitionOut)
+def get_workflow_definition(
+    key: str, session: Session = Depends(db.get_session)
+) -> WorkflowDefinitionOut:
+    """Published steps plus full immutable version history."""
+    record = session.get(db.WorkflowDefinitionRecord, key)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"No workflow definition '{key}'.")
+    return _definition_out(session, record, include_versions=True)
+
+
 # ---------------------------------------------------------------------------
 # Routes: onboarding/offboarding workflows
 
@@ -1461,22 +1741,154 @@ def webhook_intake(
 def _request_out(
     record: db.OnboardingRequestRecord, items: list[db.ChecklistItemRecord]
 ) -> OnboardingRequestOut:
+    # v1.3: one batched query for every pending timer of this request so the
+    # detail endpoint never does N+1 queries per checklist item.  The read
+    # runs on the SAME engine the caller is using (tests call use_database()
+    # with a temp file; production uses the default engine).
+    from datetime import timezone as _tz
+
+    now = db.utcnow()
+    due_by_item: dict[int, object] = {}
+    if items:
+        with db.SessionLocal() as read_session:
+            timers = read_session.execute(
+                select(db.WorkflowTimerRecord).where(
+                    db.WorkflowTimerRecord.request_id == record.id,
+                    db.WorkflowTimerRecord.status == "pending",
+                )
+            ).scalars().all()
+        due_by_item = {timer.item_id: timer.due_at for timer in timers}
+
+    def _sla_fields(item: db.ChecklistItemRecord) -> tuple[bool, Optional[int]]:
+        due = due_by_item.get(item.id)
+        if due is None or item.status != "pending":
+            return False, None
+        if due.tzinfo is None:
+            due = due.replace(tzinfo=_tz.utc)
+        remaining = int((due - now).total_seconds() // 60)
+        return remaining < 0, remaining
+
+    checklist = []
+    for item in sorted(items, key=lambda i: i.id):
+        overdue, remaining = _sla_fields(item)
+        import json as _json
+
+        checklist.append(
+            ChecklistItemOut(
+                **{c: getattr(item, c) for c in (
+                    "id", "step", "step_key", "queue", "requires_approval",
+                    "status", "action", "sla_minutes", "escalation_queue",
+                    "skip_reason",
+                )},
+                depends_on=_json.loads(item.depends_on) if item.depends_on else [],
+                join=item.join_mode or "all",
+                when=_json.loads(item.when_json) if item.when_json else [],
+                overdue=overdue,
+                sla_remaining_minutes=remaining,
+            )
+        )
     return OnboardingRequestOut(
         **{c: getattr(record, c) for c in (
             "id", "request_type", "employee_name", "employee_email",
             "department", "requester_id", "start_date", "status",
         )},
-        checklist=[
-            ChecklistItemOut(
-                **{c: getattr(item, c) for c in (
-                    "id", "step", "step_key", "queue", "requires_approval",
-                    "status", "action",
-                )},
-                result=json.loads(item.result) if item.result else None,
-            )
-            for item in sorted(items, key=lambda i: i.id)
-        ],
+        definition_key=record.definition_key,
+        definition_version=record.definition_version,
+        checklist=checklist,
     )
+
+
+def get_session_for_read():
+    """Legacy helper kept for clarity; _request_out uses db.SessionLocal()."""
+    return db.SessionLocal()
+
+
+def apply_graph_transitions(
+    session: Session,
+    record: db.OnboardingRequestRecord,
+    items: list[db.ChecklistItemRecord],
+    *,
+    actor_subject: Optional[str] = None,
+    run_id: Optional[str] = None,
+) -> list[db.ChecklistItemRecord]:
+    """v1.3: resolve the DAG against current statuses and persist outcomes.
+
+    * blocked steps stay pending;
+    * steps whose condition is false become 'skipped' with an audit-visible
+      reason (unknown identifiers included — fail closed, never a 500);
+    * 'any'-join steps whose prerequisites ALL ended failed/skipped cascade
+      to 'skipped';
+    * newly ready steps with an SLA get their timer armed (promotion time);
+    * skipped/failed steps cancel their timers.
+
+    Loops until stable so cascade skips propagate transitively.  Used by the
+    API (onboarding + offboarding), worker, scheduler, and ChatOps so all
+    entry points share identical semantics.
+    """
+    from src import timers as timers_module
+    from src import workflow
+
+    specs = workflow.specs_from_records(items)
+    changed_any = False
+    for _round in range(len(specs) + 1):  # bounded: at most one skip per round
+        states = workflow.states_from_records(items)
+        decisions = workflow.resolve_graph(specs, states)
+        changed = False
+        for item in items:
+            resolution = decisions.get(item.step_key)
+            if resolution is None:
+                continue
+            if resolution.decision == "skipped" and item.status not in workflow.TERMINAL_STATUSES:
+                item.status = workflow.SKIPPED
+                item.skip_reason = resolution.reason
+                timers_module.cancel_step_timer(session, item.id)
+                db.log_execution(
+                    session,
+                    run_id=run_id or _new_run_id(),
+                    action="onboarding.item.skipped",
+                    status="success",
+                    duration_ms=0,
+                    detail=(
+                        f"step '{item.step}' skipped: {resolution.reason}"
+                    ),
+                    actor_subject=actor_subject,
+                )
+                changed = True
+                changed_any = True
+            elif item.status == "pending" and resolution.decision == "ready":
+                if timers_module.ensure_step_timer(session, item):
+                    changed = True  # re-armed on promotion
+        if not changed:
+            break
+        # refresh in-memory state objects after writes
+        session.flush()
+        items_map = {i.step_key: i for i in items}
+        states = workflow.states_from_records(items)
+        decisions = workflow.resolve_graph(specs, states)
+    if changed_any:
+        _finalize_request_status(session, record, items, actor_subject)
+    return items
+
+
+def _finalize_request_status(
+    session: Session,
+    record: db.OnboardingRequestRecord,
+    items: list[db.ChecklistItemRecord],
+    actor_subject: Optional[str] = None,
+) -> None:
+    """Mark a request completed once no work remains (completed or skipped)."""
+    done = all(i.status in ("completed", "skipped") for i in items)
+    if done and record.status != "completed":
+        record.status = "completed"
+        db.log_execution(
+            session,
+            run_id=_new_run_id(),
+            action="onboarding.request.completed",
+            status="success",
+            duration_ms=0,
+            detail=f"all checklist steps done for request #{record.id}",
+            actor_subject=actor_subject,
+        )
 
 
 def _load_request(
@@ -1498,6 +1910,41 @@ def _create_onboarding_request(
 ) -> OnboardingRequestOut:
     """Create the record and checklist, returning the API response shape."""
     started = time.perf_counter()
+
+    # v1.3: if a published definition is requested, pin THIS request to its
+    # current version.  Editing/publishing later never alters in-flight work.
+    definition_record: Optional[db.WorkflowDefinitionRecord] = None
+    definition_version_row: Optional[db.WorkflowDefinitionVersionRecord] = None
+    if request.definition_key is not None:
+        definition_record = session.get(
+            db.WorkflowDefinitionRecord, request.definition_key
+        )
+        if definition_record is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No workflow definition '{request.definition_key}'.",
+            )
+        if definition_record.status != "published" or not definition_record.current_version:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Workflow definition '{request.definition_key}' is not published; "
+                    "only published versions can start requests."
+                ),
+            )
+        if definition_record.request_type != request.request_type:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Definition '{request.definition_key}' is for "
+                    f"'{definition_record.request_type}', not "
+                    f"'{request.request_type}'."
+                ),
+            )
+        definition_version_row = _definition_version_row(
+            session, definition_record.key, definition_record.current_version
+        )
+
     record = db.OnboardingRequestRecord(
         request_type=request.request_type,
         employee_name=request.employee_name,
@@ -1505,19 +1952,53 @@ def _create_onboarding_request(
         department=request.department,
         requester_id=request.requester_id,
         start_date=request.start_date,
+        definition_key=(
+            definition_record.key if definition_record is not None else None
+        ),
+        definition_version=(
+            definition_version_row.version if definition_version_row else None
+        ),
     )
     session.add(record)
     session.flush()
-    steps = checklist_for(request.request_type)
+    if definition_version_row is not None:
+        steps = json.loads(definition_version_row.steps_json)
+    else:
+        steps = checklist_for(request.request_type)
     for template in steps:
         # The template's ``key`` becomes the row's ``step_key`` column.
+        # Definition steps carry DAG fields (join/when/sla/...); the record
+        # stores them in their column names (join_mode / when_json).
+        template = dict(template)
+        key = template.pop("key", None)
+        join_mode = template.pop("join", None)
+        when = template.pop("when", None)
+        depends_on = template.pop("depends_on", None)
+        sla_minutes = template.pop("sla_minutes", None)
+        escalation_queue = template.pop("escalation_queue", None)
         session.add(
             db.ChecklistItemRecord(
-                request_id=record.id, step_key=template["key"],
-                **{k: v for k, v in template.items() if k != "key"},
+                request_id=record.id,
+                step_key=key,
+                step=template.pop("step"),
+                queue=template.pop("queue", "general"),
+                requires_approval=template.pop("requires_approval", False),
+                action=template.pop("action", None),
+                status="pending",
+                depends_on=json.dumps(depends_on) if depends_on else None,
+                join_mode=join_mode,
+                when_json=json.dumps(when) if when else None,
+                sla_minutes=sla_minutes,
+                escalation_queue=escalation_queue,
             )
         )
     session.flush()
+    _, items = _load_request(session, record.id)
+    if definition_version_row is not None:
+        # Data-driven graphs run through the shared resolver so conditions
+        # that are already false (or any-joins with no live prerequisite)
+        # skip immediately instead of waiting forever.
+        apply_graph_transitions(session, record, items, actor_subject=actor_subject)
     db.log_execution(
         session,
         run_id=_new_run_id(),
@@ -1525,7 +2006,13 @@ def _create_onboarding_request(
         status="success",
         duration_ms=int((time.perf_counter() - started) * 1000),
         detail=f"{request.request_type} for {request.employee_name}: "
-               f"{len(steps)} checklist steps generated",
+               f"{len(steps)} checklist steps generated"
+               + (
+                   f" from definition '{definition_record.key}' "
+                   f"v{definition_version_row.version}"
+                   if definition_version_row
+                   else ""
+               ),
         actor_subject=actor_subject,
     )
     _, items = _load_request(session, record.id)
