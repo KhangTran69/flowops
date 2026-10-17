@@ -2,7 +2,7 @@ services:
   app:
     build: .
     ports:
-      - "8000:8000"
+      - "${FLOWOPS_APP_PORT:-8000}:8000"
     environment:
       FLOWOPS_DATABASE_URL: postgresql+psycopg://flowops:flowops@postgres:5432/flowops
     depends_on:

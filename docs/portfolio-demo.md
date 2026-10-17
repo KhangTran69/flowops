@@ -96,6 +96,14 @@ curl http://127.0.0.1:8000/health
 docker compose down
 ```
 
+If port 8000 is already in use, run the stack on another host port:
+
+```bash
+FLOWOPS_APP_PORT=8001 docker compose up --build
+curl http://127.0.0.1:8001/health
+FLOWOPS_APP_PORT=8001 docker compose down
+```
+
 The same build, startup, health check, and PostgreSQL-backed ticket request
 also run automatically in the `docker-postgres` GitHub Actions job. This keeps
 the deployment path verifiable even when Docker Desktop is not installed on a

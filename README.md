@@ -103,6 +103,9 @@ curl http://127.0.0.1:8000/health
 docker compose down
 ```
 
+The host port can be changed when port 8000 is already occupied:
+`FLOWOPS_APP_PORT=8001 docker compose up --build`.
+
 The database uses a named Docker volume so `docker compose down` stops the
 services without deleting the stored PostgreSQL data. Use
 `docker compose down -v` when you intentionally want to remove that volume.
