@@ -1,19 +1,32 @@
+x-flowops-env: &flowops-env
+  FLOWOPS_DATABASE_URL: postgresql+psycopg://flowops:flowops@postgres:5432/flowops
+  FLOWOPS_ENVIRONMENT: ${FLOWOPS_ENVIRONMENT:-development}
+  FLOWOPS_AUTH_REQUIRED: ${FLOWOPS_AUTH_REQUIRED:-false}
+  FLOWOPS_DEV_BEARER_TOKEN: ${FLOWOPS_DEV_BEARER_TOKEN:-}
+  FLOWOPS_ENTRA_ISSUER: ${FLOWOPS_ENTRA_ISSUER:-}
+  FLOWOPS_ENTRA_AUDIENCE: ${FLOWOPS_ENTRA_AUDIENCE:-}
+  FLOWOPS_ENTRA_JWKS_URL: ${FLOWOPS_ENTRA_JWKS_URL:-}
+  FLOWOPS_ENTRA_REQUIRED_ROLE: ${FLOWOPS_ENTRA_REQUIRED_ROLE:-automation.operator}
+  FLOWOPS_WEBHOOK_API_KEY: ${FLOWOPS_WEBHOOK_API_KEY:-}
+  FLOWOPS_ACTION_ADAPTER: ${FLOWOPS_ACTION_ADAPTER:-simulated}
+  FLOWOPS_POWER_AUTOMATE_URL: ${FLOWOPS_POWER_AUTOMATE_URL:-}
+  FLOWOPS_GRAPH_URL: ${FLOWOPS_GRAPH_URL:-https://graph.microsoft.com/v1.0}
+  FLOWOPS_GRAPH_ACCESS_TOKEN: ${FLOWOPS_GRAPH_ACCESS_TOKEN:-}
+  FLOWOPS_ACTION_RETRIES: ${FLOWOPS_ACTION_RETRIES:-{}}
+  FLOWOPS_ACTION_FAILURE_WEBHOOK_URL: ${FLOWOPS_ACTION_FAILURE_WEBHOOK_URL:-}
+  FLOWOPS_NOTIFICATION_MAX_ATTEMPTS: ${FLOWOPS_NOTIFICATION_MAX_ATTEMPTS:-5}
+  FLOWOPS_RATE_LIMIT_PER_MINUTE: ${FLOWOPS_RATE_LIMIT_PER_MINUTE:-0}
+
 services:
   app:
     build: .
+    restart: unless-stopped
+    stop_grace_period: 15s
     ports:
       - "${FLOWOPS_APP_PORT:-8000}:8000"
     environment:
-      FLOWOPS_DATABASE_URL: postgresql+psycopg://flowops:flowops@postgres:5432/flowops
-      FLOWOPS_AUTH_REQUIRED: ${FLOWOPS_AUTH_REQUIRED:-false}
-      FLOWOPS_DEV_BEARER_TOKEN: ${FLOWOPS_DEV_BEARER_TOKEN:-}
-      FLOWOPS_DEV_BEARER_TOKEN: ${FLOWOPS_DEV_BEARER_TOKEN:-}
-      FLOWOPS_ACTION_ADAPTER: ${FLOWOPS_ACTION_ADAPTER:-simulated}
-      FLOWOPS_POWER_AUTOMATE_URL: ${FLOWOPS_POWER_AUTOMATE_URL:-}
-      FLOWOPS_GRAPH_URL: ${FLOWOPS_GRAPH_URL:-https://graph.microsoft.com/v1.0}
-      FLOWOPS_GRAPH_ACCESS_TOKEN: ${FLOWOPS_GRAPH_ACCESS_TOKEN:-}
-      FLOWOPS_ACTION_RETRIES: ${FLOWOPS_ACTION_RETRIES:-{}}
-      FLOWOPS_ACTION_FAILURE_WEBHOOK_URL: ${FLOWOPS_ACTION_FAILURE_WEBHOOK_URL:-}
+      <<: *flowops-env
+      FLOWOPS_RUN_MIGRATIONS: "true"
     depends_on:
       postgres:
         condition: service_healthy
@@ -22,14 +35,49 @@ services:
         - CMD
         - python
         - -c
-        - "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/health', timeout=2)"
+        - "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/ready', timeout=2)"
       interval: 5s
       timeout: 3s
       retries: 12
-      start_period: 5s
+      start_period: 8s
+
+  worker:
+    build: .
+    restart: unless-stopped
+    stop_grace_period: 15s
+    command: ["python", "-m", "src.worker", "--poll-interval", "2"]
+    environment:
+      <<: *flowops-env
+      FLOWOPS_RUN_MIGRATIONS: "false"
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'src.worker' >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  outbox:
+    build: .
+    restart: unless-stopped
+    stop_grace_period: 15s
+    command: ["python", "-m", "src.outbox_worker", "--poll-interval", "2"]
+    environment:
+      <<: *flowops-env
+      FLOWOPS_RUN_MIGRATIONS: "false"
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'src.outbox_worker' >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_DB: flowops
       POSTGRES_USER: flowops

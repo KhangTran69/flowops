@@ -141,3 +141,38 @@ def test_jobs_page_renders(client):
     response = client.get("/ui/workflow-jobs")
     assert response.status_code == 200
     assert "Workflow jobs" in response.text
+
+
+def test_audit_page_renders_actor_rows(client, monkeypatch):
+    monkeypatch.setenv("FLOWOPS_AUTH_REQUIRED", "true")
+    monkeypatch.setenv("FLOWOPS_DEV_BEARER_TOKEN", "dev-secret")
+    payload = {"userId": 7, "id": 42, "title": "Laptop will not start", "completed": False}
+    assert client.post(
+        "/tickets", json=payload, headers={"Authorization": "Bearer dev-secret"}
+    ).status_code == 201
+    page = client.get("/ui/audit").text
+    assert "Audit trail" in page
+    assert "configured-bearer" in page
+    assert "ticket.created" in page
+
+
+def test_job_detail_page_renders(client):
+    created = client.post("/onboarding-requests", json=ONBOARDING)
+    request_id = created.json()["id"]
+    item_id = next(
+        item["id"] for item in created.json()["checklist"] if not item["requires_approval"]
+    )
+    job = client.post(
+        f"/onboarding-requests/{request_id}/items/{item_id}/jobs"
+    ).json()
+    page = client.get(f"/ui/workflow-jobs/{job['id']}")
+    assert page.status_code == 200
+    assert "Job state" in page.text
+    assert "Payload" in page.text
+    assert f"/workflow-jobs/{job['id']}/cancel" in page.text
+
+
+def test_job_detail_missing_renders_404(client):
+    response = client.get("/ui/workflow-jobs/999")
+    assert response.status_code == 404
+    assert "Page not found" in response.text

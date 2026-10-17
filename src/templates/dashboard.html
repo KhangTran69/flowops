@@ -69,7 +69,7 @@
   {% if logs %}
   <div class="table-wrap">
     <table>
-      <thead><tr><th>#</th><th>Time</th><th>Action</th><th>Status</th><th>Ticket</th><th>Duration</th></tr></thead>
+      <thead><tr><th>#</th><th>Time</th><th>Action</th><th>Status</th><th>Ticket</th><th>Actor</th><th>Duration</th></tr></thead>
       <tbody>
         {% for log in logs %}
         <tr>
@@ -78,6 +78,7 @@
           <td>{{ log.action }}</td>
           <td><span class="badge {{ 'ok' if log.status == 'success' else 'fail' }}">{{ log.status }}</span></td>
           <td>{{ log.ticket_id or '—' }}</td>
+          <td>{{ log.actor_subject or '—' }}</td>
           <td>{{ log.duration_ms }} ms</td>
         </tr>
         {% endfor %}

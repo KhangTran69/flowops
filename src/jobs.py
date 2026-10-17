@@ -16,6 +16,8 @@ from sqlalchemy.orm import Session
 
 from src import db
 
+JOB_ONBOARDING_ITEM = "onboarding.item.execute"
+
 JOB_STATUSES = (
     "queued",
     "running",
@@ -95,7 +97,7 @@ def claim_job(
 ) -> Optional[db.WorkflowJobRecord]:
     """Atomically claim the oldest due job for this worker."""
     now = now or db.utcnow()
-    token = worker_id or uuid.uuid4().hex
+    token = uuid.uuid4().hex
     table = db.WorkflowJobRecord
     candidate_query = (
         select(table.id)
@@ -109,7 +111,7 @@ def claim_job(
 
     for job_id in candidate_ids:
         result = session.execute(
-            update(table)
+            update(table).execution_options(synchronize_session=False)
             .where(and_(table.id == job_id, _claimable(now)))
             .values(
                 status="running",
@@ -121,6 +123,7 @@ def claim_job(
         )
         if result.rowcount == 1:
             session.commit()
+            session.expire_all()
             return session.get(table, job_id)
     session.commit()
     return None
@@ -138,7 +141,7 @@ def heartbeat_job(
     now = now or db.utcnow()
     table = db.WorkflowJobRecord
     result = session.execute(
-        update(table)
+        update(table).execution_options(synchronize_session=False)
         .where(
             and_(
                 table.id == job_id,
@@ -166,7 +169,7 @@ def complete_job(
     now = now or db.utcnow()
     table = db.WorkflowJobRecord
     outcome = session.execute(
-        update(table)
+        update(table).execution_options(synchronize_session=False)
         .where(
             and_(
                 table.id == job_id,
@@ -230,7 +233,7 @@ def fail_job(
         }
         resulting_status = "retry_scheduled"
     outcome = session.execute(
-        update(table)
+        update(table).execution_options(synchronize_session=False)
         .where(
             and_(
                 table.id == job_id,
@@ -250,7 +253,7 @@ def retry_failed_job(
     now = now or db.utcnow()
     table = db.WorkflowJobRecord
     result = session.execute(
-        update(table)
+        update(table).execution_options(synchronize_session=False)
         .where(and_(table.id == job_id, table.status == "failed"))
         .values(
             status="queued",
@@ -274,7 +277,7 @@ def cancel_job(
     now = now or db.utcnow()
     table = db.WorkflowJobRecord
     result = session.execute(
-        update(table)
+        update(table).execution_options(synchronize_session=False)
         .where(
             and_(
                 table.id == job_id,
@@ -297,10 +300,14 @@ def list_jobs(
     *,
     status: Optional[str] = None,
     limit: int = 50,
+    offset: int = 0,
 ) -> Iterable[db.WorkflowJobRecord]:
-    statement = select(db.WorkflowJobRecord).order_by(
-        db.WorkflowJobRecord.id.desc()
-    ).limit(max(1, min(limit, 200)))
+    statement = (
+        select(db.WorkflowJobRecord)
+        .order_by(db.WorkflowJobRecord.id.desc())
+        .offset(max(0, offset))
+        .limit(max(1, min(limit, 200)))
+    )
     if status in JOB_STATUSES:
         statement = statement.where(db.WorkflowJobRecord.status == status)
     return session.execute(statement).scalars().all()

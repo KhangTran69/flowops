@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Audit trail — FlowOps{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <span class="eyebrow">Operator UI</span>
+    <h1>Audit trail</h1>
+    <p class="muted">Execution rows attributed to an authenticated actor.</p>
+  </div>
+  <div class="segmented" role="group" aria-label="Filter audit status">
+    <a class="button small {% if not status_filter %}active{% endif %}" href="/ui/audit">All</a>
+    <a class="button small {% if status_filter == 'success' %}active{% endif %}" href="/ui/audit?status=success">Success</a>
+    <a class="button small {% if status_filter == 'failure' %}active{% endif %}" href="/ui/audit?status=failure">Failure</a>
+  </div>
+</section>
+<section class="panel">
+  {% if logs %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Time</th><th>Actor</th><th>Action</th><th>Status</th><th>Ticket</th><th>Detail</th></tr></thead>
+      <tbody>
+        {% for log in logs %}
+        <tr>
+          <td>#{{ log.id }}</td><td>{{ log.created_at }}</td><td>{{ log.actor_subject }}</td><td>{{ log.action }}</td>
+          <td><span class="badge {{ 'ok' if log.status == 'success' else 'fail' }}">{{ log.status }}</span></td>
+          <td>{{ log.ticket_id or '—' }}</td><td class="muted">{{ log.detail or '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">No actor-attributed actions yet. Authenticated mutations will appear here.</p>
+  {% endif %}
+</section>
+{% if has_previous or has_next %}
+<div class="toolbar" style="margin-top: 0.8rem;">
+  {% if has_previous %}<a class="button small" href="/ui/audit?page={{ page - 1 }}{% if status_filter %}&status={{ status_filter }}{% endif %}{% if actor_filter %}&actor={{ actor_filter }}{% endif %}">Previous</a>{% endif %}
+  <span class="muted small">Page {{ page }}</span>
+  {% if has_next %}<a class="button small" href="/ui/audit?page={{ page + 1 }}{% if status_filter %}&status={{ status_filter }}{% endif %}{% if actor_filter %}&actor={{ actor_filter }}{% endif %}">Next</a>{% endif %}
+</div>
+{% endif %}
+{% endblock %}

@@ -23,6 +23,12 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
+      - name: Check database migrations
+        env:
+          FLOWOPS_DATABASE_URL: sqlite:///data/migration-check.db
+        run: |
+          alembic upgrade head
+          alembic upgrade head
       - name: Run offline tests
         run: pytest -q
 
@@ -74,8 +80,13 @@ jobs:
           python-version: "3.13"
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
+      - name: Run PostgreSQL migrations
+        env:
+          FLOWOPS_DATABASE_URL: postgresql+psycopg://flowops:flowops@127.0.0.1:5432/flowops
+        run: alembic upgrade head
       - name: Run PostgreSQL reliability tests
         env:
           FLOWOPS_TEST_POSTGRES_URL: postgresql+psycopg://flowops:flowops@127.0.0.1:5432/flowops
         run: |
-          pytest -q tests/test_idempotency_postgres.py tests/test_outbox_postgres.py
+          pytest -q tests/test_idempotency_postgres.py tests/test_outbox_postgres.py \
+            tests/test_jobs_postgres.py tests/test_outbox_worker_postgres.py

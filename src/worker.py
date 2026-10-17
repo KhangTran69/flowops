@@ -12,6 +12,7 @@ Or as a polling daemon:
 import argparse
 import json
 import signal
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -29,7 +30,7 @@ from src.actions import (
 )
 
 ACTION_ADAPTER: ActionAdapter = adapter_from_environment()
-JOB_ONBOARDING_ITEM = "onboarding.item.execute"
+JOB_ONBOARDING_ITEM = jobs.JOB_ONBOARDING_ITEM
 
 
 def _new_run_id() -> str:
@@ -50,8 +51,8 @@ def _add_audit(
 ) -> None:
     session.add(
         db.ActionExecutionRecord(
-            request_id=job.resource_id and int(job.resource_id) or 0,
-            checklist_item_id=0,
+            request_id=request_id or 0,
+            checklist_item_id=item_id or 0,
             action=action,
             actor_subject=None,
             adapter=type(ACTION_ADAPTER).__name__,
@@ -67,8 +68,63 @@ def _add_audit(
     )
 
 
+class _LeaseHeartbeat:
+    """Extend a job lease while an action is running, stopping on takeover."""
+
+    def __init__(
+        self,
+        job_id: int,
+        owner_token: Optional[str],
+        lease_seconds: int,
+        interval: Optional[float],
+    ) -> None:
+        self.job_id = job_id
+        self.owner_token = owner_token
+        self.lease_seconds = lease_seconds
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def __enter__(self) -> "_LeaseHeartbeat":
+        if not self.owner_token or not self.interval or self.interval <= 0:
+            return self
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            session = db.SessionLocal()
+            try:
+                still_owned = jobs.heartbeat_job(
+                    session,
+                    self.job_id,
+                    self.owner_token or "",
+                    lease_seconds=self.lease_seconds,
+                )
+                session.commit()
+                if not still_owned:
+                    self._stop.set()
+                    return
+            except Exception:
+                session.rollback()
+                return
+            finally:
+                session.close()
+
+
 def _complete_onboarding_job(
-    session: Session, job: db.WorkflowJobRecord, payload: dict[str, Any]
+    session: Session,
+    job: db.WorkflowJobRecord,
+    payload: dict[str, Any],
+    *,
+    lease_seconds: int = jobs.DEFAULT_LEASE_SECONDS,
+    heartbeat_interval: Optional[float] = None,
 ) -> dict[str, Any]:
     """Execute one onboarding item and finish the job in the same transaction."""
     started = db.utcnow()
@@ -90,22 +146,26 @@ def _complete_onboarding_job(
         )
 
     action = payload.get("action") or action_for_step(item.step)
+    idempotency_key = job.idempotency_key or f"onboarding:{request.id}:{item.id}"
     context = {
         "request_id": request.id,
         "request_type": request.request_type,
         "employee_name": request.employee_name,
         "employee_email": request.employee_email,
         "department": request.department,
+        "idempotency_key": idempotency_key,
+        "job_id": job.id,
     }
-    adapter_result: ActionResult = ACTION_ADAPTER.execute(action, context)
+    interval = heartbeat_interval
+    if interval is None:
+        interval = max(0.25, lease_seconds / 3)
+    with _LeaseHeartbeat(
+        job.id, job.lease_owner_token, lease_seconds, interval
+    ):
+        adapter_result: ActionResult = ACTION_ADAPTER.execute(action, context)
     item.status = "completed"
     session.flush()
 
-    session.execute(
-        select(db.ChecklistItemRecord).where(
-            db.ChecklistItemRecord.request_id == request.id
-        )
-    )
     items = session.execute(
         select(db.ChecklistItemRecord).where(
             db.ChecklistItemRecord.request_id == request.id
@@ -151,7 +211,13 @@ class _PermanentJobError(Exception):
     """A failure that should not be retried (invalid state or missing data)."""
 
 
-def _execute_job(session: Session, job: db.WorkflowJobRecord) -> str:
+def _execute_job(
+    session: Session,
+    job: db.WorkflowJobRecord,
+    *,
+    lease_seconds: int = jobs.DEFAULT_LEASE_SECONDS,
+    heartbeat_interval: Optional[float] = None,
+) -> str:
     if job.job_type != JOB_ONBOARDING_ITEM:
         jobs.fail_job(
             session,
@@ -165,7 +231,13 @@ def _execute_job(session: Session, job: db.WorkflowJobRecord) -> str:
 
     payload = json.loads(job.payload_json)
     try:
-        _complete_onboarding_job(session, job, payload)
+        _complete_onboarding_job(
+            session,
+            job,
+            payload,
+            lease_seconds=lease_seconds,
+            heartbeat_interval=heartbeat_interval,
+        )
         return "succeeded"
     except _PermanentJobError as error:
         jobs.fail_job(
@@ -197,6 +269,7 @@ def run_once(
     *,
     worker_id: Optional[str] = None,
     lease_seconds: int = jobs.DEFAULT_LEASE_SECONDS,
+    heartbeat_interval: Optional[float] = None,
 ) -> Optional[db.WorkflowJobRecord]:
     """Claim and execute at most one due job."""
     db._ensure_tables()
@@ -207,7 +280,12 @@ def run_once(
         )
         if job is None:
             return None
-        _execute_job(session, job)
+        _execute_job(
+            session,
+            job,
+            lease_seconds=lease_seconds,
+            heartbeat_interval=heartbeat_interval,
+        )
         session.expire_all()
         return session.get(db.WorkflowJobRecord, job.id)
     except Exception:
@@ -237,6 +315,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=None,
         help="stable worker identifier (defaults to a random id)",
     )
+    parser.add_argument(
+        "--heartbeat-interval",
+        type=float,
+        default=None,
+        help="seconds between lease heartbeats (defaults to lease/3)",
+    )
     args = parser.parse_args(argv)
     worker_id = args.worker_id or f"worker-{uuid.uuid4().hex[:8]}"
     stopping = False
@@ -249,7 +333,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     signal.signal(signal.SIGINT, stop)
 
     while not stopping:
-        job = run_once(worker_id=worker_id, lease_seconds=args.lease_seconds)
+        job = run_once(
+            worker_id=worker_id,
+            lease_seconds=args.lease_seconds,
+            heartbeat_interval=args.heartbeat_interval,
+        )
         if job is not None:
             print(f"{job.id} {job.status} {job.job_type}", flush=True)
             if args.once:

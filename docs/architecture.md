@@ -45,9 +45,38 @@ local verification and GitHub Actions.
 - Onboarding steps use explicit approval and completion state transitions.
 - Execution logs make each workflow action visible to the dashboard.
 
+## Runtime topology
+
+```text
+Browser / operator
+        |
+        v
+FastAPI app ---- Jinja2 templates + local CSS/JS
+        |                    |
+        |                    +--> landing, dashboard, /ui/onboarding, /ui/notifications, /ui/workflow-jobs
+        |
+        +--> JSON API -- idempotency reservations, tickets, onboarding, notifications, workflow jobs
+        |
+        +--> SQLite / PostgreSQL (Alembic-managed schema)
+                     ^
+                     |
+              durable worker (src/worker.py)
+              leased jobs, retries, dead-letter
+```
+
+The web UI is read-mostly and uses the same JSON API for actions. Workflow jobs
+are claimed with an owner token and lease; the worker commits the item update,
+execution log, audit row, and job completion in one fenced transaction. Auth is
+configurable: local development is open by default, while protected deployments
+require a dev bearer token or Entra JWT and record the actor on execution logs.
+`/ready` checks the database; `/metrics` exposes request, job, and outbox
+gauges; every response carries a correlation ID.
+
 ## Deliberate limits
 
-This is a localhost learning prototype. Authentication, real Microsoft 365
-actions, and AI-assisted recommendations are intentionally outside the current
-credential-free scope. Future sensitive actions must remain behind explicit
-human approval gates.
+This is a localhost learning prototype. Real Microsoft 365 actions and
+AI-assisted recommendations are intentionally outside the current
+credential-free scope. Authentication is optional and defaults to local
+development; configure a dev bearer token or Entra JWT before exposing the
+service. Future sensitive actions must remain behind explicit human approval
+gates.

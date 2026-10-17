@@ -10,6 +10,7 @@ import hashlib
 import html
 import json
 import os
+import threading
 import time
 import uuid
 from collections import Counter
@@ -20,15 +21,28 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Res
 from fastapi import status as http_status
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, StrictBool, StrictInt, StrictStr, field_validator
-from sqlalchemy import and_, delete, select, update
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, field_validator
+from sqlalchemy import and_, delete, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
-from src import db
-from src.actions import ACTION_BY_STEP, ActionResult, action_for_step, adapter_from_environment
+from src import db, jobs, web
+from src.actions import (
+    ACTION_BY_STEP,
+    ActionAdapter,
+    ActionResult,
+    SimulatedMicrosoftAdapter,
+    action_for_step,
+    adapter_from_environment,
+)
+from src.auth import (
+    AuthenticationError,
+    Actor,
+    authenticate_bearer,
+    validate_auth_configuration,
+)
 from src.m365_simulator import M365Simulator
 from src.notify import deliver_webhook
 from src.onboarding import checklist_for
@@ -111,6 +125,103 @@ app.mount(
 )
 
 
+def _actor_from_header(
+    authorization: Optional[str] = Header(default=None),
+) -> Actor:
+    """Resolve the authenticated actor, or raise a clean 401."""
+    try:
+        return authenticate_bearer(authorization)
+    except AuthenticationError as error:
+        raise HTTPException(status_code=401, detail=str(error)) from error
+
+
+def _operator_actor(actor: Actor = Depends(_actor_from_header)) -> Actor:
+    if not {"automation.operator", "automation.admin"} & set(actor.roles):
+        raise HTTPException(status_code=403, detail="Operator role is required.")
+    _enforce_rate_limit(f"actor:{actor.subject}")
+    return actor
+
+
+def _admin_actor(actor: Actor = Depends(_actor_from_header)) -> Actor:
+    if "automation.admin" not in actor.roles:
+        raise HTTPException(status_code=403, detail="Admin role is required.")
+    _enforce_rate_limit(f"actor:{actor.subject}")
+    return actor
+
+
+def _webhook_actor(
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+) -> str:
+    expected = os.environ.get("FLOWOPS_WEBHOOK_API_KEY")
+    if expected and x_api_key != expected:
+        raise HTTPException(status_code=401, detail="Invalid webhook API key.")
+    _enforce_rate_limit("webhook:intake")
+    return "webhook-api-key" if expected else "local-development"
+
+
+_METRICS_LOCK = threading.Lock()
+_METRICS: dict[tuple[str, str, int], int] = {}
+_METRICS_STARTED = time.time()
+
+
+def _record_request(method: str, route: str, status_code: int, duration: float) -> None:
+    key = (method, route, status_code)
+    with _METRICS_LOCK:
+        _METRICS[key] = _METRICS.get(key, 0) + 1
+
+
+@app.middleware("http")
+async def correlation_and_metrics(request: Request, call_next):
+    """Attach a correlation id and count every HTTP request."""
+    correlation_id = request.headers.get("X-Correlation-ID") or uuid.uuid4().hex
+    request.state.correlation_id = correlation_id
+    started = time.perf_counter()
+    response = await call_next(request)
+    duration = time.perf_counter() - started
+    route = request.scope.get("route")
+    route_path = getattr(route, "path", request.url.path)
+    _record_request(request.method, route_path, response.status_code, duration)
+    response.headers["X-Correlation-ID"] = correlation_id
+    return response
+
+
+_RATE_LIMIT_LOCK = threading.Lock()
+_RATE_LIMIT_BUCKETS: dict[str, tuple[float, int]] = {}
+
+
+def _enforce_rate_limit(actor_key: str) -> None:
+    """Simple in-process token bucket for the prototype (disabled by default)."""
+    try:
+        limit = int(os.environ.get("FLOWOPS_RATE_LIMIT_PER_MINUTE", "0") or 0)
+    except ValueError:
+        limit = 0
+    if limit <= 0:
+        return
+    now = time.monotonic()
+    with _RATE_LIMIT_LOCK:
+        window_start, count = _RATE_LIMIT_BUCKETS.get(actor_key, (now, 0))
+        if now - window_start >= 60:
+            window_start, count = now, 0
+        if count >= limit:
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limit exceeded; retry later.",
+                headers={"Retry-After": "60"},
+            )
+        _RATE_LIMIT_BUCKETS[actor_key] = (window_start, count + 1)
+
+
+@app.on_event("startup")
+def _validate_auth_on_startup() -> None:
+    validate_auth_configuration()
+
+
+@app.get("/auth/me")
+def auth_me(actor: Actor = Depends(_actor_from_header)) -> dict:
+    """Return the resolved local or token actor."""
+    return {"subject": actor.subject, "roles": list(actor.roles)}
+
+
 def _new_run_id() -> str:
     return uuid.uuid4().hex[:12]
 
@@ -119,6 +230,25 @@ def _new_run_id() -> str:
 # requests can be reclaimed after five minutes). Used by the claim/takeover
 # logic below and by _reservation_is_stale().
 IDEMPOTENCY_PROCESSING_TIMEOUT = timedelta(minutes=5)
+
+
+def _request_fingerprint(request: BaseModel) -> str:
+    """Return a stable SHA-256 of a validated request body."""
+    return hashlib.sha256(
+        json.dumps(request.model_dump(), sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _validate_idempotency_key(key: Optional[str]) -> None:
+    if key is not None and len(key) > 128:
+        raise HTTPException(
+            status_code=422, detail="Idempotency-Key must be at most 128 characters."
+        )
+
+
+def _stored_resource_type(payload: dict[str, Any]) -> str:
+    """Legacy records predate resource scoping and are ticket reservations."""
+    return payload.get("resource_type", IDEMPOTENCY_SCOPE_TICKET)
 
 
 def _claim_idempotency_key(
@@ -396,6 +526,26 @@ class Ticket(BaseModel):
     queue: Optional[str] = None
 
 
+class WorkflowJobOut(BaseModel):
+    """Durable workflow queue entry exposed to operators."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    job_type: str
+    status: str
+    attempts: int
+    max_attempts: int
+    available_at: datetime
+    last_error: Optional[str] = None
+    resource_type: Optional[str] = None
+    resource_id: Optional[str] = None
+    label: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    completed_at: Optional[datetime] = None
+
+
 class ExecutionLogOut(BaseModel):
     id: int
     run_id: str
@@ -404,6 +554,7 @@ class ExecutionLogOut(BaseModel):
     ticket_id: Optional[str] = None
     duration_ms: int
     detail: Optional[str] = None
+    actor_subject: Optional[str] = None
     created_at: datetime
 
 
@@ -543,49 +694,11 @@ def _notify(event: str, ticket: Ticket, run_id: str, session: Session) -> None:
         )
 
 
-def _action_attempts(action: str) -> int:
-    """Retry budget for one action: env override JSON, else 3 attempts."""
-    overrides = os.environ.get("FLOWOPS_ACTION_RETRIES")
-    if overrides:
-        try:
-            limit = int(json.loads(overrides).get(action, 3))
-        except (ValueError, TypeError):
-            limit = 3
-        return max(1, limit)
-    return 3
-
-
-def _notify_action_failure(
-    action: str,
-    context: dict,
-    attempts: int,
-    last_error: str,
+def _process_intake(
+    request: TicketIntakeRequest,
     session: Session,
-) -> None:
-    """Alert operators (never raising) when an action exhausts its retries."""
-    webhook_url = os.environ.get("FLOWOPS_ACTION_FAILURE_WEBHOOK_URL")
-    if not webhook_url:
-        return
-    payload = {
-        "event": "action.failure",
-        "action": action,
-        "attempts": attempts,
-        "error": last_error,
-        "request_id": context.get("request_id"),
-        "employee_email": context.get("employee_email"),
-    }
-    delivery = deliver_webhook(webhook_url, payload)
-    db.log_execution(
-        session,
-        run_id=_new_run_id(),
-        action="notification.action_failure",
-        status="success" if delivery.success else "failure",
-        duration_ms=0,
-        detail=f"action '{action}' alert delivered={delivery.success}",
-    )
-
-
-def _process_intake(request: TicketIntakeRequest, session: Session) -> Ticket:
+    actor_subject: Optional[str] = None,
+) -> Ticket:
     """Normalize, route, persist, and log one incoming ticket."""
     run_id = _new_run_id()
     started = time.perf_counter()
@@ -614,6 +727,7 @@ def _process_intake(request: TicketIntakeRequest, session: Session) -> Ticket:
         ticket_id=ticket["ticket_id"],
         duration_ms=int((time.perf_counter() - started) * 1000),
         detail=f"routed to {decision.queue} ({decision.category}/{decision.priority})",
+        actor_subject=actor_subject,
     )
     result = Ticket(**ticket)
     _notify(action, result, run_id, session)
@@ -659,6 +773,59 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+@app.get("/ready")
+def ready() -> dict:
+    """Readiness probe: verifies the configured database is reachable."""
+    try:
+        with db.engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except Exception as error:  # pragma: no cover - exercised by deployment
+        raise HTTPException(status_code=503, detail="Database is not ready.") from error
+    return {"status": "ready", "database": "ok"}
+
+
+@app.get("/metrics", include_in_schema=False)
+def metrics(session: Session = Depends(db.get_session)) -> Response:
+    """Minimal Prometheus-style metrics for jobs, outbox, and HTTP requests."""
+    lines = [
+        "# HELP flowops_http_requests_total HTTP requests by method, route, and status",
+        "# TYPE flowops_http_requests_total counter",
+    ]
+    with _METRICS_LOCK:
+        counters = dict(_METRICS)
+    for (method, route, status_code), count in sorted(counters.items()):
+        lines.append(
+            "flowops_http_requests_total"
+            f'{{method="{method}",route="{route}",status="{status_code}"}} {count}'
+        )
+
+    job_records = session.execute(select(db.WorkflowJobRecord)).scalars().all()
+    job_counts = Counter(job.status for job in job_records)
+    lines.extend(
+        [
+            "# HELP flowops_workflow_jobs Workflow jobs by state",
+            "# TYPE flowops_workflow_jobs gauge",
+        ]
+    )
+    for state in jobs.JOB_STATUSES:
+        lines.append(f'flowops_workflow_jobs{{status="{state}"}} {job_counts.get(state, 0)}')
+
+    outbox = session.execute(select(db.NotificationOutboxRecord)).scalars().all()
+    outbox_counts = Counter(item.status for item in outbox)
+    lines.extend(
+        [
+            "# HELP flowops_notification_outbox Notification deliveries by state",
+            "# TYPE flowops_notification_outbox gauge",
+        ]
+    )
+    for state in ("pending", "delivered", "failed"):
+        lines.append(
+            f'flowops_notification_outbox{{status="{state}"}} {outbox_counts.get(state, 0)}'
+        )
+    lines.append(f"flowops_uptime_seconds {time.time() - _METRICS_STARTED:.1f}")
+    return Response("\n".join(lines) + "\n", media_type="text/plain")
+
+
 # ---------------------------------------------------------------------------
 # Routes: tickets
 
@@ -667,6 +834,7 @@ def health() -> dict:
 def create_ticket(
     request: TicketIntakeRequest,
     response: Response,
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> Ticket:
@@ -693,7 +861,7 @@ def create_ticket(
     try:
         if session.get(db.TicketRecord, str(request.id)) is not None:
             response.status_code = http_status.HTTP_200_OK
-        result = _process_intake(request, session)
+        result = _process_intake(request, session, actor.subject)
         if idempotency_key and owner_token is not None:
             if not _complete_idempotency_key(
                 session,
@@ -724,11 +892,16 @@ def create_ticket(
 
 
 @app.get("/tickets", response_model=list[Ticket])
-def list_tickets(session: Session = Depends(db.get_session)) -> list[Ticket]:
-    """List all stored tickets, ordered by numeric ticket ID."""
+def list_tickets(
+    session: Session = Depends(db.get_session),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> list[Ticket]:
+    """List stored tickets, ordered by numeric ticket ID."""
     records = session.execute(select(db.TicketRecord)).scalars().all()
     tickets = [Ticket.model_validate(record, from_attributes=True) for record in records]
-    return sorted(tickets, key=lambda ticket: int(ticket.ticket_id))
+    ordered = sorted(tickets, key=lambda ticket: int(ticket.ticket_id))
+    return ordered[offset:offset + limit]
 
 
 @app.get("/tickets/{ticket_id}", response_model=Ticket)
@@ -747,6 +920,7 @@ def get_ticket(
 @app.post("/webhooks/intake")
 def webhook_intake(
     payload: TicketIntakeRequest | list[TicketIntakeRequest],
+    actor_subject: str = Depends(_webhook_actor),
     session: Session = Depends(db.get_session),
 ) -> Any:
     """n8n-friendly intake: accepts one ticket or a list, always 200.
@@ -756,8 +930,8 @@ def webhook_intake(
     item is processed.
     """
     if isinstance(payload, list):
-        return [_process_intake(item, session) for item in payload]
-    return _process_intake(payload, session)
+        return [_process_intake(item, session, actor_subject) for item in payload]
+    return _process_intake(payload, session, actor_subject)
 
 
 # ---------------------------------------------------------------------------
@@ -798,7 +972,9 @@ def _load_request(
 
 
 def _create_onboarding_request(
-    request: OnboardingRequestIn, session: Session
+    request: OnboardingRequestIn,
+    session: Session,
+    actor_subject: Optional[str] = None,
 ) -> OnboardingRequestOut:
     """Create the record and checklist, returning the API response shape."""
     started = time.perf_counter()
@@ -830,6 +1006,7 @@ def _create_onboarding_request(
         duration_ms=int((time.perf_counter() - started) * 1000),
         detail=f"{request.request_type} for {request.employee_name}: "
                f"{len(steps)} checklist steps generated",
+        actor_subject=actor_subject,
     )
     _, items = _load_request(session, record.id)
     return _request_out(record, items)
@@ -843,6 +1020,7 @@ def _create_onboarding_request(
 def create_onboarding_request(
     request: OnboardingRequestIn,
     response: Response,
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> OnboardingRequestOut:
@@ -867,7 +1045,7 @@ def create_onboarding_request(
 
     ownership_lost = False
     try:
-        result = _create_onboarding_request(request, session)
+        result = _create_onboarding_request(request, session, actor.subject)
         if idempotency_key and owner_token is not None:
             if not _complete_idempotency_key(
                 session,
@@ -1016,11 +1194,17 @@ def ui_onboarding_request(
 
 @app.get("/ui/notifications", response_class=HTMLResponse, include_in_schema=False)
 def ui_notifications(
-    request: Request, session: Session = Depends(db.get_session)
+    request: Request,
+    session: Session = Depends(db.get_session),
+    page: int = Query(default=1, ge=1),
 ) -> HTMLResponse:
     """Operator page for pending and dead-letter webhook deliveries."""
+    page_size = 25
     records = session.execute(
-        select(db.NotificationOutboxRecord).order_by(db.NotificationOutboxRecord.id)
+        select(db.NotificationOutboxRecord)
+        .order_by(db.NotificationOutboxRecord.id)
+        .offset((page - 1) * page_size)
+        .limit(page_size)
     ).scalars().all()
     return web.render(
         request,
@@ -1029,19 +1213,103 @@ def ui_notifications(
             "active": "notifications",
             "pending": [item for item in records if item.status == "pending"],
             "failed": [item for item in records if item.status == "failed"],
+            "page": page,
+            "has_previous": page > 1,
+            "has_next": len(records) == page_size,
         },
     )
 
 
 @app.get("/ui/workflow-jobs", response_class=HTMLResponse, include_in_schema=False)
 def ui_workflow_jobs(
-    request: Request, session: Session = Depends(db.get_session)
+    request: Request,
+    session: Session = Depends(db.get_session),
+    page: int = Query(default=1, ge=1),
 ) -> HTMLResponse:
     """Operator page for the durable workflow queue."""
+    page_size = 25
+    records = jobs.list_jobs(
+        session, limit=page_size, offset=(page - 1) * page_size
+    )
     return web.render(
         request,
         "jobs.html",
-        {"active": "jobs", "jobs": []},
+        {
+            "active": "jobs",
+            "jobs": records,
+            "page": page,
+            "has_previous": page > 1,
+            "has_next": len(records) == page_size,
+        },
+    )
+
+
+@app.get("/ui/audit", response_class=HTMLResponse, include_in_schema=False)
+def ui_audit(
+    request: Request,
+    session: Session = Depends(db.get_session),
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    actor_filter: Optional[str] = Query(default=None, alias="actor"),
+    page: int = Query(default=1, ge=1),
+) -> HTMLResponse:
+    """Operator audit page for actor-attributed execution rows."""
+    query = select(db.ExecutionLogRecord).where(
+        db.ExecutionLogRecord.actor_subject.is_not(None)
+    )
+    if status_filter in ("success", "failure"):
+        query = query.where(db.ExecutionLogRecord.status == status_filter)
+    if actor_filter:
+        query = query.where(db.ExecutionLogRecord.actor_subject == actor_filter)
+    page_size = 25
+    records = session.execute(
+        query.order_by(db.ExecutionLogRecord.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    ).scalars().all()
+    return web.render(
+        request,
+        "audit.html",
+        {
+            "active": "audit",
+            "logs": records,
+            "status_filter": status_filter,
+            "actor_filter": actor_filter or "",
+            "page": page,
+            "has_previous": page > 1,
+            "has_next": len(records) == page_size,
+        },
+    )
+
+
+@app.get(
+    "/ui/workflow-jobs/{job_id}",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+)
+def ui_workflow_job_detail(
+    request: Request, job_id: int, session: Session = Depends(db.get_session)
+) -> HTMLResponse:
+    """Operator detail page for one durable workflow job."""
+    job = session.get(db.WorkflowJobRecord, job_id)
+    if job is None:
+        return web.render(request, "404.html", {"active": "jobs"}, status_code=404)
+    try:
+        payload = json.loads(job.payload_json)
+    except json.JSONDecodeError:
+        payload = {}
+    try:
+        result = json.loads(job.result_json) if job.result_json else {}
+    except json.JSONDecodeError:
+        result = {}
+    return web.render(
+        request,
+        "job_detail.html",
+        {
+            "active": "jobs",
+            "job": job,
+            "payload": json.dumps(payload, indent=2, sort_keys=True),
+            "result": json.dumps(result, indent=2, sort_keys=True),
+        },
     )
 
 
@@ -1065,6 +1333,7 @@ def _transition_item(
     request_id: int,
     item_id: int,
     action: Literal["approve", "complete"],
+    actor_subject: Optional[str] = None,
 ) -> OnboardingRequestOut:
     record, _ = _load_request(session, request_id)
     item = _get_item(session, record, item_id)
@@ -1093,6 +1362,7 @@ def _transition_item(
         status="success",
         duration_ms=0,
         detail=f"step '{item.step}' of request #{record.id} is now '{item.status}'",
+        actor_subject=actor_subject,
     )
 
     _, items = _load_request(session, record.id)
@@ -1105,6 +1375,7 @@ def _transition_item(
             status="success",
             duration_ms=0,
             detail=f"all checklist steps done for request #{record.id}",
+            actor_subject=actor_subject,
         )
     _, items = _load_request(session, record.id)
     return _request_out(record, items)
@@ -1168,6 +1439,7 @@ def _execute_item(
                 status="success",
                 duration_ms=int((time.perf_counter() - started) * 1000),
                 detail=f"attempts={attempt}; {result.detail}",
+                actor_subject=actor.subject,
             )
             _, items = _load_request(session, record.id)
             if all(i.status == "completed" for i in items):
@@ -1208,6 +1480,7 @@ def _execute_item(
         status="failure",
         duration_ms=int((time.perf_counter() - started) * 1000),
         detail=f"attempts={attempts_limit}; {last_error}",
+        actor_subject=actor.subject,
     )
     session.flush()
     session.commit()
@@ -1221,14 +1494,10 @@ def _execute_item(
 def execute_item(
     request_id: int,
     item_id: int,
-    authorization: Optional[str] = Header(default=None),
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
 ) -> OnboardingRequestOut:
     """Execute a checklist action through the configured Microsoft adapter."""
-    try:
-        actor = authenticate_bearer(authorization)
-    except AuthenticationError as error:
-        raise HTTPException(status_code=401, detail=str(error)) from error
     return _execute_item(session, request_id, item_id, actor)
 
 @app.get("/onboarding-requests/{request_id}/action-executions", response_model=list[ActionExecutionOut])
@@ -1247,15 +1516,21 @@ def list_action_executions(
 
 @app.post("/onboarding-requests/{request_id}/items/{item_id}/approve")
 def approve_item(
-    request_id: int, item_id: int, session: Session = Depends(db.get_session)
+    request_id: int,
+    item_id: int,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
 ) -> OnboardingRequestOut:
     """Approve a checklist step that requires human sign-off."""
-    return _transition_item(session, request_id, item_id, "approve")
+    return _transition_item(session, request_id, item_id, "approve", actor.subject)
 
 
 @app.post("/onboarding-requests/{request_id}/items/{item_id}/complete")
 def complete_item(
-    request_id: int, item_id: int, session: Session = Depends(db.get_session)
+    request_id: int,
+    item_id: int,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
 ) -> OnboardingRequestOut:
     """Mark a checklist step completed (after approval if required).
 
@@ -1275,7 +1550,10 @@ def complete_item(
             "POST /offboarding-requests/{checklist_id}/steps/{step_key}/complete "
             "(idempotent completion ledger).",
         )
-    return _transition_item(session, request_id, item_id, "complete")
+    return _transition_item(
+        session, request_id, item_id, "complete", actor.subject
+    )
+
 
 
 class OffboardingStepResultOut(BaseModel):
@@ -1510,6 +1788,146 @@ def get_m365_status(user_id: str) -> M365StatusOut:
 
 
 # ---------------------------------------------------------------------------
+# Routes: durable workflow jobs
+
+
+@app.post(
+    "/onboarding-requests/{request_id}/items/{item_id}/jobs",
+    response_model=WorkflowJobOut,
+    status_code=http_status.HTTP_202_ACCEPTED,
+)
+def enqueue_onboarding_item_job(
+    request_id: int,
+    item_id: int,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowJobOut:
+    """Queue one onboarding checklist action for a durable worker."""
+    record, _ = _load_request(session, request_id)
+    item = _get_item(session, record, item_id)
+    if item.status == "completed":
+        raise HTTPException(409, "Checklist item is already completed.")
+    required_status = "approved" if item.requires_approval else "pending"
+    if item.status != required_status:
+        raise HTTPException(
+            409,
+            f"Item must be '{required_status}' before execution "
+            f"(current status: '{item.status}').",
+        )
+    action = action_for_step(item.step)
+    job = jobs.enqueue_job(
+        session,
+        job_type=jobs.JOB_ONBOARDING_ITEM,
+        payload={"request_id": record.id, "item_id": item.id, "action": action},
+        idempotency_key=f"onboarding:{record.id}:{item.id}",
+        resource_type="onboarding",
+        resource_id=str(record.id),
+        label=f"{record.employee_name}: {item.step}",
+    )
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="workflow.job.enqueued",
+        status="success",
+        ticket_id=str(record.id),
+        duration_ms=0,
+        detail=f"job #{job.id} ({action}) queued for item #{item.id}",
+        actor_subject=actor.subject,
+    )
+    session.commit()
+    return WorkflowJobOut.model_validate(job)
+
+
+@app.get("/workflow-jobs", response_model=list[WorkflowJobOut])
+def list_workflow_jobs(
+    session: Session = Depends(db.get_session),
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> list[WorkflowJobOut]:
+    """List durable workflow jobs, newest first."""
+    return [
+        WorkflowJobOut.model_validate(job)
+        for job in jobs.list_jobs(
+            session, status=status_filter, limit=limit, offset=offset
+        )
+    ]
+
+
+@app.get("/workflow-jobs/{job_id}", response_model=WorkflowJobOut)
+def get_workflow_job(
+    job_id: int, session: Session = Depends(db.get_session)
+) -> WorkflowJobOut:
+    """Return one durable workflow job."""
+    job = session.get(db.WorkflowJobRecord, job_id)
+    if job is None:
+        raise HTTPException(404, "Workflow job not found.")
+    return WorkflowJobOut.model_validate(job)
+
+
+@app.post("/workflow-jobs/{job_id}/retry", response_model=WorkflowJobOut)
+def retry_workflow_job(
+    job_id: int,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowJobOut:
+    """Return a failed workflow job to the queue with a fresh attempt budget."""
+    job = session.get(db.WorkflowJobRecord, job_id)
+    if job is None:
+        raise HTTPException(404, "Workflow job not found.")
+    if job.status != "failed":
+        raise HTTPException(
+            409, f"Only failed jobs can be retried (current status: '{job.status}')."
+        )
+    if not jobs.retry_failed_job(session, job_id):
+        raise HTTPException(409, "Workflow job changed state; refresh and retry.")
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="workflow.job.retried",
+        status="success",
+        ticket_id=job.resource_id,
+        duration_ms=0,
+        detail=f"job #{job_id} returned to the queue",
+        actor_subject=actor.subject,
+    )
+    session.commit()
+    session.expire_all()
+    job = session.get(db.WorkflowJobRecord, job_id)
+    return WorkflowJobOut.model_validate(job)
+
+
+@app.post("/workflow-jobs/{job_id}/cancel", response_model=WorkflowJobOut)
+def cancel_workflow_job(
+    job_id: int,
+    actor: Actor = Depends(_admin_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowJobOut:
+    """Cancel a queued or retry-scheduled workflow job."""
+    job = session.get(db.WorkflowJobRecord, job_id)
+    if job is None:
+        raise HTTPException(404, "Workflow job not found.")
+    if not jobs.cancel_job(session, job_id):
+        raise HTTPException(
+            409, "Only queued or retry-scheduled jobs can be cancelled."
+        )
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="workflow.job.cancelled",
+        status="success",
+        ticket_id=job.resource_id,
+        duration_ms=0,
+        detail=f"job #{job_id} cancelled",
+        actor_subject=actor.subject,
+    )
+    session.commit()
+    session.expire_all()
+    job = session.get(db.WorkflowJobRecord, job_id)
+    return WorkflowJobOut.model_validate(job)
+
+
+# ---------------------------------------------------------------------------
 # Routes: monitoring
 
 
@@ -1537,12 +1955,16 @@ def _outbox_out(record: db.NotificationOutboxRecord) -> NotificationOutboxOut:
 @app.get("/notifications/pending", response_model=list[NotificationOutboxOut])
 def list_pending_notifications(
     session: Session = Depends(db.get_session),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
 ) -> list[NotificationOutboxOut]:
     """List webhook deliveries that await a manual retry."""
     records = session.execute(
         select(db.NotificationOutboxRecord)
         .where(db.NotificationOutboxRecord.status == "pending")
         .order_by(db.NotificationOutboxRecord.id)
+        .offset(offset)
+        .limit(limit)
     ).scalars().all()
     return [_outbox_out(record) for record in records]
 
@@ -1550,6 +1972,8 @@ def list_pending_notifications(
 @app.get("/notifications/failed", response_model=list[NotificationOutboxOut])
 def list_failed_notifications(
     session: Session = Depends(db.get_session),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
 ) -> list[NotificationOutboxOut]:
     """List dead-letter deliveries that exhausted their retry budget.
 
@@ -1560,12 +1984,15 @@ def list_failed_notifications(
         select(db.NotificationOutboxRecord)
         .where(db.NotificationOutboxRecord.status == "failed")
         .order_by(db.NotificationOutboxRecord.id)
+        .offset(offset)
+        .limit(limit)
     ).scalars().all()
     return [_outbox_out(record) for record in records]
 
 
 @app.post("/notifications/retry", response_model=list[NotificationOutboxOut])
 def retry_failed_notifications(
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
     limit: int = Query(default=20, ge=1, le=100),
 ) -> list[NotificationOutboxOut]:
@@ -1609,6 +2036,7 @@ def retry_failed_notifications(
                         f"outbox #{record.id} exhausted after "
                         f"{record.attempts} attempts"
                     ),
+                    actor_subject=actor.subject,
                 )
         db.log_execution(
             session,
@@ -1618,6 +2046,7 @@ def retry_failed_notifications(
             ticket_id=record.ticket_id,
             duration_ms=duration_ms,
             detail=f"outbox #{record.id}: now '{record.status}'",
+            actor_subject=actor.subject,
         )
         results.append(_outbox_out(record))
     return results
@@ -1628,7 +2057,9 @@ def retry_failed_notifications(
     response_model=NotificationOutboxOut,
 )
 def requeue_failed_notification(
-    notification_id: int, session: Session = Depends(db.get_session)
+    notification_id: int,
+    actor: Actor = Depends(_admin_actor),
+    session: Session = Depends(db.get_session),
 ) -> NotificationOutboxOut:
     """Return one dead-letter delivery to the pending queue.
 
@@ -1677,6 +2108,7 @@ def requeue_failed_notification(
             f"outbox #{record.id} returned to pending; "
             f"attempts={record.attempts} preserved"
         ),
+        actor_subject=actor.subject,
     )
     return _outbox_out(record)
 
@@ -1685,20 +2117,56 @@ def requeue_failed_notification(
 def list_execution_logs(
     session: Session = Depends(db.get_session),
     status_filter: Optional[str] = Query(default=None, alias="status"),
+    actor_filter: Optional[str] = Query(default=None, alias="actor"),
     limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
 ) -> list[ExecutionLogOut]:
     """Recent workflow execution log entries, newest first."""
     statement = select(db.ExecutionLogRecord).order_by(
         db.ExecutionLogRecord.id.desc()
-    ).limit(limit)
+    ).offset(offset).limit(limit)
     if status_filter in ("success", "failure"):
         statement = statement.where(db.ExecutionLogRecord.status == status_filter)
+    if actor_filter:
+        statement = statement.where(
+            db.ExecutionLogRecord.actor_subject == actor_filter
+        )
     records = session.execute(statement).scalars().all()
     return [
         ExecutionLogOut(
             **{c: getattr(record, c) for c in (
                 "id", "run_id", "action", "status", "ticket_id",
-                "duration_ms", "detail", "created_at",
+                "duration_ms", "detail", "actor_subject", "created_at",
+            )}
+        )
+        for record in records
+    ]
+
+
+@app.get("/audit", response_model=list[ExecutionLogOut])
+def list_audit_trail(
+    session: Session = Depends(db.get_session),
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    actor_filter: Optional[str] = Query(default=None, alias="actor"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> list[ExecutionLogOut]:
+    """Recent execution rows that carry an authenticated actor."""
+    query = select(db.ExecutionLogRecord).where(
+        db.ExecutionLogRecord.actor_subject.is_not(None)
+    )
+    if status_filter in ("success", "failure"):
+        query = query.where(db.ExecutionLogRecord.status == status_filter)
+    if actor_filter:
+        query = query.where(db.ExecutionLogRecord.actor_subject == actor_filter)
+    records = session.execute(
+        query.order_by(db.ExecutionLogRecord.id.desc()).offset(offset).limit(limit)
+    ).scalars().all()
+    return [
+        ExecutionLogOut(
+            **{c: getattr(record, c) for c in (
+                "id", "run_id", "action", "status", "ticket_id",
+                "duration_ms", "detail", "actor_subject", "created_at",
             )}
         )
         for record in records
@@ -1777,6 +2245,7 @@ def dashboard(
             "action": log.action,
             "status": log.status,
             "ticket_id": log.ticket_id,
+            "actor_subject": log.actor_subject,
             "duration_ms": log.duration_ms,
         }
         for log in logs[:50]

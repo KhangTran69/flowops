@@ -5,10 +5,52 @@
   <div>
     <span class="eyebrow">Operator UI</span>
     <h1>Workflow jobs</h1>
-    <p class="muted">Durable execution queue for onboarding actions.</p>
+    <p class="muted">Durable execution queue for onboarding actions, with leased workers and retries.</p>
+  </div>
+  <div class="toolbar">
+    <span class="muted small">Run the worker with <code>python -m src.worker</code></span>
   </div>
 </section>
+
 <section class="panel">
-  <p class="empty">No workflow jobs yet. Enqueue one from an onboarding item.</p>
+  {% if jobs %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Job</th><th>Resource</th><th>Status</th><th>Attempts</th><th>Available</th><th>Last error</th><th>Actions</th></tr></thead>
+      <tbody>
+        {% for job in jobs %}
+        <tr>
+          <td>#{{ job.id }}</td>
+          <td><a href="/ui/workflow-jobs/{{ job.id }}">{{ job.label or job.job_type }}</a></td>
+          <td>{% if job.resource_type == 'onboarding' and job.resource_id %}<a href="/ui/onboarding-requests/{{ job.resource_id }}">request #{{ job.resource_id }}</a>{% else %}{{ job.resource_type or '—' }}{% endif %}</td>
+          <td><span class="badge {% if job.status == 'succeeded' %}ok{% elif job.status == 'failed' %}fail{% elif job.status == 'running' %}info{% endif %}">{{ job.status }}</span></td>
+          <td>{{ job.attempts }}/{{ job.max_attempts }}</td>
+          <td>{{ job.available_at }}</td>
+          <td class="fail">{{ job.last_error or '—' }}</td>
+          <td class="actions">
+            {% if job.status == 'failed' %}
+            <button class="button small" type="button" data-action-url="/workflow-jobs/{{ job.id }}/retry" data-method="POST" data-reload="true">Retry</button>
+            {% endif %}
+            {% if job.status in ('queued', 'retry_scheduled') %}
+            <button class="button small ghost" type="button" data-action-url="/workflow-jobs/{{ job.id }}/cancel" data-method="POST" data-reload="true" data-confirm="Cancel this queued job?">Cancel</button>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">No workflow jobs yet. Enqueue one from an onboarding item:</p>
+  <pre><code>curl -X POST http://127.0.0.1:8000/onboarding-requests/1/items/1/jobs</code></pre>
+  <p class="muted small">The synchronous <code>POST .../execute</code> endpoint still works for compatibility.</p>
+  {% endif %}
 </section>
+{% if has_previous or has_next %}
+<div class="toolbar" style="margin-top: 0.8rem;">
+  {% if has_previous %}<a class="button small" href="/ui/workflow-jobs?page={{ page - 1 }}">Previous</a>{% endif %}
+  <span class="muted small">Page {{ page }}</span>
+  {% if has_next %}<a class="button small" href="/ui/workflow-jobs?page={{ page + 1 }}">Next</a>{% endif %}
+</div>
+{% endif %}
 {% endblock %}

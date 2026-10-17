@@ -109,3 +109,62 @@ also run automatically in the `docker-postgres` GitHub Actions job. This keeps
 the deployment path verifiable even when Docker Desktop is not installed on a
 developer machine.
 
+
+## 5. Walk through the operator UI
+
+Open these pages:
+
+- <http://127.0.0.1:8000/> — landing page with live counts and API status
+- <http://127.0.0.1:8000/dashboard> — run health, routing bars, notification state
+- <http://127.0.0.1:8000/ui/onboarding-requests> — onboarding list and checklist detail
+- <http://127.0.0.1:8000/ui/notifications> — pending and dead-letter deliveries
+- <http://127.0.0.1:8000/ui/workflow-jobs> — durable queue, job detail, retry/cancel
+- <http://127.0.0.1:8000/ui/audit> — actor-attributed action history
+
+The UI is server-rendered with Jinja2 and local CSS/vanilla JS. It works offline;
+there are no CDN assets or build steps. Theme, pagination, and action buttons
+are progressive enhancements; core content still renders without JavaScript.
+
+## 6. Show the durable worker
+
+Enqueue an onboarding action:
+
+```bash
+curl -X POST http://127.0.0.1:8000/onboarding-requests/1/items/2/jobs
+```
+
+Run one worker iteration locally:
+
+```bash
+python -m src.worker --once
+```
+
+Or with Docker Compose, the worker service processes jobs automatically. In the
+UI, `/ui/workflow-jobs/{id}` shows the lease, attempts, payload, result, and
+retry/cancel controls. A slow action heartbeats its lease; a takeover fences the
+old owner. External actions remain at-least-once and receive a stable
+`idempotency_key`.
+
+## 7. Show operations and reliability
+
+```bash
+curl http://127.0.0.1:8000/ready
+curl http://127.0.0.1:8000/metrics
+curl -i http://127.0.0.1:8000/health   # includes X-Correlation-ID
+alembic upgrade head
+python scripts/load_smoke.py --requests 10 --concurrency 3
+```
+
+`/ready` checks the database; `/metrics` exposes request, job, and outbox
+counters/gauges; Alembic owns the schema; the load smoke script is a correctness
+check for concurrent intake/replay, not a benchmark.
+
+## Talking points for reliability
+
+- Idempotency reservations are fenced; stale owners cannot finalize or clean up
+  a takeover.
+- Workflow jobs and outbox deliveries use leases and conditional transitions.
+- Retries use exponential backoff and dead-lettering; operators can requeue.
+- Auth is optional locally, role-aware when enabled, and records the actor in
+  the audit trail.
+- Migrations run in the container entrypoint; the image runs as non-root.

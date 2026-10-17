@@ -269,10 +269,10 @@ def test_concurrent_same_key_returns_in_progress_then_replays(client, monkeypatc
     release_pipeline = Event()
     original_process = api._process_intake
 
-    def pause_pipeline(request, session):
+    def pause_pipeline(request, session, actor_subject=None):
         entered_pipeline.set()
         assert release_pipeline.wait(timeout=5), "test did not release the first request"
-        return original_process(request, session)
+        return original_process(request, session, actor_subject)
 
     monkeypatch.setattr(api, "_process_intake", pause_pipeline)
     headers = {"Idempotency-Key": "concurrent-same-key"}
@@ -417,7 +417,7 @@ def test_stale_owner_cannot_finalize_after_takeover(client, monkeypatch):
     call_lock = threading.Lock()
     original_process = api._process_intake
 
-    def pause_first_request(request, session):
+    def pause_first_request(request, session, actor_subject=None):
         nonlocal calls
         with call_lock:
             calls += 1
@@ -425,7 +425,7 @@ def test_stale_owner_cannot_finalize_after_takeover(client, monkeypatch):
         if is_first:
             a_entered.set()
             assert release_a.wait(timeout=5), "test did not release the stale owner"
-        return original_process(request, session)
+        return original_process(request, session, actor_subject)
 
     monkeypatch.setattr(api, "_process_intake", pause_first_request)
     key = "takeover-finalize-key"
@@ -488,7 +488,7 @@ def test_stale_owner_cleanup_cannot_delete_new_owner_reservation(client, monkeyp
     call_lock = threading.Lock()
     original_process = api._process_intake
 
-    def controlled_process(request, session):
+    def controlled_process(request, session, actor_subject=None):
         nonlocal calls
         with call_lock:
             calls += 1
@@ -500,7 +500,7 @@ def test_stale_owner_cleanup_cannot_delete_new_owner_reservation(client, monkeyp
         if call_number == 2:
             b_entered.set()
             assert b_release.wait(timeout=5), "test did not release the new owner"
-        return original_process(request, session)
+        return original_process(request, session, actor_subject)
 
     monkeypatch.setattr(api, "_process_intake", controlled_process)
     key = "takeover-cleanup-key"
@@ -568,7 +568,7 @@ def test_processing_failure_cleans_up_only_its_own_reservation(client, monkeypat
     finally:
         session.close()
 
-    def fail_pipeline(request, session):
+    def fail_pipeline(request, session, actor_subject=None):
         raise RuntimeError("ticket pipeline exploded")
 
     monkeypatch.setattr(api, "_process_intake", fail_pipeline)
