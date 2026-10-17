@@ -440,6 +440,74 @@ def _ensure_outbox_lease_columns() -> None:
                 )
 
 
+def _ensure_trigger_tables() -> None:
+    """Add trigger tables to databases created before they existed (v1.4)."""
+    if engine.dialect.name != "sqlite":
+        return
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    with engine.begin() as connection:
+        if "event_sources" not in tables:
+            connection.execute(
+                text(
+                    "CREATE TABLE event_sources ("
+                    "key VARCHAR(80) PRIMARY KEY, "
+                    "name VARCHAR(200) NOT NULL, "
+                    "secret VARCHAR(128) NOT NULL, "
+                    "active BOOLEAN NOT NULL DEFAULT 1, "
+                    "created_at DATETIME NOT NULL)"
+                )
+            )
+        if "triggers" not in tables:
+            connection.execute(
+                text(
+                    "CREATE TABLE triggers ("
+                    "key VARCHAR(80) PRIMARY KEY, "
+                    "name VARCHAR(200) NOT NULL, "
+                    "source_key VARCHAR(80) NOT NULL, "
+                    "event_type VARCHAR(64) NOT NULL, "
+                    "target_type VARCHAR(32) NOT NULL, "
+                    "definition_key VARCHAR(80), "
+                    "mapping_json TEXT NOT NULL, "
+                    "schedule_kind VARCHAR(16) NOT NULL DEFAULT 'webhook', "
+                    "interval_seconds INTEGER, "
+                    "daily_at_utc VARCHAR(5), "
+                    "active BOOLEAN NOT NULL DEFAULT 1, "
+                    "last_fired_at DATETIME, "
+                    "created_at DATETIME NOT NULL, "
+                    "updated_at DATETIME NOT NULL)"
+                )
+            )
+            connection.execute(
+                text("CREATE INDEX ix_triggers_source_key ON triggers(source_key)")
+            )
+            connection.execute(
+                text("CREATE INDEX ix_triggers_active ON triggers(active)")
+            )
+        if "trigger_deliveries" not in tables:
+            connection.execute(
+                text(
+                    "CREATE TABLE trigger_deliveries ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "trigger_key VARCHAR(80) NOT NULL, "
+                    "event_id VARCHAR(128) NOT NULL, "
+                    "payload_json TEXT NOT NULL, "
+                    "status VARCHAR(16) NOT NULL DEFAULT 'received', "
+                    "request_id VARCHAR(64), "
+                    "error TEXT, "
+                    "received_at DATETIME NOT NULL, "
+                    "processed_at DATETIME, "
+                    "UNIQUE(trigger_key, event_id))"
+                )
+            )
+            connection.execute(
+                text("CREATE INDEX ix_trigger_deliveries_trigger_key ON trigger_deliveries(trigger_key)")
+            )
+            connection.execute(
+                text("CREATE INDEX ix_trigger_deliveries_status ON trigger_deliveries(status)")
+            )
+
+
 def _ensure_tables() -> None:
     """Create missing tables once and apply additive compatibility migrations."""
     global _tables_ready
@@ -455,6 +523,7 @@ def _ensure_tables() -> None:
         _ensure_idempotency_resource_type()
         _ensure_execution_log_actor()
         _ensure_outbox_lease_columns()
+        _ensure_trigger_tables()
         _tables_ready = True
 
 
@@ -645,3 +714,71 @@ class WorkflowTimerRecord(Base):
         DateTime(timezone=True), nullable=True
     )
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class EventSourceRecord(Base):
+    """An external webhook source with a shared secret (v1.4)."""
+
+    __tablename__ = "event_sources"
+
+    key: Mapped[str] = mapped_column(String(80), primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    secret: Mapped[str] = mapped_column(String(128), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class TriggerRecord(Base):
+    """An event-driven workflow trigger (v1.4)."""
+
+    __tablename__ = "triggers"
+    __table_args__ = (
+        Index("ix_triggers_source_key", "source_key"),
+        Index("ix_triggers_active", "active"),
+    )
+
+    key: Mapped[str] = mapped_column(String(80), primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    source_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    definition_key: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    mapping_json: Mapped[str] = mapped_column(Text, nullable=False)
+    schedule_kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="webhook"
+    )
+    interval_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    daily_at_utc: Mapped[Optional[str]] = mapped_column(String(5), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    last_fired_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class TriggerDeliveryRecord(Base):
+    """One event delivery attempt with deduplication (v1.4)."""
+
+    __tablename__ = "trigger_deliveries"
+    __table_args__ = (
+        UniqueConstraint("trigger_key", "event_id", name="uq_trigger_delivery_event"),
+        Index("ix_trigger_deliveries_trigger_key", "trigger_key"),
+        Index("ix_trigger_deliveries_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trigger_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    event_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="received"
+    )
+    request_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    processed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
