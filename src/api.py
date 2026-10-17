@@ -6,7 +6,6 @@ onboarding/offboarding checklists, idempotency keys, and delivery retries;
 the v1.0 preview keeps failed webhook deliveries in a retryable outbox.
 """
 
-import hashlib
 import json
 import os
 import threading
@@ -24,11 +23,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import and_, delete, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.dialects.postgresql import insert as postgres_insert
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
-from src import ai_agent, chatops, db, definitions, jobs, scheduler, timers, ui_session, web, workflow, workflow_control
+from src import ai_agent, chatops, db, definitions, idempotency, jobs, logging_config, metrics, scheduler, timers, ui_session, web, workflow, workflow_control
 from src.actions import (
     ActionAdapter,
     action_for_step,
@@ -89,12 +86,9 @@ AI_ADAPTER: ai_agent.AIAdapter = ai_agent.adapter_from_environment()
 DEFAULT_ACTION_ATTEMPTS = 3
 DEFAULT_NOTIFICATION_MAX_ATTEMPTS = 5
 IDEMPOTENCY_PROCESSING_TIMEOUT = timedelta(minutes=5)
-IDEMPOTENCY_SCOPE_TICKET = "ticket"
-IDEMPOTENCY_SCOPE_ONBOARDING = "onboarding"
-IDEMPOTENCY_REPLAY_ACTIONS = {
-    IDEMPOTENCY_SCOPE_TICKET: "ticket.idempotent_replay",
-    IDEMPOTENCY_SCOPE_ONBOARDING: "onboarding.request.idempotent_replay",
-}
+IDEMPOTENCY_SCOPE_TICKET = idempotency.SCOPE_TICKET
+IDEMPOTENCY_SCOPE_ONBOARDING = idempotency.SCOPE_ONBOARDING
+IDEMPOTENCY_REPLAY_ACTIONS = idempotency.REPLAY_ACTIONS
 
 
 def _action_attempts(action: str) -> int:
@@ -161,39 +155,16 @@ app.mount(
 )
 
 
-_METRICS_LOCK = threading.Lock()
-_METRICS: dict[tuple[str, str, int], int] = {}
-_METRICS_STARTED = time.time()
-_AI_METRICS_LOCK = threading.Lock()
-_AI_TRIAGE: dict[tuple[str, str], int] = {}
-_AI_APPLY: dict[str, int] = {}
-_AI_PROVIDER_ERRORS: dict[str, int] = {}
-
-
 def _ai_provider_name() -> str:
     return str(getattr(AI_ADAPTER, "provider", getattr(AI_ADAPTER, "name", "unknown")))
 
 
-def _record_ai_triage(adapter: str, outcome: str) -> None:
-    with _AI_METRICS_LOCK:
-        key = (adapter, outcome)
-        _AI_TRIAGE[key] = _AI_TRIAGE.get(key, 0) + 1
-
-
-def _record_ai_apply(field: str) -> None:
-    with _AI_METRICS_LOCK:
-        _AI_APPLY[field] = _AI_APPLY.get(field, 0) + 1
-
-
-def _record_ai_provider_error(provider: str) -> None:
-    with _AI_METRICS_LOCK:
-        _AI_PROVIDER_ERRORS[provider] = _AI_PROVIDER_ERRORS.get(provider, 0) + 1
-
-
-def _record_request(method: str, route: str, status_code: int, duration: float) -> None:
-    key = (method, route, status_code)
-    with _METRICS_LOCK:
-        _METRICS[key] = _METRICS.get(key, 0) + 1
+# In-process HTTP/AI counters live in src.metrics; these thin wrappers keep the
+# call sites (and any monkeypatching in tests) stable.
+_record_ai_triage = metrics.record_ai_triage
+_record_ai_apply = metrics.record_ai_apply
+_record_ai_provider_error = metrics.record_ai_provider_error
+_record_request = metrics.record_request
 
 
 @app.middleware("http")
@@ -242,285 +213,22 @@ def auth_me(actor: Actor = Depends(_actor_from_header)) -> dict:
     }
 
 
-# Recovery lease for in-flight idempotency reservations (README: abandoned
-# requests can be reclaimed after five minutes). Used by the claim/takeover
-# logic below and by _reservation_is_stale().
-IDEMPOTENCY_PROCESSING_TIMEOUT = timedelta(minutes=5)
+# ---------------------------------------------------------------------------
+# Idempotency protocol helpers. The implementation lives in src.idempotency so
+# the ticket and onboarding routes share one fenced reservation protocol;
+# these module-level aliases keep existing call sites and tests stable.
 
-
-def _fingerprint_payload(request: BaseModel) -> dict:
-    """Payload used for Idempotency-Key binding.
-
-    Optional tenant fields are left out when unset so keys stored before
-    multi-tenancy keep matching the same request.
-    """
-    payload = request.model_dump()
-    for field in ("tenant", "tenant_key"):
-        if payload.get(field) is None:
-            payload.pop(field, None)
-    return payload
-
-
-def _request_fingerprint(request: BaseModel) -> str:
-    """Return a stable SHA-256 of a validated request body."""
-    return hashlib.sha256(
-        json.dumps(_fingerprint_payload(request), sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-
-
-def _validate_idempotency_key(key: Optional[str]) -> None:
-    if key is not None and len(key) > 128:
-        raise HTTPException(
-            status_code=422, detail="Idempotency-Key must be at most 128 characters."
-        )
-
-
-def _stored_resource_type(payload: dict[str, Any]) -> str:
-    """Legacy records predate resource scoping and are ticket reservations."""
-    return payload.get("resource_type", IDEMPOTENCY_SCOPE_TICKET)
-
-
-def _claim_idempotency_key(
-    session: Session,
-    key: str,
-    resource_id: str,
-    request_hash: str,
-    resource_type: str,
-) -> Optional[str]:
-    """Atomically claim a key or take over an expired processing reservation.
-
-    Returns a fresh fencing token when this request owns the reservation, or
-    ``None`` when another request owns it. A takeover replaces the token and
-    refreshes the lease timestamp in the same upsert, so the previous owner
-    loses the ability to finalize or remove the reservation.
-    """
-    table = db.IdempotencyRecord.__table__
-    now = db.utcnow()
-    stale_before = now - IDEMPOTENCY_PROCESSING_TIMEOUT
-    owner_token = uuid.uuid4().hex
-    values = {
-        "key": key,
-        "ticket_id": resource_id,
-        "response_json": json.dumps(
-            {
-                "request_hash": request_hash,
-                "state": "processing",
-                "resource_type": resource_type,
-            },
-            separators=(",", ":"),
-        ),
-        "owner_token": owner_token,
-        "resource_type": resource_type,
-        "created_at": now,
-    }
-    scope_matches = table.c.resource_type == resource_type
-    if resource_type == IDEMPOTENCY_SCOPE_TICKET:
-        # Reservations created before scoping existed are ticket reservations.
-        scope_matches = or_(scope_matches, table.c.resource_type.is_(None))
-    takeover = and_(
-        table.c.created_at < stale_before,
-        table.c.response_json.like('%"state":"processing"%'),
-        scope_matches,
-    )
-    set_values = {
-        "ticket_id": resource_id,
-        "response_json": values["response_json"],
-        "owner_token": owner_token,
-        "resource_type": resource_type,
-        "created_at": now,
-    }
-    dialect = session.get_bind().dialect.name
-    if dialect == "sqlite":
-        statement = sqlite_insert(table).values(**values).on_conflict_do_update(
-            index_elements=[table.c.key],
-            set_=set_values,
-            where=takeover,
-        )
-        # SQLite reports 1 for both the insert and the takeover update.
-        claimed = session.execute(statement).rowcount == 1
-    elif dialect == "postgresql":
-        statement = (
-            postgres_insert(table)
-            .values(**values)
-            .on_conflict_do_update(
-                index_elements=[table.c.key],
-                set_=set_values,
-                where=takeover,
-            )
-            .returning(table.c.owner_token)
-        )
-        # psycopg reports -1 for this upsert, so confirm the claim through the
-        # RETURNING row instead of relying on a driver-specific rowcount.
-        claimed = session.execute(statement).scalar_one_or_none() == owner_token
-    else:
-        raise RuntimeError(f"Idempotency reservations do not support database dialect {dialect!r}.")
-
-    session.commit()
-    return owner_token if claimed else None
-
-
-def _complete_idempotency_key(
-    session: Session,
-    key: str,
-    owner_token: str,
-    request_hash: str,
-    resource_type: str,
-    resource_id: str,
-    completion: dict[str, Any],
-) -> bool:
-    """Store the completed response only if this request still owns the key.
-
-    The conditional update runs in the same transaction as the resource and
-    execution-log writes, so losing the fencing token rolls all of them back
-    instead of committing a duplicate durable result.
-    """
-    table = db.IdempotencyRecord.__table__
-    payload = {
-        "request_hash": request_hash,
-        "state": "completed",
-        "resource_type": resource_type,
-        **completion,
-    }
-    result = session.execute(
-        update(table)
-        .where(
-            and_(
-                table.c.key == key,
-                table.c.owner_token == owner_token,
-                table.c.resource_type == resource_type,
-                table.c.response_json.like('%"state":"processing"%'),
-            )
-        )
-        .values(
-            ticket_id=resource_id,
-            response_json=json.dumps(payload, separators=(",", ":")),
-        )
-    )
-    return result.rowcount == 1
-
-
-def _release_idempotency_key(
-    session: Session, key: str, owner_token: str
-) -> bool:
-    """Delete a failed request's reservation, but only while it still owns it."""
-    table = db.IdempotencyRecord.__table__
-    result = session.execute(
-        delete(table).where(
-            and_(
-                table.c.key == key,
-                table.c.owner_token == owner_token,
-                table.c.response_json.like('%"state":"processing"%'),
-            )
-        )
-    )
-    released = result.rowcount == 1
-    if released:
-        session.commit()
-    else:
-        session.rollback()
-    return released
-
-
-def _reservation_is_stale(created_at: datetime) -> bool:
-    """Return whether a processing reservation has exceeded its recovery lease."""
-    if created_at.tzinfo is None:
-        created_at = created_at.replace(tzinfo=timezone.utc)
-    return created_at < db.utcnow() - IDEMPOTENCY_PROCESSING_TIMEOUT
-
-
-def _replay_stored_response(
-    stored: db.IdempotencyRecord,
-    payload: dict[str, Any],
-    request_hash: str,
-    resource_type: str,
-    response: Response,
-    session: Session,
-) -> dict[str, Any]:
-    """Validate and replay a stored completed response, or return a 409."""
-    if _stored_resource_type(payload) != resource_type:
-        raise HTTPException(
-            status_code=409,
-            detail="Idempotency-Key was already used for a different resource type.",
-        )
-    if payload.get("request_hash") != request_hash:
-        raise HTTPException(
-            status_code=409,
-            detail="Idempotency-Key was already used with a different request.",
-        )
-    if payload.get("state") == "processing":
-        raise HTTPException(
-            status_code=409,
-            detail="A request with this Idempotency-Key is still processing.",
-        )
-    response.status_code = http_status.HTTP_200_OK
-    response.headers["Idempotency-Replayed"] = "true"
-    db.log_execution(
-        session,
-        run_id=_new_run_id(),
-        action=IDEMPOTENCY_REPLAY_ACTIONS[resource_type],
-        status="success",
-        ticket_id=stored.ticket_id,
-        detail="replayed stored response without re-executing",
-    )
-    return payload
-
-
-def _reserve_idempotency_key(
-    session: Session,
-    response: Response,
-    key: Optional[str],
-    request_hash: str,
-    resource_type: str,
-    resource_id: str,
-) -> tuple[Optional[str], Optional[dict[str, Any]]]:
-    """Claim a reservation or return a completed stored response.
-
-    Returns ``(owner_token, None)`` for a new claim and ``(None, payload)`` for
-    a replay. Active, changed-payload, and cross-resource requests raise 409.
-    """
-    if not key:
-        return None, None
-    stored = session.get(db.IdempotencyRecord, key)
-    if stored is not None:
-        payload = json.loads(stored.response_json)
-        if _stored_resource_type(payload) != resource_type:
-            raise HTTPException(
-                status_code=409,
-                detail="Idempotency-Key was already used for a different resource type.",
-            )
-        if payload.get("state") == "processing":
-            if payload.get("request_hash") != request_hash:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Idempotency-Key was already used with a different request.",
-                )
-            if not _reservation_is_stale(stored.created_at):
-                return None, _replay_stored_response(
-                    stored, payload, request_hash, resource_type, response, session
-                )
-            owner_token = _claim_idempotency_key(
-                session, key, resource_id, request_hash, resource_type
-            )
-        else:
-            return None, _replay_stored_response(
-                stored, payload, request_hash, resource_type, response, session
-            )
-    else:
-        owner_token = _claim_idempotency_key(
-            session, key, resource_id, request_hash, resource_type
-        )
-    if owner_token is None:
-        session.expire_all()
-        stored = session.get(db.IdempotencyRecord, key)
-        if stored is None:
-            raise HTTPException(
-                409, "Unable to claim this Idempotency-Key; retry the request."
-            )
-        payload = json.loads(stored.response_json)
-        return None, _replay_stored_response(
-            stored, payload, request_hash, resource_type, response, session
-        )
-    return owner_token, None
+IDEMPOTENCY_PROCESSING_TIMEOUT = idempotency.PROCESSING_TIMEOUT
+_fingerprint_payload = idempotency.fingerprint_payload
+_request_fingerprint = idempotency.request_fingerprint
+_validate_idempotency_key = idempotency.validate_idempotency_key
+_stored_resource_type = idempotency._stored_resource_type
+_claim_idempotency_key = idempotency.claim_key
+_complete_idempotency_key = idempotency.complete_key
+_release_idempotency_key = idempotency.release_key
+_reservation_is_stale = idempotency._reservation_is_stale
+_replay_stored_response = idempotency.replay_stored_response
+_reserve_idempotency_key = idempotency.reserve_key
 
 
 # ---------------------------------------------------------------------------
@@ -634,14 +342,13 @@ def ready() -> dict:
 
 
 @app.get("/metrics", include_in_schema=False)
-def metrics(session: Session = Depends(db.get_session)) -> Response:
+def metrics_endpoint(session: Session = Depends(db.get_session)) -> Response:
     """Minimal Prometheus-style metrics for jobs, outbox, and HTTP requests."""
     lines = [
         "# HELP flowops_http_requests_total HTTP requests by method, route, and status",
         "# TYPE flowops_http_requests_total counter",
     ]
-    with _METRICS_LOCK:
-        counters = dict(_METRICS)
+    counters = metrics.snapshot_http()
     for (method, route, status_code), count in sorted(counters.items()):
         lines.append(
             "flowops_http_requests_total"
@@ -674,10 +381,7 @@ def metrics(session: Session = Depends(db.get_session)) -> Response:
         lines.append(
             f'flowops_notification_outbox{{status="{state}"}} {outbox_counts.get(state, 0)}'
         )
-    with _AI_METRICS_LOCK:
-        triage_counts = dict(_AI_TRIAGE)
-        apply_counts = dict(_AI_APPLY)
-        provider_errors = dict(_AI_PROVIDER_ERRORS)
+    triage_counts, apply_counts, provider_errors = metrics.snapshot_ai()
     lines.extend(
         [
             "# HELP flowops_ai_triage_total AI triage calls by adapter and outcome",
@@ -734,7 +438,7 @@ def metrics(session: Session = Depends(db.get_session)) -> Response:
     )
     for outcome, count in sorted(scheduler.TICK_COUNTS.items()):
         lines.append(f'flowops_dag_scheduler_ticks_total{{outcome="{outcome}"}} {count}')
-    lines.append(f"flowops_uptime_seconds {time.time() - _METRICS_STARTED:.1f}")
+    lines.append(f"flowops_uptime_seconds {metrics.uptime_seconds():.1f}")
     return Response("\n".join(lines) + "\n", media_type="text/plain")
 
 

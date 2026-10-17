@@ -15,13 +15,11 @@ from src import chatops, db, definitions, jobs, scheduler, ui_session, web, work
 
 from fastapi import APIRouter
 
+from src import metrics as _metrics
 from src.deps import _new_run_id
 from src.api import (
     AITriageOut,
     Ticket,
-    _AI_APPLY,
-    _AI_PROVIDER_ERRORS,
-    _AI_TRIAGE,
     _analyze_ticket,
     _definition_out,
     _load_request,
@@ -618,9 +616,9 @@ def dashboard(
             "last_updated": db.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
             "offboarding_rows": offboarding_rows,
             "ai_stats": {
-                "triage": sum(_AI_TRIAGE.values()),
-                "applies": sum(_AI_APPLY.values()),
-                "errors": sum(_AI_PROVIDER_ERRORS.values()),
+                "triage": sum(_metrics.snapshot_ai()[0].values()),
+                "applies": sum(_metrics.snapshot_ai()[1].values()),
+                "errors": sum(_metrics.snapshot_ai()[2].values()),
             },
         },
     )

@@ -16,12 +16,32 @@ import time
 import uuid
 from typing import Optional
 
-from src import db, outbox
+from src import db, idempotency, outbox
 from src.notify import deliver_webhook
 
 
 def _new_run_id() -> str:
     return uuid.uuid4().hex[:12]
+
+
+def sweep_idempotency_keys() -> int:
+    """Delete idempotency records past the retention window.
+
+    Returns the number of rows removed; failures are logged but never crash
+    the dispatcher loop (the next poll retries).
+    """
+    session = db.SessionLocal()
+    try:
+        return idempotency.sweep_expired(session)
+    except Exception as exc:  # pragma: no cover - defensive for daemon loop
+        from src import logging_config
+
+        logging_config.configure()
+        logging_config.log_exception("idempotency sweep failed", exc)
+        session.rollback()
+        return 0
+    finally:
+        session.close()
 
 
 def run_once(
@@ -89,9 +109,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--poll-interval", type=float, default=2.0)
     parser.add_argument("--lease-seconds", type=int, default=outbox.DEFAULT_LEASE_SECONDS)
     parser.add_argument("--worker-id", default=None)
+    parser.add_argument(
+        "--sweep-interval",
+        type=float,
+        default=3600.0,
+        help="seconds between idempotency retention sweeps (0 disables)",
+    )
     args = parser.parse_args(argv)
     worker_id = args.worker_id or f"outbox-{uuid.uuid4().hex[:8]}"
     stopping = False
+    last_sweep = 0.0
 
     def stop(signum, frame):
         nonlocal stopping
@@ -108,6 +135,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                 return 0
         elif args.once:
             return 0
+        if args.sweep_interval > 0 and (time.monotonic() - last_sweep) >= args.sweep_interval:
+            last_sweep = time.monotonic()
+            removed = sweep_idempotency_keys()
+            if removed:
+                print(f"idempotency sweep removed {removed} expired keys", flush=True)
         if not args.once:
             time.sleep(max(0.1, args.poll_interval))
     return 0

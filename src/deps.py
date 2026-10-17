@@ -1,6 +1,7 @@
 """Shared FastAPI dependencies: actors, roles, CSRF, rate limiting."""
 
 import os
+import secrets
 import threading
 import time
 import uuid
@@ -89,7 +90,7 @@ def _webhook_actor(
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
 ) -> str:
     expected = os.environ.get("FLOWOPS_WEBHOOK_API_KEY")
-    if expected and x_api_key != expected:
+    if expected and not secrets.compare_digest(x_api_key or "", expected):
         raise HTTPException(status_code=401, detail="Invalid webhook API key.")
     _enforce_rate_limit("webhook:intake")
     return "webhook-api-key" if expected else "local-development"

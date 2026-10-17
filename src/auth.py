@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 import json
 import os
+import secrets
 import time
 from typing import Any, Optional
 
@@ -109,6 +110,10 @@ def authenticate_bearer(
     if values.get("FLOWOPS_ENTRA_ISSUER"):
         return _authenticate_jwt(token, values)
     expected = values.get("FLOWOPS_DEV_BEARER_TOKEN")
-    if environment == "development" and expected and token == expected:
+    if (
+        environment == "development"
+        and expected
+        and secrets.compare_digest(token, expected)
+    ):
         return Actor(subject="configured-bearer", roles=("automation.operator",))
     raise AuthenticationError("Entra authentication is required in protected mode.")
