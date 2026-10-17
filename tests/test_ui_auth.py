@@ -52,6 +52,7 @@ def _admin_cookie(client):
     session = ui_session.create_session(
         Actor("admin-test", ("automation.admin",), source="session")
     )
+    client.cookies.clear()
     client.cookies.set(ui_session.SESSION_COOKIE, ui_session.encode_session(session))
     return session
 
