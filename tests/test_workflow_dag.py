@@ -177,17 +177,19 @@ def test_unknown_template_is_rejected(client):
     assert response.status_code == 422
 
 
-def test_offboarding_dag_is_not_offered(client):
-    """The ledger completion path cannot enforce edges yet, so it stays flat."""
+def test_offboarding_dag_is_offered_and_blocked(client):
+    """The ledger path now enforces the same prerequisites as onboarding."""
     body = {
         **ONBOARDING,
         "request_type": "offboarding",
         "template": "offboarding-dag",
     }
-    assert client.post("/onboarding-requests", json=body).status_code == 422
-    assert "offboarding-dag" not in onboarding.TEMPLATES
-    with pytest.raises(onboarding.WorkflowGraphError):
-        onboarding.template_for("onboarding-dag", "offboarding")
+    response = client.post("/onboarding-requests", json=body)
+    assert response.status_code == 201
+    statuses = {item["step_key"]: item["status"] for item in response.json()["checklist"]}
+    assert statuses["disable_user_account"] == "pending"
+    assert statuses["revoke_licenses"] == "blocked"
+    assert statuses["archive_mailbox"] == "blocked"
 
 
 # ---------------------------------------------------------------------------

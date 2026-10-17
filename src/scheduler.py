@@ -18,7 +18,7 @@ from typing import Any, Iterable, Optional, Sequence
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
 
-from src import db, jobs, workflow
+from src import db, jobs, timers, workflow
 
 RUN_STATUSES = ("pending", "running", "paused", "cancelled", "completed", "failed")
 ACTIVE_STEP_STATUSES = ("scheduled", "running")
@@ -254,6 +254,7 @@ def tick(
     workflow.apply_graph_transitions(
         session, items, request_id=run.request_id, actor_subject="scheduler"
     )
+    timers.sync_timers(session, run.request_id, now=at)
     session.flush()
     step_runs = session.execute(
         select(db.WorkflowStepRunRecord).where(db.WorkflowStepRunRecord.run_id == run.id)

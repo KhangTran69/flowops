@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Workflow definitions — FlowOps{% endblock %}
+{% block content %}
+<section class="page-heading"><div><span class="eyebrow">Control plane</span><h1>Workflow definitions</h1><p class="muted">Versioned DAGs. Publishing never mutates in-flight requests.</p></div></section>
+<section class="panel">
+  <div class="panel-head"><h2>Definitions</h2><span class="muted small">{{ definitions | length }} total</span></div>
+  {% if definitions %}
+  <div class="table-wrap"><table><thead><tr><th>Key</th><th>Name</th><th>Type</th><th>Status</th><th>Current</th><th>Versions</th></tr></thead><tbody>
+  {% for definition in definitions %}<tr><td><a href="/ui/workflow-definitions/{{ definition.key }}">{{ definition.key }}</a></td><td>{{ definition.name }}</td><td>{{ definition.request_type }}</td><td><span class="badge {{ 'ok' if definition.status == 'published' else 'info' }}">{{ definition.status }}</span></td><td>{{ definition.current_version or '—' }}</td><td>{{ definition.versions | length }}</td></tr>{% endfor %}
+  </tbody></table></div>
+  {% else %}<p class="empty">No definitions yet.</p>{% endif %}
+</section>
+{% endblock %}

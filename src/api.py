@@ -33,6 +33,7 @@ from sqlalchemy.orm import Session
 
 from src import ai_agent, db, jobs, ui_session, web  # noqa: F401 - modules referenced at runtime
 from src import ai_agent, chatops, db, jobs, scheduler, ui_session, web, workflow, workflow_control
+from src import ai_agent, chatops, db, definitions, jobs, scheduler, timers, ui_session, web, workflow, workflow_control
 from src.actions import (
     ACTION_BY_STEP,
     ActionAdapter,
@@ -735,8 +736,51 @@ class ChecklistItemOut(BaseModel):
     result: Optional[dict | list | str | int | float | bool | None] = None
     depends_on: list[str] = []
     output: Optional[dict] = None
+    join_mode: str = "all"
+    when: list[str] = []
+    sla_minutes: Optional[int] = None
+    overdue: bool = False
+    sla_remaining_minutes: Optional[int] = None
 
 
+
+
+class DefinitionCreateIn(BaseModel):
+    key: StrictStr
+    name: StrictStr
+    request_type: Literal["onboarding", "offboarding"]
+    steps: list[dict[str, Any]]
+
+
+class DefinitionVersionIn(BaseModel):
+    steps: list[dict[str, Any]]
+
+
+class DefinitionPublishIn(BaseModel):
+    version: StrictInt = Field(ge=1)
+
+
+class DefinitionMigrationIn(BaseModel):
+    version: StrictInt = Field(ge=1)
+    dry_run: StrictBool = True
+
+
+class DefinitionVersionOut(BaseModel):
+    version: int
+    checksum: str
+    steps: list[dict[str, Any]]
+    created_by: Optional[str] = None
+    created_at: datetime
+    published_at: Optional[datetime] = None
+
+
+class WorkflowDefinitionOut(BaseModel):
+    key: str
+    name: str
+    request_type: str
+    status: str
+    current_version: Optional[int] = None
+    versions: list[DefinitionVersionOut] = []
 
 
 class OnboardingRequestIn(BaseModel):
@@ -749,6 +793,12 @@ class OnboardingRequestIn(BaseModel):
     requester_id: StrictInt = Field(ge=1)
     start_date: Optional[StrictStr] = Field(
         default=None, description="ISO date (YYYY-MM-DD) the employee starts or leaves."
+    )
+    definition_key: Optional[StrictStr] = Field(
+        default=None, description="Optional published workflow definition key."
+    )
+    definition_version: Optional[StrictInt] = Field(
+        default=None, ge=1, description="Optional pinned definition version."
     )
     template: Optional[StrictStr] = Field(
         default=None,
@@ -793,6 +843,8 @@ class OnboardingRequestOut(BaseModel):
     requester_id: int
     start_date: Optional[str] = None
     status: str
+    definition_key: Optional[str] = None
+    definition_version: Optional[int] = None
     checklist: list[ChecklistItemOut]
 
 
@@ -1599,6 +1651,7 @@ def _chatops_action(
         actor_subject=actor,
         reason=reason,
     )
+    timers.sync_timers(session, record.id)
     db.log_execution(
         session,
         run_id=_new_run_id(),
@@ -1654,6 +1707,7 @@ def _request_out(
         **{c: getattr(record, c) for c in (
             "id", "request_type", "employee_name", "employee_email",
             "department", "requester_id", "start_date", "status",
+            "definition_key", "definition_version",
         )},
         checklist=[
             ChecklistItemOut(
@@ -1668,6 +1722,11 @@ def _request_out(
                 output=json.loads(item.output_json)
                 if item.output_json
                 else None,
+                join_mode=item.join_mode or "all",
+                when=json.loads(item.when_json) if item.when_json else [],
+                sla_minutes=item.sla_minutes,
+                overdue=bool(getattr(item, "overdue", False)),
+                sla_remaining_minutes=getattr(item, "sla_remaining_minutes", None),
             )
             for item in sorted(items, key=lambda i: i.id)
         ],
@@ -1683,7 +1742,222 @@ def _load_request(
     items = session.execute(
         select(db.ChecklistItemRecord).where(db.ChecklistItemRecord.request_id == request_id)
     ).scalars().all()
+    timer_rows = session.execute(
+        select(db.WorkflowTimerRecord).where(
+            db.WorkflowTimerRecord.request_id == request_id,
+            db.WorkflowTimerRecord.status == "pending",
+        )
+    ).scalars().all()
+    by_item = {row.item_id: row for row in timer_rows}
+    now = db.utcnow()
+    for item in items:
+        timer = by_item.get(item.id)
+        if timer is not None:
+            due = timer.due_at
+            if due.tzinfo is None:
+                due = due.replace(tzinfo=timezone.utc)
+            item.overdue = due <= now
+            item.sla_remaining_minutes = max(
+                0, int((due - now).total_seconds() // 60)
+            )
+        else:
+            item.overdue = False
+            item.sla_remaining_minutes = None
     return record, list(items)
+
+
+def _definition_out(
+    session: Session, definition: db.WorkflowDefinitionRecord
+) -> WorkflowDefinitionOut:
+    versions = definitions.list_versions(session, definition.key)
+    return WorkflowDefinitionOut(
+        key=definition.key,
+        name=definition.name,
+        request_type=definition.request_type,
+        status=definition.status,
+        current_version=definition.current_version,
+        versions=[
+            DefinitionVersionOut(
+                version=row.version,
+                checksum=row.checksum,
+                steps=json.loads(row.steps_json),
+                created_by=row.created_by,
+                created_at=row.created_at,
+                published_at=row.published_at,
+            )
+            for row in versions
+        ],
+    )
+
+
+@app.post("/workflow-definitions", response_model=WorkflowDefinitionOut)
+def create_workflow_definition(
+    payload: DefinitionCreateIn,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowDefinitionOut:
+    try:
+        definition = definitions.create_definition(
+            session,
+            key=payload.key,
+            name=payload.name,
+            request_type=payload.request_type,
+            steps=payload.steps,
+            actor=actor.subject,
+        )
+    except definitions.DefinitionError as error:
+        raise HTTPException(422, str(error)) from error
+    session.commit()
+    return _definition_out(session, definition)
+
+
+@app.put("/workflow-definitions/{key}", response_model=WorkflowDefinitionOut)
+def create_workflow_definition_version(
+    key: str,
+    payload: DefinitionVersionIn,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowDefinitionOut:
+    try:
+        definitions.create_version(session, key, payload.steps, actor=actor.subject)
+        definition = definitions.get_definition(session, key)
+    except definitions.DefinitionError as error:
+        raise HTTPException(422, str(error)) from error
+    if definition is None:
+        raise HTTPException(404, "Definition not found.")
+    session.commit()
+    return _definition_out(session, definition)
+
+
+@app.post("/workflow-definitions/{key}/publish", response_model=WorkflowDefinitionOut)
+def publish_workflow_definition(
+    key: str,
+    payload: DefinitionPublishIn,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowDefinitionOut:
+    try:
+        definition = definitions.publish_version(
+            session, key, payload.version, actor=actor.subject
+        )
+    except definitions.DefinitionError as error:
+        raise HTTPException(422, str(error)) from error
+    session.commit()
+    return _definition_out(session, definition)
+
+
+@app.post("/onboarding-requests/{request_id}/definition")
+def migrate_definition(
+    request_id: int,
+    payload: DefinitionMigrationIn,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> dict[str, Any]:
+    """Preview or apply a safe move to another definition version."""
+    record, items = _load_request(session, request_id)
+    if not record.definition_key:
+        raise HTTPException(409, "Request is not pinned to a definition.")
+    definition = definitions.get_definition(session, record.definition_key)
+    target = definitions.get_version(session, record.definition_key, payload.version)
+    if definition is None or target is None:
+        raise HTTPException(404, "Definition version not found.")
+    target_steps = {step["key"]: step for step in json.loads(target.steps_json)}
+    existing = {item.step_key: item for item in items}
+    added = sorted(set(target_steps) - set(existing))
+    removed = sorted(set(existing) - set(target_steps))
+    changed = sorted(
+        key for key in set(existing) & set(target_steps)
+        if (existing[key].step, existing[key].queue, existing[key].depends_on_json)
+        != (
+            target_steps[key]["step"],
+            target_steps[key]["queue"],
+            json.dumps(target_steps[key].get("depends_on", [])),
+        )
+    )
+    diff = {
+        "from_version": record.definition_version,
+        "to_version": payload.version,
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+        "dry_run": payload.dry_run,
+        "statuses": {item.step_key: item.status for item in items},
+    }
+    if payload.dry_run:
+        return diff
+    for key in removed:
+        if existing[key].status == "completed":
+            raise HTTPException(
+                409, f"Cannot remove completed step {key!r} during migration."
+            )
+        session.delete(existing[key])
+    for key, step in target_steps.items():
+        item = existing.get(key)
+        if item is None:
+            item = db.ChecklistItemRecord(
+                request_id=record.id,
+                step_key=key,
+                step=step["step"],
+                queue=step["queue"],
+                requires_approval=bool(step.get("requires_approval", False)),
+                action=step.get("action", "none"),
+                status=initial_status_for(step),
+                depends_on_json=json.dumps(step.get("depends_on", [])),
+                join_mode=step.get("join", "all"),
+                when_json=json.dumps(step.get("when", [])),
+                sla_minutes=step.get("sla_minutes"),
+                escalation_queue=step.get("escalation_queue"),
+            )
+            session.add(item)
+        else:
+            item.step = step["step"]
+            item.queue = step["queue"]
+            item.requires_approval = bool(step.get("requires_approval", False))
+            item.action = step.get("action", "none")
+            item.depends_on_json = json.dumps(step.get("depends_on", []))
+            item.join_mode = step.get("join", "all")
+            item.when_json = json.dumps(step.get("when", []))
+            item.sla_minutes = step.get("sla_minutes")
+            item.escalation_queue = step.get("escalation_queue")
+    record.definition_version = payload.version
+    session.flush()
+    _, items = _load_request(session, record.id)
+    workflow.apply_graph_transitions(
+        session, items, request_id=record.id, actor_subject=actor.subject
+    )
+    timers.sync_timers(session, record.id)
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="onboarding.request.definition_migrated",
+        status="success",
+        ticket_id=str(record.id),
+        duration_ms=0,
+        detail=f"definition {record.definition_key} version {payload.version}",
+        actor_subject=actor.subject,
+    )
+    session.commit()
+    return diff
+
+
+@app.get("/workflow-definitions", response_model=list[WorkflowDefinitionOut])
+def list_workflow_definitions(
+    session: Session = Depends(db.get_session),
+) -> list[WorkflowDefinitionOut]:
+    return [
+        _definition_out(session, definition)
+        for definition in definitions.list_definitions(session)
+    ]
+
+
+@app.get("/workflow-definitions/{key}", response_model=WorkflowDefinitionOut)
+def get_workflow_definition(
+    key: str, session: Session = Depends(db.get_session)
+) -> WorkflowDefinitionOut:
+    definition = definitions.get_definition(session, key)
+    if definition is None:
+        raise HTTPException(404, "Definition not found.")
+    return _definition_out(session, definition)
 
 
 def _create_onboarding_request(
@@ -1703,7 +1977,24 @@ def _create_onboarding_request(
     )
     session.add(record)
     session.flush()
-    steps = checklist_for(request.request_type, template=request.template)
+    if request.definition_key:
+        definition, version = definitions.published_version(
+            session, request.definition_key
+        )
+        if definition.request_type != request.request_type:
+            raise HTTPException(422, "Definition request_type does not match request.")
+        if request.definition_version is not None and request.definition_version != version.version:
+            selected = definitions.get_version(
+                session, request.definition_key, request.definition_version
+            )
+            if selected is None:
+                raise HTTPException(422, "Definition version not found.")
+            version = selected
+        steps = json.loads(version.steps_json)
+        record.definition_key = definition.key
+        record.definition_version = version.version
+    else:
+        steps = checklist_for(request.request_type, template=request.template)
     for template in steps:
         # The template's ``key`` becomes the row's ``step_key`` column;
         # depends_on is persisted as JSON for the graph resolver.
@@ -1717,9 +2008,14 @@ def _create_onboarding_request(
                 action=template.get("action"),
                 status=initial_status_for(template),
                 depends_on_json=json.dumps(template.get("depends_on", [])),
+                join_mode=template.get("join", "all"),
+                when_json=json.dumps(template.get("when", [])),
+                sla_minutes=template.get("sla_minutes"),
+                escalation_queue=template.get("escalation_queue"),
             )
         )
     session.flush()
+    timers.sync_timers(session, record.id)
     db.log_execution(
         session,
         run_id=_new_run_id(),
@@ -2141,6 +2437,37 @@ def ui_onboarding_request(
     )
 
 
+@app.get("/ui/workflow-definitions", response_class=HTMLResponse, include_in_schema=False)
+def ui_workflow_definitions(
+    request: Request, session: Session = Depends(db.get_session)
+) -> HTMLResponse:
+    rows = [
+        _definition_out(session, definition)
+        for definition in definitions.list_definitions(session)
+    ]
+    return web.render(
+        request, "workflow_definitions.html", {"active": "definitions", "definitions": rows}
+    )
+
+
+@app.get(
+    "/ui/workflow-definitions/{key}",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+)
+def ui_workflow_definition(
+    request: Request, key: str, session: Session = Depends(db.get_session)
+) -> HTMLResponse:
+    definition = definitions.get_definition(session, key)
+    if definition is None:
+        return web.render(request, "404.html", {"active": "definitions"}, status_code=404)
+    return web.render(
+        request,
+        "workflow_definition.html",
+        {"active": "definitions", "definition": _definition_out(session, definition)},
+    )
+
+
 @app.get("/ui/workflow-runs", response_class=HTMLResponse, include_in_schema=False)
 def ui_workflow_runs(
     request: Request,
@@ -2341,6 +2668,7 @@ def _transition_item(
         workflow.apply_graph_transitions(
             session, items, request_id=record.id, actor_subject=actor_subject
         )
+        timers.sync_timers(session, record.id)
 
     db.log_execution(
         session,
@@ -2751,6 +3079,35 @@ def complete_offboarding_step(
             )
 
     item = next(i for i in items if i.step_key == step_key)
+    missing = workflow.missing_prerequisites(item, items)
+    if missing:
+        log("rejected", "failure", f"unmet prerequisites: {', '.join(missing)}")
+        session.execute(
+            delete(table).where(
+                table.id == claim.id,
+                table.status == "running",
+                table.owner_token == owner_token,
+            )
+        )
+        session.commit()
+        raise HTTPException(
+            409,
+            f"Step '{step_key}' is blocked by incomplete prerequisites: "
+            f"{', '.join(missing)}.",
+        )
+    if item.status == "skipped":
+        log("rejected", "failure", "step was skipped by a predicate")
+        session.execute(
+            delete(table).where(
+                table.id == claim.id,
+                table.status == "running",
+                table.owner_token == owner_token,
+            )
+        )
+        session.commit()
+        raise HTTPException(
+            409, f"Step '{step_key}' was skipped by a workflow predicate."
+        )
     if item.requires_approval and item.status != "approved":
         log("rejected", "failure", f"step requires approval (status '{item.status}')")
         session.execute(
@@ -2815,6 +3172,7 @@ def complete_offboarding_step(
         workflow.apply_graph_transitions(
             session, all_items, request_id=checklist_id, actor_subject=actor.subject
         )
+        timers.sync_timers(session, checklist_id)
         all_items = session.execute(
             select(db.ChecklistItemRecord).where(
                 db.ChecklistItemRecord.request_id == checklist_id

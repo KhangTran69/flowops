@@ -57,7 +57,7 @@
           </td>
           <td>{{ item.queue }}</td>
           <td>{{ 'Required' if item.requires_approval else 'Not required' }}</td>
-          <td><span class="badge {{ 'ok' if item.status == 'completed' else ('info' if item.status == 'approved' else ('fail' if item.status in ('failed','rejected','cascade_blocked') else '')) }}">{{ item.status }}</span>{% if item.status == 'blocked' %}<div class="muted small">Waiting on prerequisites</div>{% endif %}</td>
+          <td><span class="badge {{ 'ok' if item.status == 'completed' else ('info' if item.status == 'approved' else ('fail' if item.status in ('failed','rejected','cascade_blocked') else '')) }}">{{ item.status }}</span>{% if item.overdue %}<span class="badge fail">Overdue</span>{% endif %}{% if item.sla_remaining_minutes is not none and not item.overdue %}<div class="muted small">SLA: {{ item.sla_remaining_minutes }} min</div>{% endif %}{% if item.status == 'blocked' %}<div class="muted small">Waiting on prerequisites</div>{% endif %}</td>
           <td class="actions">
             {% if item.requires_approval and item.status == 'pending' %}
             <button class="button small" type="button" data-action-url="/onboarding-requests/{{ request_record.id }}/items/{{ item.id }}/approve" data-method="POST" data-reload="true">Approve</button>

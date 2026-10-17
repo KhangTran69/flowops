@@ -16,6 +16,8 @@ x-flowops-env: &flowops-env
   FLOWOPS_DAG_MAX_PARALLEL: ${FLOWOPS_DAG_MAX_PARALLEL:-4}
   FLOWOPS_DAG_LEASE_SECONDS: ${FLOWOPS_DAG_LEASE_SECONDS:-60}
   FLOWOPS_DAG_SCHEDULER_INTERVAL: ${FLOWOPS_DAG_SCHEDULER_INTERVAL:-2}
+  FLOWOPS_TIMER_INTERVAL: ${FLOWOPS_TIMER_INTERVAL:-2}
+  FLOWOPS_ESCALATION_WEBHOOK_URL: ${FLOWOPS_ESCALATION_WEBHOOK_URL:-}
   FLOWOPS_ACTION_ADAPTER: ${FLOWOPS_ACTION_ADAPTER:-simulated}
   FLOWOPS_POWER_AUTOMATE_URL: ${FLOWOPS_POWER_AUTOMATE_URL:-}
   FLOWOPS_GRAPH_URL: ${FLOWOPS_GRAPH_URL:-https://graph.microsoft.com/v1.0}
@@ -85,6 +87,23 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "pgrep -f 'src.scheduler' >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  timers:
+    build: .
+    restart: unless-stopped
+    stop_grace_period: 15s
+    command: ["python", "-m", "src.timers", "--poll", "--interval", "${FLOWOPS_TIMER_INTERVAL:-2}"]
+    environment:
+      <<: *flowops-env
+      FLOWOPS_RUN_MIGRATIONS: "false"
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'src.timers' >/dev/null"]
       interval: 10s
       timeout: 3s
       retries: 3
