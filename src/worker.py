@@ -211,6 +211,42 @@ class _PermanentJobError(Exception):
     """A failure that should not be retried (invalid state or missing data)."""
 
 
+def _notify_worker_failure(
+    session: Session,
+    job: db.WorkflowJobRecord,
+    payload: dict[str, Any],
+    error: str,
+) -> None:
+    import os
+    url = os.environ.get("FLOWOPS_ACTION_FAILURE_WEBHOOK_URL")
+    if not url:
+        return
+    from src.notify import deliver_webhook
+
+    action = payload.get("action") or "unknown"
+    delivery = deliver_webhook(
+        url,
+        {
+            "event": "workflow.job.failed",
+            "job_id": job.id,
+            "job_type": job.job_type,
+            "action": action,
+            "payload": payload,
+            "attempts": job.attempts,
+            "error": error,
+        },
+    )
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="notification.action_failure",
+        status="success" if delivery.success else "failure",
+        ticket_id=str(payload.get("request_id") or job.id),
+        duration_ms=0,
+        detail=f"job #{job.id} attempts={delivery.attempts}; {delivery.last_error or 'delivered'}",
+    )
+
+
 def _execute_job(
     session: Session,
     job: db.WorkflowJobRecord,
@@ -247,6 +283,7 @@ def _execute_job(
             str(error),
             retryable=False,
         )
+        _notify_worker_failure(session, job, payload, str(error))
         session.commit()
         return "failed"
     except Exception as error:  # adapter failures are retryable
@@ -261,6 +298,8 @@ def _execute_job(
             str(error),
             retryable=True,
         )
+        if status == "failed":
+            _notify_worker_failure(session, reloaded, payload, str(error))
         session.commit()
         return status or "fenced"
 
