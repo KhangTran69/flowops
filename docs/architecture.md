@@ -140,6 +140,47 @@ Cookie-authenticated mutations require `X-CSRF-Token`; bearer routes remain
 CSRF-exempt. Cookies are HttpOnly, SameSite=Lax, and optionally Secure, with a
 bounded max-age. This is a prototype token-paste login, not an SSO/user store.
 
+## Event-driven triggers (v1.4)
+
+External webhooks, internal events, and schedules can start workflows without
+human intervention. Three tables (migration `0009_event_triggers`) back the
+system:
+
+- **`event_sources`** — named sources with a shared HMAC secret. A source is
+  active/inactive and identified by a `source_key`.
+- **`triggers`** — each trigger binds a source to a workflow action
+  (`start_onboarding`, `create_ticket`) with a `schedule_kind` of `webhook`,
+  `interval`, or `daily`. Interval triggers carry `interval_seconds`; daily
+  triggers carry `daily_at_utc` (`HH:MM:SS`). A `mapping_json` column holds
+  the field-mapping spec.
+- **`trigger_deliveries`** — one row per inbound event, with a deterministic
+  `event_id`, `status` (`received` → `queued` → `running` → `succeeded` /
+  `failed`), lease fields, and attempt/backoff columns.
+
+**Signed webhooks** — `POST /webhooks/triggers/{trigger_key}` verifies an
+HMAC-SHA256 signature (`X-FlowOps-Signature: sha256=<hex>`) over
+`timestamp + "." + raw_body` using constant-time comparison. A 5-minute
+timestamp window rejects replayed requests. The `event_id` (from the body or
+`X-FlowOps-Event-ID` header) deduplicates deliveries.
+
+**Safe mapping engine** — `src/trigger_mapping.py` resolves `mapping_json` to
+workflow request fields using explicit dot paths (`event.user.name`,
+`trigger.source_key`) or fixed literals. No `eval`/`exec` — just dictionary
+lookups. Unknown paths fail closed with a `MappingError`.
+
+**Scheduler** (`src/triggers.py`) — leases and fires due interval/daily
+triggers, generating a deterministic `event_id` per occurrence and inserting a
+`trigger_deliveries` row. Uses the same lease/fencing pattern as jobs and
+timers so two schedulers cannot double-fire.
+
+**Worker** (`src/trigger_worker.py`) — claims `trigger_deliveries` rows,
+applies the mapping, creates a workflow request or ticket through the existing
+paths, and records the outcome. Leased claims with exponential backoff and
+dead-letter at the attempt limit mirror the workflow job worker.
+
+`/ui/triggers` exposes the operator console; `/metrics` adds trigger delivery
+counters, processing-time summaries, and scheduler tick gauges.
+
 ## Deliberate limits
 
 This is a localhost learning prototype. Real Microsoft 365 actions and
