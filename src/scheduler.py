@@ -435,24 +435,24 @@ def tick_all(*, now: Optional[datetime] = None, worker_id: str = "scheduler") ->
         # Tick trigger scheduler
         from src import jobs
         trigger_ticks = triggers.tick_scheduler(session, now=now)
-        for tick in trigger_ticks:
+        for trigger_tick in trigger_ticks:
             TRIGGER_TICK_COUNTS["fired"] = TRIGGER_TICK_COUNTS.get("fired", 0) + 1
             # Enqueue trigger execution job
             jobs.enqueue_job(
                 session,
                 job_type=jobs.JOB_TRIGGER_EXECUTE,
                 payload={
-                    "trigger_key": tick.trigger_key,
-                    "event_id": tick.event_id,
+                    "trigger_key": trigger_tick.trigger_key,
+                    "event_id": trigger_tick.event_id,
                     "event_payload": {},
                 },
-                label=f"trigger:{tick.trigger_key}",
+                label=f"trigger:{trigger_tick.trigger_key}",
             )
             # Record delivery
             triggers.record_delivery(
                 session,
-                trigger_key=tick.trigger_key,
-                event_id=tick.event_id,
+                trigger_key=trigger_tick.trigger_key,
+                event_id=trigger_tick.event_id,
                 payload={},
                 status="queued",
             )
