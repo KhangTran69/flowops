@@ -34,9 +34,13 @@ local verification and GitHub Actions.
 ## Reliability boundaries
 
 - Strict validation rejects malformed or ambiguous source data at the API edge.
-- Idempotency keys reserve each ticket operation with a fencing token. A stale
-  owner that loses its lease to a takeover cannot finalize or delete the new
-  reservation, and its ticket/log writes roll back with a retryable 409.
+- Idempotency keys reserve ticket and onboarding operations with a fencing
+  token. A stale owner that loses its lease to a takeover cannot finalize or
+  delete the new reservation, and its resource/log writes roll back with a
+  retryable 409. Keys are scoped to their resource type.
+- Failed webhook deliveries move to a dead-letter state after the configured
+  attempt limit. An operator can inspect failed rows and conditionally requeue
+  one; delivery remains at-least-once, so receivers must deduplicate.
 - Webhook delivery retries transient failures and records the final outcome.
 - Onboarding steps use explicit approval and completion state transitions.
 - Execution logs make each workflow action visible to the dashboard.

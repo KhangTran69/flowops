@@ -1,5 +1,10 @@
 """Tests for onboarding/offboarding workflows (v0.5)."""
 
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -15,6 +20,13 @@ VALID_ONBOARDING = {
     "start_date": "2026-11-02",
 }
 
+VALID_TICKET = {
+    "userId": 7,
+    "id": 42,
+    "title": "Laptop will not start",
+    "completed": False,
+}
+
 
 @pytest.fixture
 def client(tmp_path):
@@ -25,6 +37,36 @@ def client(tmp_path):
 def _create(client, overrides=None):
     payload = {**VALID_ONBOARDING, **(overrides or {})}
     return client.post("/onboarding-requests", json=payload)
+
+
+def _ensure_tables():
+    db.Base.metadata.create_all(bind=db.engine)
+
+
+def _reservation(key):
+    session = db.SessionLocal()
+    try:
+        record = session.get(db.IdempotencyRecord, key)
+        if record is None:
+            return None
+        return {
+            "payload": json.loads(record.response_json),
+            "owner_token": record.owner_token,
+            "resource_type": record.resource_type,
+        }
+    finally:
+        session.close()
+
+
+def _make_reservation_stale(key):
+    session = db.SessionLocal()
+    try:
+        record = session.get(db.IdempotencyRecord, key)
+        assert record is not None
+        record.created_at = db.utcnow() - timedelta(minutes=10)
+        session.commit()
+    finally:
+        session.close()
 
 
 def test_create_onboarding_generates_checklist(client):
@@ -199,3 +241,206 @@ def test_get_onboarding_request_status_progresses_to_completion(client):
 
 def test_get_onboarding_request_status_unknown_returns_404(client):
     assert client.get("/onboarding-requests/999/status").status_code == 404
+
+
+# --- Onboarding idempotency (fenced reservations) ---
+
+
+def test_onboarding_idempotency_key_replays_stored_response(client):
+    headers = {"Idempotency-Key": "onboarding-replay"}
+    first = client.post("/onboarding-requests", json=VALID_ONBOARDING, headers=headers)
+    second = client.post("/onboarding-requests", json=VALID_ONBOARDING, headers=headers)
+
+    assert first.status_code == 201
+    assert second.status_code == 200
+    assert second.headers["Idempotency-Replayed"] == "true"
+    assert second.json() == first.json()
+    assert len(client.get("/onboarding-requests").json()) == 1
+
+    actions = [log["action"] for log in client.get("/execution-logs").json()]
+    assert actions.count("onboarding.request.created") == 1
+    assert "onboarding.request.idempotent_replay" in actions
+
+
+def test_onboarding_same_key_different_payload_returns_409(client):
+    headers = {"Idempotency-Key": "onboarding-conflict"}
+    first = client.post("/onboarding-requests", json=VALID_ONBOARDING, headers=headers)
+    assert first.status_code == 201
+
+    conflict = client.post(
+        "/onboarding-requests",
+        json={**VALID_ONBOARDING, "employee_name": "Someone Else"},
+        headers=headers,
+    )
+    assert conflict.status_code == 409
+    assert "different request" in conflict.json()["detail"]
+    assert len(client.get("/onboarding-requests").json()) == 1
+
+
+def test_onboarding_concurrent_same_key_returns_409(client, monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+    call_lock = threading.Lock()
+    original_create = api._create_onboarding_request
+
+    def pause_first(request, session):
+        nonlocal calls
+        with call_lock:
+            calls += 1
+            is_first = calls == 1
+        if is_first:
+            entered.set()
+            assert release.wait(timeout=5), "test did not release the first request"
+        return original_create(request, session)
+
+    monkeypatch.setattr(api, "_create_onboarding_request", pause_first)
+    headers = {"Idempotency-Key": "onboarding-concurrent"}
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first_future = executor.submit(
+            client.post, "/onboarding-requests", json=VALID_ONBOARDING, headers=headers
+        )
+        assert entered.wait(timeout=5), "first request never reached creation"
+        try:
+            concurrent = client.post(
+                "/onboarding-requests", json=VALID_ONBOARDING, headers=headers
+            )
+        finally:
+            release.set()
+        first = first_future.result(timeout=5)
+
+    assert concurrent.status_code == 409
+    assert "still processing" in concurrent.json()["detail"]
+    assert first.status_code == 201
+    assert len(client.get("/onboarding-requests").json()) == 1
+
+
+def test_onboarding_stale_owner_cannot_finalize_after_takeover(client, monkeypatch):
+    """Only the new owner's onboarding record and logs may commit."""
+    _ensure_tables()
+    a_entered = threading.Event()
+    release_a = threading.Event()
+    calls = 0
+    call_lock = threading.Lock()
+    original_create = api._create_onboarding_request
+
+    def pause_first(request, session):
+        nonlocal calls
+        with call_lock:
+            calls += 1
+            is_first = calls == 1
+        if is_first:
+            a_entered.set()
+            assert release_a.wait(timeout=5), "test did not release the stale owner"
+        return original_create(request, session)
+
+    monkeypatch.setattr(api, "_create_onboarding_request", pause_first)
+    key = "onboarding-takeover"
+    headers = {"Idempotency-Key": key}
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        stale_future = executor.submit(
+            client.post, "/onboarding-requests", json=VALID_ONBOARDING, headers=headers
+        )
+        assert a_entered.wait(timeout=5), "stale owner never claimed the reservation"
+        claimed = _reservation(key)
+        assert claimed["payload"]["state"] == "processing"
+        assert claimed["owner_token"]
+        assert claimed["resource_type"] == api.IDEMPOTENCY_SCOPE_ONBOARDING
+        _make_reservation_stale(key)
+
+        new_owner = client.post(
+            "/onboarding-requests", json=VALID_ONBOARDING, headers=headers
+        )
+        assert new_owner.status_code == 201
+        after_takeover = _reservation(key)
+        assert after_takeover["payload"]["state"] == "completed"
+        assert after_takeover["owner_token"] != claimed["owner_token"]
+        assert after_takeover["payload"]["resource_type"] == "onboarding"
+
+        release_a.set()
+        stale_response = stale_future.result(timeout=5)
+
+    assert stale_response.status_code == 409
+    assert "took over" in stale_response.json()["detail"]
+    assert len(client.get("/onboarding-requests").json()) == 1
+    actions = [log["action"] for log in client.get("/execution-logs").json()]
+    assert actions.count("onboarding.request.created") == 1
+
+    final = _reservation(key)
+    assert final["payload"]["state"] == "completed"
+    assert final["owner_token"] == after_takeover["owner_token"]
+    replay = client.post(
+        "/onboarding-requests", json=VALID_ONBOARDING, headers=headers
+    )
+    assert replay.status_code == 200
+    assert replay.headers["Idempotency-Replayed"] == "true"
+    assert replay.json() == new_owner.json()
+
+
+def test_onboarding_failure_cleans_up_only_its_own_reservation(client, monkeypatch):
+    _ensure_tables()
+    session = db.SessionLocal()
+    try:
+        session.add(
+            db.IdempotencyRecord(
+                key="foreign-onboarding-key",
+                ticket_id="0",
+                response_json=json.dumps(
+                    {"request_hash": "other", "state": "processing"},
+                    separators=(",", ":"),
+                ),
+                owner_token="foreign-owner-token",
+                resource_type=api.IDEMPOTENCY_SCOPE_ONBOARDING,
+                created_at=db.utcnow(),
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+
+    def fail_create(request, session):
+        raise RuntimeError("onboarding creation exploded")
+
+    monkeypatch.setattr(api, "_create_onboarding_request", fail_create)
+    with pytest.raises(RuntimeError, match="onboarding creation exploded"):
+        client.post(
+            "/onboarding-requests",
+            json=VALID_ONBOARDING,
+            headers={"Idempotency-Key": "onboarding-failing"},
+        )
+
+    assert _reservation("onboarding-failing") is None
+    foreign = _reservation("foreign-onboarding-key")
+    assert foreign is not None
+    assert foreign["payload"]["state"] == "processing"
+    assert foreign["owner_token"] == "foreign-owner-token"
+
+
+def test_ticket_and_onboarding_keys_are_scoped(client):
+    ticket_key = "shared-ticket-first"
+    ticket = client.post(
+        "/tickets", json=VALID_TICKET, headers={"Idempotency-Key": ticket_key}
+    )
+    assert ticket.status_code == 201
+    onboarding_conflict = client.post(
+        "/onboarding-requests",
+        json=VALID_ONBOARDING,
+        headers={"Idempotency-Key": ticket_key},
+    )
+    assert onboarding_conflict.status_code == 409
+    assert "different resource type" in onboarding_conflict.json()["detail"]
+
+    onboarding_key = "shared-onboarding-first"
+    onboarding = client.post(
+        "/onboarding-requests",
+        json=VALID_ONBOARDING,
+        headers={"Idempotency-Key": onboarding_key},
+    )
+    assert onboarding.status_code == 201
+    ticket_conflict = client.post(
+        "/tickets", json=VALID_TICKET, headers={"Idempotency-Key": onboarding_key}
+    )
+    assert ticket_conflict.status_code == 409
+    assert "different resource type" in ticket_conflict.json()["detail"]

@@ -16,16 +16,18 @@ from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi import status as http_status
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, StrictBool, StrictInt, StrictStr, field_validator
-from sqlalchemy import and_, delete, select, update
+from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
-from src import db
+from src import db, web
+from src.auth import AuthenticationError, Actor, authenticate_bearer
 from src.actions import (
     ActionAdapter,
     adapter_from_environment,
@@ -39,7 +41,14 @@ from src.ticket_processor import normalize_ticket
 
 ACTION_ADAPTER: ActionAdapter = adapter_from_environment()
 DEFAULT_ACTION_ATTEMPTS = 3
+DEFAULT_NOTIFICATION_MAX_ATTEMPTS = 5
 IDEMPOTENCY_PROCESSING_TIMEOUT = timedelta(minutes=5)
+IDEMPOTENCY_SCOPE_TICKET = "ticket"
+IDEMPOTENCY_SCOPE_ONBOARDING = "onboarding"
+IDEMPOTENCY_REPLAY_ACTIONS = {
+    IDEMPOTENCY_SCOPE_TICKET: "ticket.idempotent_replay",
+    IDEMPOTENCY_SCOPE_ONBOARDING: "onboarding.request.idempotent_replay",
+}
 
 
 def _action_attempts(action: str) -> int:
@@ -49,6 +58,20 @@ def _action_attempts(action: str) -> int:
         return max(1, min(10, int(configured.get(action, DEFAULT_ACTION_ATTEMPTS))))
     except (TypeError, ValueError, json.JSONDecodeError):
         return DEFAULT_ACTION_ATTEMPTS
+
+
+def _notification_max_attempts() -> int:
+    """Read the bounded dead-letter threshold for outbox deliveries."""
+    try:
+        configured = int(
+            os.environ.get(
+                "FLOWOPS_NOTIFICATION_MAX_ATTEMPTS",
+                DEFAULT_NOTIFICATION_MAX_ATTEMPTS,
+            )
+        )
+        return max(1, min(20, configured))
+    except (TypeError, ValueError):
+        return DEFAULT_NOTIFICATION_MAX_ATTEMPTS
 
 
 def _notify_action_failure(
@@ -81,14 +104,42 @@ app = FastAPI(
     ),
     version="1.0.0-preview",
 )
+app.mount(
+    "/static",
+    StaticFiles(directory=str(web.BASE_DIR / "static")),
+    name="static",
+)
 
 
 def _new_run_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def _request_fingerprint(request: BaseModel) -> str:
+    """Return a stable SHA-256 of a validated request body."""
+    return hashlib.sha256(
+        json.dumps(request.model_dump(), sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _validate_idempotency_key(key: Optional[str]) -> None:
+    if key is not None and len(key) > 128:
+        raise HTTPException(
+            status_code=422, detail="Idempotency-Key must be at most 128 characters."
+        )
+
+
+def _stored_resource_type(payload: dict[str, Any]) -> str:
+    """Legacy records predate resource scoping and are ticket reservations."""
+    return payload.get("resource_type", IDEMPOTENCY_SCOPE_TICKET)
+
+
 def _claim_idempotency_key(
-    session: Session, key: str, ticket_id: str, request_hash: str
+    session: Session,
+    key: str,
+    resource_id: str,
+    request_hash: str,
+    resource_type: str,
 ) -> Optional[str]:
     """Atomically claim a key or take over an expired processing reservation.
 
@@ -103,22 +154,33 @@ def _claim_idempotency_key(
     owner_token = uuid.uuid4().hex
     values = {
         "key": key,
-        "ticket_id": ticket_id,
+        "ticket_id": resource_id,
         "response_json": json.dumps(
-            {"request_hash": request_hash, "state": "processing"},
+            {
+                "request_hash": request_hash,
+                "state": "processing",
+                "resource_type": resource_type,
+            },
             separators=(",", ":"),
         ),
         "owner_token": owner_token,
+        "resource_type": resource_type,
         "created_at": now,
     }
+    scope_matches = table.c.resource_type == resource_type
+    if resource_type == IDEMPOTENCY_SCOPE_TICKET:
+        # Reservations created before scoping existed are ticket reservations.
+        scope_matches = or_(scope_matches, table.c.resource_type.is_(None))
     takeover = and_(
         table.c.created_at < stale_before,
         table.c.response_json.like('%"state":"processing"%'),
+        scope_matches,
     )
     set_values = {
-        "ticket_id": ticket_id,
+        "ticket_id": resource_id,
         "response_json": values["response_json"],
         "owner_token": owner_token,
+        "resource_type": resource_type,
         "created_at": now,
     }
     dialect = session.get_bind().dialect.name
@@ -156,34 +218,36 @@ def _complete_idempotency_key(
     key: str,
     owner_token: str,
     request_hash: str,
-    ticket: "Ticket",
+    resource_type: str,
+    resource_id: str,
+    completion: dict[str, Any],
 ) -> bool:
     """Store the completed response only if this request still owns the key.
 
-    The conditional update runs in the same transaction as the ticket and
+    The conditional update runs in the same transaction as the resource and
     execution-log writes, so losing the fencing token rolls all of them back
     instead of committing a duplicate durable result.
     """
     table = db.IdempotencyRecord.__table__
+    payload = {
+        "request_hash": request_hash,
+        "state": "completed",
+        "resource_type": resource_type,
+        **completion,
+    }
     result = session.execute(
         update(table)
         .where(
             and_(
                 table.c.key == key,
                 table.c.owner_token == owner_token,
+                table.c.resource_type == resource_type,
                 table.c.response_json.like('%"state":"processing"%'),
             )
         )
         .values(
-            ticket_id=ticket.ticket_id,
-            response_json=json.dumps(
-                {
-                    "request_hash": request_hash,
-                    "state": "completed",
-                    "ticket": ticket.model_dump(),
-                },
-                separators=(",", ":"),
-            ),
+            ticket_id=resource_id,
+            response_json=json.dumps(payload, separators=(",", ":")),
         )
     )
     return result.rowcount == 1
@@ -218,20 +282,26 @@ def _reservation_is_stale(created_at: datetime) -> bool:
     return created_at < db.utcnow() - IDEMPOTENCY_PROCESSING_TIMEOUT
 
 
-def _replay_or_reject(
+def _replay_stored_response(
     stored: db.IdempotencyRecord,
+    payload: dict[str, Any],
     request_hash: str,
+    resource_type: str,
     response: Response,
     session: Session,
-) -> "Ticket":
-    """Replay a completed matching key, or return the appropriate 409."""
-    stored_payload = json.loads(stored.response_json)
-    if stored_payload.get("request_hash") != request_hash:
+) -> dict[str, Any]:
+    """Validate and replay a stored completed response, or return a 409."""
+    if _stored_resource_type(payload) != resource_type:
+        raise HTTPException(
+            status_code=409,
+            detail="Idempotency-Key was already used for a different resource type.",
+        )
+    if payload.get("request_hash") != request_hash:
         raise HTTPException(
             status_code=409,
             detail="Idempotency-Key was already used with a different request.",
         )
-    if stored_payload.get("state") == "processing":
+    if payload.get("state") == "processing":
         raise HTTPException(
             status_code=409,
             detail="A request with this Idempotency-Key is still processing.",
@@ -241,12 +311,70 @@ def _replay_or_reject(
     db.log_execution(
         session,
         run_id=_new_run_id(),
-        action="ticket.idempotent_replay",
+        action=IDEMPOTENCY_REPLAY_ACTIONS[resource_type],
         status="success",
         ticket_id=stored.ticket_id,
         detail="replayed stored response without re-executing",
     )
-    return Ticket.model_validate(stored_payload["ticket"])
+    return payload
+
+
+def _reserve_idempotency_key(
+    session: Session,
+    response: Response,
+    key: Optional[str],
+    request_hash: str,
+    resource_type: str,
+    resource_id: str,
+) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    """Claim a reservation or return a completed stored response.
+
+    Returns ``(owner_token, None)`` for a new claim and ``(None, payload)`` for
+    a replay. Active, changed-payload, and cross-resource requests raise 409.
+    """
+    if not key:
+        return None, None
+    stored = session.get(db.IdempotencyRecord, key)
+    if stored is not None:
+        payload = json.loads(stored.response_json)
+        if _stored_resource_type(payload) != resource_type:
+            raise HTTPException(
+                status_code=409,
+                detail="Idempotency-Key was already used for a different resource type.",
+            )
+        if payload.get("state") == "processing":
+            if payload.get("request_hash") != request_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Idempotency-Key was already used with a different request.",
+                )
+            if not _reservation_is_stale(stored.created_at):
+                return None, _replay_stored_response(
+                    stored, payload, request_hash, resource_type, response, session
+                )
+            owner_token = _claim_idempotency_key(
+                session, key, resource_id, request_hash, resource_type
+            )
+        else:
+            return None, _replay_stored_response(
+                stored, payload, request_hash, resource_type, response, session
+            )
+    else:
+        owner_token = _claim_idempotency_key(
+            session, key, resource_id, request_hash, resource_type
+        )
+    if owner_token is None:
+        session.expire_all()
+        stored = session.get(db.IdempotencyRecord, key)
+        if stored is None:
+            raise HTTPException(
+                409, "Unable to claim this Idempotency-Key; retry the request."
+            )
+        payload = json.loads(stored.response_json)
+        return None, _replay_stored_response(
+            stored, payload, request_hash, resource_type, response, session
+        )
+    return owner_token, None
 
 
 # ---------------------------------------------------------------------------
@@ -292,12 +420,30 @@ class ExecutionLogOut(BaseModel):
     created_at: datetime
 
 
+class ActionExecutionOut(BaseModel):
+    id: int
+    request_id: int
+    checklist_item_id: int
+    action: str
+    actor_subject: Optional[str] = None
+    adapter: str
+    correlation_id: str
+    attempt: int
+    status: str
+    error_category: Optional[str] = None
+    error_detail: Optional[str] = None
+    external_reference: Optional[str] = None
+    started_at: datetime
+    completed_at: Optional[datetime] = None
+    duration_ms: Optional[int] = None
 class ChecklistItemOut(BaseModel):
     id: int
     step: str
     queue: str
     requires_approval: bool
     status: str
+
+
 
 
 class OnboardingRequestIn(BaseModel):
@@ -446,51 +592,33 @@ def _process_intake(request: TicketIntakeRequest, session: Session) -> Ticket:
 # Routes: service
 
 
-LANDING_PAGE = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FlowOps</title>
-<style>
-  body { font-family: -apple-system, system-ui, sans-serif; margin: 0; display: grid; place-items: center; min-height: 100vh; background: #f5f6f8; color: #1f2933; }
-  main { background: #fff; padding: 2.5rem 3rem; border-radius: 12px; box-shadow: 0 1px 4px rgba(0,0,0,.08); max-width: 36rem; }
-  h1 { margin: 0 0 .25rem; font-size: 1.6rem; }
-  p.tagline { margin: 0 0 1.5rem; color: #5f6b7a; }
-  ul { list-style: none; padding: 0; margin: 0 0 1.5rem; }
-  li { padding: .45rem 0; border-bottom: 1px solid #eef0f3; font-family: ui-monospace, monospace; font-size: .85rem; }
-  a { color: #2563eb; }
-  .note { color: #8a94a6; font-size: .8rem; }
-</style>
-</head>
-<body>
-<main>
-  <h1>FlowOps</h1>
-  <p class="tagline">IT workflow automation &mdash; tickets, routing, onboarding (v1.0 preview)</p>
-  <ul>
-    <li>GET /health</li>
-    <li>POST /tickets &nbsp;(supports Idempotency-Key)</li>
-    <li>GET /tickets &middot; GET /tickets/{ticket_id}</li>
-    <li>POST /webhooks/intake &nbsp;(single or bulk, for n8n)</li>
-<<<<<<< ours
-    <li>POST / GET /onboarding-requests &middot; approve/complete items</li>
-    <li>GET /notifications/pending &middot; POST /notifications/retry</li>
-=======
-    <li>POST / GET /onboarding-requests[/{id}/status] &middot; approve/complete items</li>
->>>>>>> theirs
-    <li>GET /execution-logs &middot; GET /dashboard</li>
-  </ul>
-  <p><a href="/docs">Interactive API docs</a> &middot; <a href="/dashboard">Monitoring dashboard</a></p>
-  <p class="note">Learning prototype &mdash; ticket data is simulated, not real support tickets.</p>
-</main>
-</body>
-</html>"""
+def _site_stats(session: Session) -> dict[str, int]:
+    """Small aggregate snapshot used by the landing page."""
+    tickets = session.execute(select(db.TicketRecord)).scalars().all()
+    outbox = session.execute(select(db.NotificationOutboxRecord)).scalars().all()
+    onboarding = session.execute(select(db.OnboardingRequestRecord)).scalars().all()
+    return {
+        "tickets": len(tickets),
+        "open_tickets": sum(1 for ticket in tickets if ticket.status == "open"),
+        "auto_routed": sum(
+            1 for ticket in tickets if ticket.queue and ticket.queue != "it-service-desk"
+        ),
+        "onboarding_requests": len(onboarding),
+        "pending_notifications": sum(1 for item in outbox if item.status == "pending"),
+        "failed_notifications": sum(1 for item in outbox if item.status == "failed"),
+    }
 
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
-def root() -> str:
-    """HTML landing page so browsers get something readable at the root."""
-    return LANDING_PAGE
+def root(
+    request: Request, session: Session = Depends(db.get_session)
+) -> HTMLResponse:
+    """Landing page with live counts and operator links."""
+    return web.render(
+        request,
+        "landing.html",
+        {"active": "home", "stats": _site_stats(session)},
+    )
 
 
 @app.get("/health")
@@ -516,41 +644,18 @@ def create_ticket(
     200 with an Idempotency-Replayed header when the same Idempotency-Key
     is replayed (without re-executing the request).
     """
-    if idempotency_key is not None and len(idempotency_key) > 128:
-        raise HTTPException(
-            status_code=422, detail="Idempotency-Key must be at most 128 characters."
-        )
-    request_hash = hashlib.sha256(
-        json.dumps(request.model_dump(), sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    owner_token: Optional[str] = None
-    if idempotency_key:
-        stored = session.get(db.IdempotencyRecord, idempotency_key)
-        if stored:
-            stored_payload = json.loads(stored.response_json)
-            if stored_payload.get("state") == "processing":
-                if stored_payload.get("request_hash") != request_hash:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="Idempotency-Key was already used with a different request.",
-                    )
-                if not _reservation_is_stale(stored.created_at):
-                    return _replay_or_reject(stored, request_hash, response, session)
-                owner_token = _claim_idempotency_key(
-                    session, idempotency_key, str(request.id), request_hash
-                )
-            else:
-                return _replay_or_reject(stored, request_hash, response, session)
-        else:
-            owner_token = _claim_idempotency_key(
-                session, idempotency_key, str(request.id), request_hash
-            )
-        if owner_token is None:
-            session.expire_all()
-            stored = session.get(db.IdempotencyRecord, idempotency_key)
-            if stored is None:
-                raise HTTPException(409, "Unable to claim this Idempotency-Key; retry the request.")
-            return _replay_or_reject(stored, request_hash, response, session)
+    _validate_idempotency_key(idempotency_key)
+    request_hash = _request_fingerprint(request)
+    owner_token, replay = _reserve_idempotency_key(
+        session,
+        response,
+        idempotency_key,
+        request_hash,
+        IDEMPOTENCY_SCOPE_TICKET,
+        str(request.id),
+    )
+    if replay is not None:
+        return Ticket.model_validate(replay["ticket"])
 
     ownership_lost = False
     try:
@@ -559,7 +664,13 @@ def create_ticket(
         result = _process_intake(request, session)
         if idempotency_key and owner_token is not None:
             if not _complete_idempotency_key(
-                session, idempotency_key, owner_token, request_hash, result
+                session,
+                idempotency_key,
+                owner_token,
+                request_hash,
+                IDEMPOTENCY_SCOPE_TICKET,
+                result.ticket_id,
+                {"ticket": result.model_dump()},
             ):
                 # Another request took over the expired lease. Roll back this
                 # request's ticket/log writes before reporting a retryable conflict.
@@ -652,15 +763,10 @@ def _load_request(
     return record, list(items)
 
 
-@app.post(
-    "/onboarding-requests",
-    response_model=OnboardingRequestOut,
-    status_code=http_status.HTTP_201_CREATED,
-)
-def create_onboarding_request(
-    request: OnboardingRequestIn, session: Session = Depends(db.get_session)
+def _create_onboarding_request(
+    request: OnboardingRequestIn, session: Session
 ) -> OnboardingRequestOut:
-    """Create an onboarding/offboarding request and generate its checklist."""
+    """Create the record and checklist, returning the API response shape."""
     started = time.perf_counter()
     record = db.OnboardingRequestRecord(
         request_type=request.request_type,
@@ -687,6 +793,66 @@ def create_onboarding_request(
     )
     _, items = _load_request(session, record.id)
     return _request_out(record, items)
+
+
+@app.post(
+    "/onboarding-requests",
+    response_model=OnboardingRequestOut,
+    status_code=http_status.HTTP_201_CREATED,
+)
+def create_onboarding_request(
+    request: OnboardingRequestIn,
+    response: Response,
+    session: Session = Depends(db.get_session),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+) -> OnboardingRequestOut:
+    """Create an onboarding/offboarding request and generate its checklist.
+
+    Supports ``Idempotency-Key`` with the same fenced reservation protocol as
+    ``POST /tickets``: replays are 200, changed payloads are 409, and a stale
+    owner that loses its lease cannot finalize the takeover's reservation.
+    """
+    _validate_idempotency_key(idempotency_key)
+    request_hash = _request_fingerprint(request)
+    owner_token, replay = _reserve_idempotency_key(
+        session,
+        response,
+        idempotency_key,
+        request_hash,
+        IDEMPOTENCY_SCOPE_ONBOARDING,
+        "0",
+    )
+    if replay is not None:
+        return OnboardingRequestOut.model_validate(replay["onboarding_request"])
+
+    ownership_lost = False
+    try:
+        result = _create_onboarding_request(request, session)
+        if idempotency_key and owner_token is not None:
+            if not _complete_idempotency_key(
+                session,
+                idempotency_key,
+                owner_token,
+                request_hash,
+                IDEMPOTENCY_SCOPE_ONBOARDING,
+                str(result.id),
+                {"onboarding_request": result.model_dump(mode="json")},
+            ):
+                session.rollback()
+                ownership_lost = True
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Another request took over this Idempotency-Key while it was "
+                        "processing; retry the request."
+                    ),
+                )
+        return result
+    except Exception:
+        if idempotency_key and owner_token is not None and not ownership_lost:
+            session.rollback()
+            _release_idempotency_key(session, idempotency_key, owner_token)
+        raise
 
 
 @app.get("/onboarding-requests", response_model=list[OnboardingRequestOut])
@@ -799,7 +965,7 @@ def _transition_item(
 
 
 def _execute_item(
-    session: Session, request_id: int, item_id: int
+    session: Session, request_id: int, item_id: int, actor: Actor
 ) -> OnboardingRequestOut:
     """Run one approved checklist action with bounded retries."""
     record, _ = _load_request(session, request_id)
@@ -819,13 +985,32 @@ def _execute_item(
         "employee_name": record.employee_name,
         "employee_email": record.employee_email,
         "department": record.department,
+        "actor_subject": actor.subject,
+        "actor_roles": list(actor.roles),
     }
+    correlation_id = _new_run_id()
+    started_at = db.utcnow()
     started = time.perf_counter()
     last_error = ""
     attempts_limit = _action_attempts(action)
     for attempt in range(1, attempts_limit + 1):
         try:
             result = ACTION_ADAPTER.execute(action, context)
+            completed_at = db.utcnow()
+            session.add(db.ActionExecutionRecord(
+                request_id=record.id,
+                checklist_item_id=item.id,
+                action=action,
+                actor_subject=actor.subject,
+                adapter=ACTION_ADAPTER.__class__.__name__,
+                correlation_id=correlation_id,
+                attempt=attempt,
+                status="succeeded",
+                external_reference=result.detail[:256],
+                started_at=started_at,
+                completed_at=completed_at,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            ))
             item.status = "completed"
             session.flush()
             db.log_execution(
@@ -851,6 +1036,21 @@ def _execute_item(
             return _request_out(record, items)
         except Exception as error:  # adapter failures must be logged and retried
             last_error = str(error)
+            session.add(db.ActionExecutionRecord(
+                request_id=record.id,
+                checklist_item_id=item.id,
+                action=action,
+                actor_subject=actor.subject,
+                adapter=ACTION_ADAPTER.__class__.__name__,
+                correlation_id=correlation_id,
+                attempt=attempt,
+                status="retrying" if attempt < attempts_limit else "failed",
+                error_category="adapter_error",
+                error_detail=last_error[:1000],
+                started_at=started_at,
+                completed_at=db.utcnow(),
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            ))
 
     _notify_action_failure(action, context, attempts_limit, last_error, session)
     db.log_execution(
@@ -871,10 +1071,31 @@ def _execute_item(
 
 @app.post("/onboarding-requests/{request_id}/items/{item_id}/execute")
 def execute_item(
-    request_id: int, item_id: int, session: Session = Depends(db.get_session)
+    request_id: int,
+    item_id: int,
+    authorization: Optional[str] = Header(default=None),
+    session: Session = Depends(db.get_session),
 ) -> OnboardingRequestOut:
     """Execute a checklist action through the configured Microsoft adapter."""
-    return _execute_item(session, request_id, item_id)
+    try:
+        actor = authenticate_bearer(authorization)
+    except AuthenticationError as error:
+        raise HTTPException(status_code=401, detail=str(error)) from error
+    return _execute_item(session, request_id, item_id, actor)
+
+@app.get("/onboarding-requests/{request_id}/action-executions", response_model=list[ActionExecutionOut])
+def list_action_executions(
+    request_id: int, session: Session = Depends(db.get_session)
+) -> list[ActionExecutionOut]:
+    """List durable action attempts for one onboarding request."""
+    _load_request(session, request_id)
+    records = session.execute(
+        select(db.ActionExecutionRecord)
+        .where(db.ActionExecutionRecord.request_id == request_id)
+        .order_by(db.ActionExecutionRecord.id)
+    ).scalars().all()
+    return [ActionExecutionOut.model_validate(record, from_attributes=True) for record in records]
+
 
 @app.post("/onboarding-requests/{request_id}/items/{item_id}/approve")
 def approve_item(
@@ -921,10 +1142,27 @@ def _outbox_out(record: db.NotificationOutboxRecord) -> NotificationOutboxOut:
 def list_pending_notifications(
     session: Session = Depends(db.get_session),
 ) -> list[NotificationOutboxOut]:
-    """List webhook deliveries that failed all retries and await a manual retry."""
+    """List webhook deliveries that await a manual retry."""
     records = session.execute(
         select(db.NotificationOutboxRecord)
         .where(db.NotificationOutboxRecord.status == "pending")
+        .order_by(db.NotificationOutboxRecord.id)
+    ).scalars().all()
+    return [_outbox_out(record) for record in records]
+
+
+@app.get("/notifications/failed", response_model=list[NotificationOutboxOut])
+def list_failed_notifications(
+    session: Session = Depends(db.get_session),
+) -> list[NotificationOutboxOut]:
+    """List dead-letter deliveries that exhausted their retry budget.
+
+    Operators can inspect these rows and return one to the pending queue with
+    ``POST /notifications/{notification_id}/requeue``.
+    """
+    records = session.execute(
+        select(db.NotificationOutboxRecord)
+        .where(db.NotificationOutboxRecord.status == "failed")
         .order_by(db.NotificationOutboxRecord.id)
     ).scalars().all()
     return [_outbox_out(record) for record in records]
@@ -938,9 +1176,11 @@ def retry_failed_notifications(
     """Retry pending webhook deliveries once each (oldest first).
 
     Successful retries are marked ``delivered``; still-failing ones stay
-    ``pending`` with an incremented attempt count. Every outcome is written
-    to the execution log as ``notification.retry``.
+    ``pending`` until their attempt count reaches
+    ``FLOWOPS_NOTIFICATION_MAX_ATTEMPTS``, at which point they become
+    ``failed`` (dead-lettered). Every outcome is written to the execution log.
     """
+    max_attempts = _notification_max_attempts()
     records = session.execute(
         select(db.NotificationOutboxRecord)
         .where(db.NotificationOutboxRecord.status == "pending")
@@ -960,6 +1200,20 @@ def retry_failed_notifications(
             record.last_error = None
         else:
             record.last_error = delivery.last_error
+            if record.attempts >= max_attempts:
+                record.status = "failed"
+                db.log_execution(
+                    session,
+                    run_id=_new_run_id(),
+                    action="notification.dead_lettered",
+                    status="failure",
+                    ticket_id=record.ticket_id,
+                    duration_ms=duration_ms,
+                    detail=(
+                        f"outbox #{record.id} exhausted after "
+                        f"{record.attempts} attempts"
+                    ),
+                )
         db.log_execution(
             session,
             run_id=_new_run_id(),
@@ -971,6 +1225,64 @@ def retry_failed_notifications(
         )
         results.append(_outbox_out(record))
     return results
+
+
+@app.post(
+    "/notifications/{notification_id}/requeue",
+    response_model=NotificationOutboxOut,
+)
+def requeue_failed_notification(
+    notification_id: int, session: Session = Depends(db.get_session)
+) -> NotificationOutboxOut:
+    """Return one dead-letter delivery to the pending queue.
+
+    The transition is conditional on the row still being ``failed``, so two
+    operators cannot requeue the same delivery twice. Attempt history and the
+    last error are preserved; each requeue grants one more delivery attempt.
+    """
+    record = session.get(db.NotificationOutboxRecord, notification_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Notification delivery not found.")
+    if record.status != "failed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Only failed deliveries can be requeued (current status: '{record.status}').",
+        )
+
+    table = db.NotificationOutboxRecord.__table__
+    now = db.utcnow()
+    result = session.execute(
+        update(table)
+        .where(
+            and_(
+                table.c.id == notification_id,
+                table.c.status == "failed",
+            )
+        )
+        .values(status="pending", updated_at=now)
+    )
+    if result.rowcount != 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Notification delivery changed state; refresh and retry.",
+        )
+    session.expire_all()
+    record = session.get(db.NotificationOutboxRecord, notification_id)
+    if record is None:  # pragma: no cover - only if deleted concurrently
+        raise HTTPException(status_code=404, detail="Notification delivery not found.")
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="notification.requeued",
+        status="success",
+        ticket_id=record.ticket_id,
+        duration_ms=0,
+        detail=(
+            f"outbox #{record.id} returned to pending; "
+            f"attempts={record.attempts} preserved"
+        ),
+    )
+    return _outbox_out(record)
 
 
 @app.get("/execution-logs", response_model=list[ExecutionLogOut])
@@ -1009,6 +1321,9 @@ def dashboard(session: Session = Depends(db.get_session)) -> str:
     ).scalars().all()
     pending_deliveries = [
         item for item in outbox_records if item.status == "pending"
+    ]
+    failed_deliveries = [
+        item for item in outbox_records if item.status == "failed"
     ]
 
     total = len(tickets)
@@ -1065,10 +1380,32 @@ def dashboard(session: Session = Depends(db.get_session)) -> str:
             for item in pending_deliveries[:15]
         )
         outbox_section = f"""<section>
-        <h2>Failed webhook deliveries ({outbox_pending} pending)</h2>
+<h2>Pending webhook deliveries ({outbox_pending})</h2>
 <p>Retry them with <code>POST /notifications/retry</code> &middot;
 list with <code>GET /notifications/pending</code>.</p>
 <table><tr><th>#</th><th>ticket</th><th>url</th><th>attempts</th><th>last error</th></tr>{outbox_rows}</table>
+</section>
+"""
+
+    failed_section = ""
+    if failed_deliveries:
+        failed_rows = "".join(
+            "<tr>"
+            f"<td>#{item.id}</td>"
+            f"<td>{html.escape(item.ticket_id or '')}</td>"
+            f"<td>{html.escape(item.url)}</td>"
+            f"<td>{item.attempts}</td>"
+            f"<td class=\"fail\">{html.escape(item.last_error or '')}</td>"
+            f"<td><code>POST /notifications/{item.id}/requeue</code></td>"
+            "</tr>"
+            for item in failed_deliveries[:15]
+        )
+        failed_section = f"""<section>
+<h2>Dead-letter notifications ({outbox_failed})</h2>
+<p>Return one to the pending queue with
+<code>POST /notifications/{{id}}/requeue</code> &middot;
+list with <code>GET /notifications/failed</code>.</p>
+<table><tr><th>#</th><th>ticket</th><th>url</th><th>attempts</th><th>last error</th><th>action</th></tr>{failed_rows}</table>
 </section>
 """
 
@@ -1118,7 +1455,7 @@ list with <code>GET /notifications/pending</code>.</p>
   <section><h2>Tickets by queue</h2><table>{counter_rows(by_queue)}</table></section>
   <section><h2>Tickets by priority</h2><table>{counter_rows(by_priority)}</table></section>
 </div>
-{outbox_section}<section>
+{outbox_section}{failed_section}<section>
   <h2>Recent workflow runs</h2>
   <table><tr><th>run</th><th>time</th><th>action</th><th>status</th><th>ticket</th><th>duration</th></tr>{recent_rows}</table>
 </section>

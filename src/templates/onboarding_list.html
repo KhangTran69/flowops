@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Onboarding requests — FlowOps{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <span class="eyebrow">Operator UI</span>
+    <h1>Onboarding requests</h1>
+    <p class="muted">Approval-gated checklists for new hires and offboarding.</p>
+  </div>
+  <a class="button primary" href="/docs#/default/create_onboarding_request_onboarding_requests_post">Create via API</a>
+</section>
+
+<section class="panel">
+  {% if requests %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Type</th><th>Employee</th><th>Department</th><th>Status</th><th>Progress</th><th></th></tr></thead>
+      <tbody>
+        {% for row in requests %}
+        <tr>
+          <td>#{{ row.id }}</td>
+          <td><span class="badge">{{ row.request_type }}</span></td>
+          <td>{{ row.employee_name }}</td>
+          <td>{{ row.department }}</td>
+          <td><span class="badge {{ 'ok' if row.status == 'completed' else 'info' }}">{{ row.status }}</span></td>
+          <td>
+            <span class="progress"><span class="progress-fill" style="width: {{ row.percent }}%"></span></span>
+            <span class="small muted">{{ row.completed }}/{{ row.total }}</span>
+          </td>
+          <td><a class="button small" href="/ui/onboarding-requests/{{ row.id }}">Open</a></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">No onboarding requests yet. Create one with <code>POST /onboarding-requests</code>.</p>
+  {% endif %}
+</section>
+{% endblock %}

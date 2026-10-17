@@ -50,6 +50,23 @@ class SimulatedMicrosoftAdapter:
         )
 
 
+class MicrosoftGraphAdapter:
+    """Calls a Microsoft Graph action endpoint with a bearer access token."""
+
+    def __init__(self, url: str, token: str, timeout: float = 10.0) -> None:
+        self.url = url.rstrip("/")
+        self.token = token
+        self.timeout = timeout
+
+    def execute(self, action: str, context: dict[str, Any]) -> ActionResult:
+        response = requests.post(
+            f"{self.url}/{action}",
+            json=context,
+            headers={"Authorization": f"Bearer {self.token}"},
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        return ActionResult(action=action, detail="Microsoft Graph action accepted")
 class PowerAutomateAdapter:
     """POSTs sanitized checklist context to a Power Automate trigger."""
 
@@ -67,6 +84,8 @@ class PowerAutomateAdapter:
         return ActionResult(action=action, detail="Power Automate webhook accepted action")
 
 
+
+
 def adapter_from_environment(environ: dict[str, str] | None = None) -> ActionAdapter:
     """Build the configured adapter; simulation remains the safe default."""
     values = environ if environ is not None else os.environ
@@ -78,6 +97,12 @@ def adapter_from_environment(environ: dict[str, str] | None = None) -> ActionAda
         if not url:
             raise ValueError("FLOWOPS_POWER_AUTOMATE_URL is required for power_automate")
         return PowerAutomateAdapter(url)
+    if name == "graph":
+        url = values.get("FLOWOPS_GRAPH_URL", "https://graph.microsoft.com/v1.0")
+        token = values.get("FLOWOPS_GRAPH_ACCESS_TOKEN")
+        if not token:
+            raise ValueError("FLOWOPS_GRAPH_ACCESS_TOKEN is required for graph")
+        return MicrosoftGraphAdapter(url, token)
     raise ValueError(f"Unsupported FLOWOPS_ACTION_ADAPTER: {name!r}")
 
 

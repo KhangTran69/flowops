@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}FlowOps{% endblock %}</title>
+  <link rel="stylesheet" href="/static/css/app.css">
+  <script src="/static/js/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div class="container header-inner">
+      <a class="brand" href="/">
+        <span class="brand-mark" aria-hidden="true">◆</span>
+        <span>FlowOps</span>
+      </a>
+      <nav class="site-nav" aria-label="Main navigation">
+        <a href="/" {% if active == "home" %}aria-current="page"{% endif %}>Home</a>
+        <a href="/dashboard" {% if active == "dashboard" %}aria-current="page"{% endif %}>Dashboard</a>
+        <a href="/ui/onboarding-requests" {% if active == "onboarding" %}aria-current="page"{% endif %}>Onboarding</a>
+        <a href="/ui/notifications" {% if active == "notifications" %}aria-current="page"{% endif %}>Notifications</a>
+        <a href="/ui/workflow-jobs" {% if active == "jobs" %}aria-current="page"{% endif %}>Jobs</a>
+        <a href="/docs">API docs</a>
+      </nav>
+      <button class="button ghost theme-toggle" id="theme-toggle" type="button" aria-label="Toggle color theme">
+        Theme
+      </button>
+    </div>
+  </header>
+
+  <main id="main" class="container">
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="site-footer">
+    <div class="container footer-inner">
+      <span>FlowOps — learning prototype; simulated data.</span>
+      <span>
+        <a href="/dashboard">Dashboard</a> ·
+        <a href="/docs">API docs</a> ·
+        <a href="/health">Health</a>
+      </span>
+    </div>
+  </footer>
+</body>
+</html>
