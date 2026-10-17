@@ -175,7 +175,7 @@ curl -X POST http://127.0.0.1:8000/onboarding-requests -H 'Content-Type: applica
 ## Running the tests
 
 ```bash
-pytest    # 101 tests, fully offline: mocked HTTP, SQLite in tmp dirs
+pytest    # 104 tests, fully offline: mocked HTTP, SQLite in tmp dirs
 python -m compileall -q src tests
 ```
 

@@ -81,6 +81,33 @@ class IdempotencyRecord(Base):
     )
 
 
+class NotificationOutboxRecord(Base):
+    """A failed outbound webhook delivery kept for a later retry (v1.0 preview).
+
+    When ``deliver_webhook`` exhausts its in-request retries, the payload is
+    stored here so operators can see it and retry manually via
+    ``POST /notifications/retry`` instead of losing the event silently.
+    """
+
+    __tablename__ = "notification_outbox"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    url: Mapped[str] = mapped_column(String(500), nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    ticket_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending"
+    )  # pending | delivered | failed
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
 class OnboardingRequestRecord(Base):
     """An onboarding or offboarding request (v0.5)."""
 
