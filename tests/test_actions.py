@@ -1,5 +1,6 @@
 """Tests for the credential-free v0.6 action layer."""
 
+import shutil
 import pytest
 from fastapi.testclient import TestClient
 
@@ -169,21 +170,32 @@ def test_action_execution_audit_records_retries(client, monkeypatch):
     assert all(entry["error_category"] == "adapter_error" for entry in executions)
 
 
-def test_powershell_adapter_dry_run():
-    from src.actions import PowerShellAdapter
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="PowerShell 7 not installed")
+def test_powershell_adapter_dry_run_runs_real_script():
+    from src.actions import PowerShellAdapter, PowerShellError
 
     adapter = PowerShellAdapter(dry_run=True)
-    res = adapter.execute("create_user_account", {"employee_email": "jane@example.com"})
-    assert res.action == "create_user_account"
-    assert "simulated PowerShell execution" in res.detail
-    assert "jane@example.com" in res.detail
+    res = adapter.execute(
+        "archive_email_mailbox",
+        {"employee_email": "jane@example.com", "manager_email": "boss@example.com"},
+    )
+    assert res.output["dry_run"] is True
+    assert "Set-Mailbox -Identity jane@example.com -Type Shared" in res.output["commands"]
+    assert res.output["delegate"] == "boss@example.com"
+    with pytest.raises(PowerShellError) as info:
+        adapter.execute("archive_email_mailbox", {})
+    assert info.value.retryable is False
 
 
-def test_powershell_adapter_execution(monkeypatch):
+def test_powershell_adapter_parses_json_result(monkeypatch):
     from src.actions import PowerShellAdapter
 
     class FakeCompletedProcess:
-        stdout = "PowerShell executed action 'create_user_account' for jane@example.com\n"
+        returncode = 0
+        stdout = (
+            "WARNING: module loaded\n"
+            '{"status":"ok","action":"configure_email_mailbox","detail":"done","output":{"mailbox":"jane@example.com"}}\n'
+        )
         stderr = ""
 
     calls = []
@@ -194,24 +206,29 @@ def test_powershell_adapter_execution(monkeypatch):
 
     monkeypatch.setattr("subprocess.run", fake_run)
     adapter = PowerShellAdapter(command_path="/usr/local/bin/pwsh", dry_run=False, timeout=10.0)
-    res = adapter.execute("create_user_account", {"employee_email": "jane@example.com"})
-    assert res.action == "create_user_account"
-    assert "PowerShell executed action" in res.detail
-    assert calls[0][0][0] == "/usr/local/bin/pwsh"
-    assert calls[0][2] == 10.0
+    res = adapter.execute("configure_email_mailbox", {"employee_email": "jane@example.com"})
+    assert res.detail == "done"
+    assert res.output == {"mailbox": "jane@example.com"}
+    args, stdin, timeout = calls[0]
+    assert args[0] == "/usr/local/bin/pwsh"
+    assert args[3] == "-File" and "-DryRun" not in args
+    assert "jane@example.com" not in " ".join(args)  # data goes via stdin only
+    assert '"configure_email_mailbox"' in stdin
+    assert timeout == 10.0
 
 
-def test_powershell_adapter_failure(monkeypatch):
-    import subprocess
-    from src.actions import PowerShellAdapter
+def test_powershell_adapter_failure_surfaces_stderr(monkeypatch):
+    from src.actions import PowerShellAdapter, PowerShellError
 
-    def fake_run(*args, **kwargs):
-        raise subprocess.CalledProcessError(1, ["pwsh"], stderr="ExecutionPolicy restriction")
+    class Failed:
+        returncode = 1
+        stdout = ""
+        stderr = "ExecutionPolicy restriction"
 
-    monkeypatch.setattr("subprocess.run", fake_run)
-    adapter = PowerShellAdapter(dry_run=False)
-    with pytest.raises(RuntimeError, match="ExecutionPolicy restriction"):
-        adapter.execute("create_user_account", {"employee_email": "jane@example.com"})
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: Failed())
+    with pytest.raises(PowerShellError, match="ExecutionPolicy restriction") as info:
+        PowerShellAdapter().execute("create_user_account", {"employee_email": "jane@example.com"})
+    assert info.value.retryable is True
 
 
 def test_powershell_adapter_from_environment():

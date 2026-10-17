@@ -1,12 +1,18 @@
-"""Credential-free action boundary for onboarding workflows (v0.6).
+"""Action boundary for onboarding/offboarding workflows.
 
-The default adapter records a simulated action. A Microsoft Graph,
-Power Automate, or PowerShell adapter can replace it without changing the
-workflow or API layer.
+The default adapter records a simulated action. The Microsoft Graph adapter
+performs the real user/licence/mailbox calls per tenant and drops back to
+Exchange Online PowerShell for the steps Graph cannot do (shared-mailbox
+conversion). Power Automate and PowerShell adapters can replace it without
+changing the workflow or API layer.
 """
 
+import json
 import os
+import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 import requests
@@ -51,74 +57,6 @@ class SimulatedMicrosoftAdapter:
         )
 
 
-class MicrosoftGraphAdapter:
-    """Calls a Microsoft Graph action endpoint with a bearer access token."""
-
-    def __init__(self, url: str, token: str, timeout: float = 10.0) -> None:
-        self.url = url.rstrip("/")
-        self.token = token
-        self.timeout = timeout
-
-    def execute(self, action: str, context: dict[str, Any]) -> ActionResult:
-        headers = {"Authorization": f"Bearer {self.token}"}
-        if context.get("idempotency_key"):
-            headers["Idempotency-Key"] = str(context["idempotency_key"])
-        response = requests.post(
-            f"{self.url}/{action}",
-            json=context,
-            headers=headers,
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
-        return ActionResult(action=action, detail="Microsoft Graph action accepted")
-
-
-
-class GraphClientActionAdapter:
-    """Uses the client-credentials GraphClient for real user/license actions."""
-
-    def __init__(self, client, *, sku_id: str = "") -> None:
-        self.client = client
-        self.sku_id = sku_id
-
-    def execute(self, action: str, context: dict[str, Any]) -> ActionResult:
-        email = str(context.get("employee_email") or "")
-        if action == "create_user_account":
-            password = context.get("temporary_password")
-            if not password:
-                raise ValueError("temporary_password is required to create a Graph user")
-            payload = {
-                "accountEnabled": True,
-                "displayName": context.get("employee_name") or email.split("@")[0],
-                "mailNickname": email.split("@")[0],
-                "userPrincipalName": email,
-                "passwordProfile": {"forceChangePasswordNextSignIn": True, "password": password},
-            }
-            output = self.client.create_user(payload)
-            return ActionResult(action=action, detail="Graph user created", output=output)
-        if action == "grant_software_licenses":
-            if not self.sku_id:
-                raise ValueError("FLOWOPS_GRAPH_SKU_ID is required to assign licenses")
-            user_id = context.get("user_id") or context.get("graph_user_id")
-            if not user_id:
-                users = self.client.list_users(f"userPrincipalName eq '{email}'")
-                if not users:
-                    raise ValueError(f"Graph user not found: {email}")
-                user_id = users[0]["id"]
-            output = self.client.assign_license(str(user_id), self.sku_id)
-            return ActionResult(action=action, detail="Graph license assigned", output=output or {})
-        if action in ("disable_user_account", "revoke_software_licenses"):
-            user_id = context.get("user_id") or context.get("graph_user_id")
-            if not user_id:
-                users = self.client.list_users(f"userPrincipalName eq '{email}'")
-                if not users:
-                    raise ValueError(f"Graph user not found: {email}")
-                user_id = users[0]["id"]
-            output = self.client.request("PATCH", f"/users/{user_id}", json={"accountEnabled": False})
-            return ActionResult(action=action, detail="Graph user disabled", output=output or {})
-        raise ValueError(f"Graph client action is not implemented: {action!r}")
-
-
 class PowerAutomateAdapter:
     """POSTs sanitized checklist context to a Power Automate trigger."""
 
@@ -139,59 +77,217 @@ class PowerAutomateAdapter:
         return ActionResult(action=action, detail="Power Automate webhook accepted action")
 
 
+class PowerShellError(RuntimeError):
+    """A failed PowerShell action; ``retryable`` is False for bad input/config."""
+
+    def __init__(self, message: str, *, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+DEFAULT_POWERSHELL_SCRIPT = (
+    Path(__file__).resolve().parent.parent / "scripts" / "powershell" / "Invoke-FlowOpsAction.ps1"
+)
 
 
 class PowerShellAdapter:
-    """Executes checklist actions via PowerShell / Microsoft Graph PowerShell SDK.
+    """Runs ``Invoke-FlowOpsAction.ps1`` (Exchange Online) and parses its JSON.
 
-    Supports local pwsh execution, script templating, and dry-run execution
-    for safe testing without executing external processes.
+    The request goes to the script on stdin, so no user data is ever
+    interpolated into a command line. The script writes one JSON line;
+    exit code 2 means invalid input/configuration (not retried), any other
+    non-zero code is treated as transient.
     """
 
     def __init__(
         self,
         command_path: str = "pwsh",
         dry_run: bool = False,
-        timeout: float = 15.0,
+        timeout: float = 120.0,
+        script_path: str | None = None,
     ) -> None:
         self.command_path = command_path
         self.dry_run = dry_run
         self.timeout = timeout
+        self.script_path = str(script_path or DEFAULT_POWERSHELL_SCRIPT)
+
+    def command(self) -> list[str]:
+        args = [self.command_path, "-NoProfile", "-NonInteractive", "-File", self.script_path]
+        if self.dry_run:
+            args.append("-DryRun")
+        return args
 
     def execute(self, action: str, context: dict[str, Any]) -> ActionResult:
-        employee = context.get("employee_email", "unknown")
-        if self.dry_run:
-            return ActionResult(
-                action=action,
-                detail=f"simulated PowerShell execution '{action}' for {employee}",
-            )
-
-        import json
-        import subprocess
-
-        script = (
-            f"$input_json = $input | Out-String; "
-            f"Write-Output \"PowerShell executed action '{action}' for {employee}\""
-        )
-        payload = json.dumps({"action": action, "context": context})
+        payload = json.dumps({"action": action, "context": context}, default=str)
         try:
-            result = subprocess.run(
-                [self.command_path, "-NoProfile", "-NonInteractive", "-Command", script],
+            completed = subprocess.run(
+                self.command(),
                 input=payload,
                 capture_output=True,
                 text=True,
                 timeout=self.timeout,
-                check=True,
+                check=False,
             )
-            detail = result.stdout.strip() or f"PowerShell completed action '{action}'"
-            return ActionResult(action=action, detail=detail)
-        except subprocess.CalledProcessError as err:
-            err_msg = err.stderr.strip() if err.stderr else str(err)
-            raise RuntimeError(f"PowerShell execution failed: {err_msg}") from err
         except subprocess.TimeoutExpired as err:
-            raise RuntimeError(f"PowerShell action timed out after {self.timeout}s") from err
+            raise PowerShellError(f"PowerShell action timed out after {self.timeout}s") from err
         except FileNotFoundError as err:
-            raise RuntimeError(f"PowerShell executable not found at '{self.command_path}'") from err
+            raise PowerShellError(
+                f"PowerShell executable not found at '{self.command_path}'", retryable=False
+            ) from err
+        result = parse_powershell_output(completed.stdout)
+        if completed.returncode != 0 or result is None or result.get("status") != "ok":
+            detail = (result or {}).get("detail") or (completed.stderr or "").strip() or (
+                f"exit code {completed.returncode} with no JSON result"
+            )
+            raise PowerShellError(
+                f"PowerShell {action} failed: {detail}", retryable=completed.returncode != 2
+            )
+        return ActionResult(
+            action=action,
+            detail=str(result.get("detail") or f"PowerShell completed {action}"),
+            output=result.get("output") or {},
+        )
+
+
+def parse_powershell_output(stdout: str) -> dict[str, Any] | None:
+    """Return the last JSON object line in ``stdout`` (warnings may precede it)."""
+    for line in reversed((stdout or "").strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                parsed = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+    return None
+
+
+class MicrosoftGraphAdapter:
+    """Runs checklist actions against Microsoft Graph, one tenant at a time.
+
+    ``resolve(tenant_key)`` returns ``(GraphClient, TenantSettings)``, so the
+    same workflow runs across many customer tenants with different licence
+    SKUs and usage locations. Every action is idempotent: running it twice
+    finds the existing user/licence/state and reports a no-op.
+    """
+
+    EXCHANGE_ONLY_ACTIONS = frozenset({"archive_email_mailbox"})
+    NON_M365_ACTIONS = frozenset({"provision_hardware", "recover_hardware"})
+
+    def __init__(
+        self,
+        resolve: Callable[[str | None], Any],
+        *,
+        exchange_fallback: ActionAdapter | None = None,
+        default_sku: str = "O365_BUSINESS_PREMIUM",
+    ) -> None:
+        self.resolve = resolve
+        self.exchange_fallback = exchange_fallback
+        self.default_sku = default_sku
+
+    def execute(self, action: str, context: dict[str, Any]) -> ActionResult:
+        if action in self.NON_M365_ACTIONS:
+            return ActionResult(action=action, detail=f"'{action}' is a PSA/RMM task; no Graph call made")
+        if action in self.EXCHANGE_ONLY_ACTIONS:
+            if self.exchange_fallback is None:
+                from src.graph import GraphError
+
+                raise GraphError(
+                    f"'{action}' needs Exchange Online PowerShell; set FLOWOPS_POWERSHELL_PATH",
+                    code="ExchangeFallbackMissing",
+                    status_code=501,
+                )
+            result = self.exchange_fallback.execute(action, context)
+            return ActionResult(action=action, detail=f"via Exchange Online PowerShell: {result.detail}", output=result.output)
+        handler = getattr(self, f"_{action}", None)
+        if handler is None:
+            raise ValueError(f"No Microsoft Graph implementation for action {action!r}")
+        client, tenant = self.resolve(context.get("tenant_key"))
+        detail, output = handler(client, tenant, context)
+        output = {"tenant": tenant.key, **output}
+        return ActionResult(action=action, detail=f"[{tenant.key}] {detail}", output=output)
+
+    @staticmethod
+    def _upn(context: dict[str, Any]) -> str:
+        return str(context["employee_email"]).strip().lower()
+
+    def _create_user_account(self, client, tenant, context):
+        upn = self._upn(context)
+        existing = client.find_user(upn)
+        if existing:
+            return f"user {upn} already exists", {"user_id": existing["id"], "created": False}
+        user = client.create_user(
+            display_name=context.get("employee_name") or upn,
+            user_principal_name=upn,
+            department=context.get("department"),
+            usage_location=tenant.usage_location,
+        )
+        return f"created user {upn}", {"user_id": user.get("id"), "created": True}
+
+    def _grant_software_licenses(self, client, tenant, context):
+        from src.graph import GraphError, available_units
+
+        upn = self._upn(context)
+        user = client.require_user(upn)
+        part = context.get("licence_sku") or tenant.licence_sku or self.default_sku
+        sku = client.sku(part)
+        if any(lic.get("skuId") == sku["skuId"] for lic in user.get("assignedLicenses") or []):
+            return f"{part} already assigned to {upn}", {"sku": part, "assigned": False}
+        if available_units(sku) <= 0:
+            raise GraphError(
+                f"no free {part} licences in tenant {tenant.key}; buy more or free one up",
+                code="LicenceExhausted",
+                status_code=409,
+            )
+        if not user.get("usageLocation"):
+            if not tenant.usage_location:
+                raise GraphError(
+                    f"{upn} has no usageLocation and tenant {tenant.key} has no default",
+                    code="UsageLocationMissing",
+                    status_code=400,
+                )
+            client.update_user(user["id"], {"usageLocation": tenant.usage_location})
+        client.assign_licenses(user["id"], add=[sku["skuId"]])
+        return f"assigned {part} to {upn}", {"sku": part, "assigned": True}
+
+    def _configure_email_mailbox(self, client, tenant, context):
+        upn = self._upn(context)
+        user = client.require_user(upn)
+        settings = {
+            "timeZone": context.get("time_zone") or "UTC",
+            "language": {"locale": context.get("language") or "en-US"},
+        }
+        client.update_mailbox_settings(user["id"], settings)
+        return f"configured mailbox for {upn}", {"mailbox_settings": settings}
+
+    def _disable_user_account(self, client, tenant, context):
+        upn = self._upn(context)
+        user = client.require_user(upn)
+        if user.get("accountEnabled") is not False:
+            client.update_user(user["id"], {"accountEnabled": False})
+        client.revoke_sign_in_sessions(user["id"])
+        return f"disabled {upn} and revoked sessions", {"user_id": user["id"]}
+
+    def _revoke_software_licenses(self, client, tenant, context):
+        upn = self._upn(context)
+        user = client.require_user(upn)
+        skus = [lic["skuId"] for lic in user.get("assignedLicenses") or [] if lic.get("skuId")]
+        if skus:
+            client.assign_licenses(user["id"], remove=skus)
+        return f"removed {len(skus)} licence(s) from {upn}", {"removed_sku_ids": skus}
+
+
+def _truthy(value: str | None) -> bool:
+    return (value or "").lower() in ("true", "1", "yes")
+
+
+def _powershell_from_environment(values: dict[str, str] | Any) -> PowerShellAdapter:
+    return PowerShellAdapter(
+        command_path=values.get("FLOWOPS_POWERSHELL_PATH", "pwsh"),
+        dry_run=_truthy(values.get("FLOWOPS_POWERSHELL_DRY_RUN")),
+        script_path=values.get("FLOWOPS_POWERSHELL_SCRIPT") or None,
+    )
 
 
 def adapter_from_environment(environ: dict[str, str] | None = None) -> ActionAdapter:
@@ -205,29 +301,28 @@ def adapter_from_environment(environ: dict[str, str] | None = None) -> ActionAda
         if not url:
             raise ValueError("FLOWOPS_POWER_AUTOMATE_URL is required for power_automate")
         return PowerAutomateAdapter(url)
-    if name == "graph":
-        tenant = values.get("FLOWOPS_GRAPH_TENANT_ID")
-        client_id = values.get("FLOWOPS_GRAPH_CLIENT_ID")
-        client_secret = values.get("FLOWOPS_GRAPH_CLIENT_SECRET")
-        if tenant and client_id and client_secret:
-            from src.graph import GraphClient
-            return GraphClientActionAdapter(
-                GraphClient(tenant_id=tenant, client_id=client_id, client_secret=client_secret,
-                            base_url=values.get("FLOWOPS_GRAPH_URL", "https://graph.microsoft.com/v1.0")),
-                sku_id=values.get("FLOWOPS_GRAPH_SKU_ID", ""),
+    if name in ("graph", "graph_simulated"):
+        from src.tenants import GraphClientFactory
+
+        simulated = name == "graph_simulated"
+        has_secret = values.get("FLOWOPS_GRAPH_CLIENT_ID") and values.get("FLOWOPS_GRAPH_CLIENT_SECRET")
+        if not simulated and not (values.get("FLOWOPS_GRAPH_ACCESS_TOKEN") or has_secret):
+            raise ValueError(
+                "graph needs FLOWOPS_GRAPH_CLIENT_ID + FLOWOPS_GRAPH_CLIENT_SECRET "
+                "(client credentials) or FLOWOPS_GRAPH_ACCESS_TOKEN"
             )
-        url = values.get("FLOWOPS_GRAPH_URL", "https://graph.microsoft.com/v1.0")
-        token = values.get("FLOWOPS_GRAPH_ACCESS_TOKEN")
-        if not token:
-            raise ValueError("Set graph client credentials or FLOWOPS_GRAPH_ACCESS_TOKEN")
-        return MicrosoftGraphAdapter(url, token)
-    if name == "connectwise_mock":
-        from src.connectwise import ConnectWiseMockAdapter
-        return ConnectWiseMockAdapter(base_url=values.get("FLOWOPS_CONNECTWISE_URL", "https://api.connectwise.com"))
+        fallback: ActionAdapter | None = None
+        if simulated:
+            fallback = PowerShellAdapter(dry_run=True)
+        elif values.get("FLOWOPS_POWERSHELL_PATH") or values.get("FLOWOPS_EXO_APP_ID"):
+            fallback = _powershell_from_environment(values)
+        return MicrosoftGraphAdapter(
+            GraphClientFactory(dict(values), simulated=simulated),
+            exchange_fallback=fallback,
+            default_sku=values.get("FLOWOPS_GRAPH_DEFAULT_SKU") or "O365_BUSINESS_PREMIUM",
+        )
     if name == "powershell":
-        command_path = values.get("FLOWOPS_POWERSHELL_PATH", "pwsh")
-        dry_run = values.get("FLOWOPS_POWERSHELL_DRY_RUN", "").lower() in ("true", "1", "yes")
-        return PowerShellAdapter(command_path=command_path, dry_run=dry_run)
+        return _powershell_from_environment(values)
     raise ValueError(f"Unsupported FLOWOPS_ACTION_ADAPTER: {name!r}")
 
 

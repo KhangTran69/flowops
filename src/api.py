@@ -6,46 +6,33 @@ onboarding/offboarding checklists, idempotency keys, and delivery retries;
 the v1.0 preview keeps failed webhook deliveries in a retryable outbox.
 """
 
-import hashlib
-import html
 import json
 import os
-import secrets
 import threading
 import time
 import uuid
 from collections import Counter
-from dataclasses import replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Optional
 from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi import status as http_status
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, field_validator
+from pydantic import BaseModel
 from sqlalchemy import and_, delete, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.dialects.postgresql import insert as postgres_insert
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
-from src import ai_agent, db, jobs, ui_session, web  # noqa: F401 - modules referenced at runtime
-from src import ai_agent, chatops, db, jobs, scheduler, ui_session, web, workflow, workflow_control
-from src import ai_agent, chatops, db, definitions, jobs, scheduler, timers, triggers, ui_session, web, workflow, workflow_control
+from src import ai_agent, chatops, db, definitions, idempotency, jobs, logging_config, metrics, scheduler, timers, ui_session, web, workflow, workflow_control
 from src.actions import (
-    ACTION_BY_STEP,
     ActionAdapter,
-    ActionResult,
-    SimulatedMicrosoftAdapter,
     action_for_step,
     adapter_from_environment,
 )
 from src.auth import (
-    AuthenticationError,
     Actor,
-    authenticate_bearer,
     validate_auth_configuration,
 )
 from src.m365_simulator import M365Simulator
@@ -53,18 +40,55 @@ from src.notify import deliver_webhook
 from src.onboarding import checklist_for, initial_status_for
 from src.routing import route_ticket
 from src.ticket_processor import normalize_ticket
+from src.deps import (
+    _local_ui_actor,
+    _actor_from_header,
+    _operator_actor,
+    _admin_actor,
+    _webhook_actor,
+    _new_run_id,
+    _RATE_LIMIT_BUCKETS,  # noqa: F401  (re-exported for tests)
+)
+from src.schemas import (
+    TicketIntakeRequest,
+    Ticket,
+    KnowledgeBaseArticleOut,
+    KnowledgeBaseMatchOut,
+    AISummaryOut,
+    AIRecommendationOut,
+    AITriageOut,
+    AIApplyRequest,
+    AIApplyOut,
+    WorkflowJobOut,
+    ExecutionLogOut,
+    ActionExecutionOut,
+    ChecklistItemOut,
+    DefinitionCreateIn,
+    DefinitionVersionIn,
+    DefinitionPublishIn,
+    DefinitionMigrationIn,
+    DefinitionVersionOut,
+    WorkflowDefinitionOut,
+    OnboardingRequestIn,
+    OnboardingRequestOut,
+    WorkflowStepRunOut,
+    WorkflowEventOut,
+    WorkflowRunOut,
+    OnboardingStatusSummaryOut,
+    OffboardingStepResultOut,
+    OffboardingCompletionOut,
+    M365StatusOut,
+    NotificationOutboxOut,
+)
 
 ACTION_ADAPTER: ActionAdapter = adapter_from_environment()
 AI_ADAPTER: ai_agent.AIAdapter = ai_agent.adapter_from_environment()
 DEFAULT_ACTION_ATTEMPTS = 3
 DEFAULT_NOTIFICATION_MAX_ATTEMPTS = 5
 IDEMPOTENCY_PROCESSING_TIMEOUT = timedelta(minutes=5)
-IDEMPOTENCY_SCOPE_TICKET = "ticket"
-IDEMPOTENCY_SCOPE_ONBOARDING = "onboarding"
-IDEMPOTENCY_REPLAY_ACTIONS = {
-    IDEMPOTENCY_SCOPE_TICKET: "ticket.idempotent_replay",
-    IDEMPOTENCY_SCOPE_ONBOARDING: "onboarding.request.idempotent_replay",
-}
+IDEMPOTENCY_SCOPE_TICKET = idempotency.SCOPE_TICKET
+IDEMPOTENCY_SCOPE_ONBOARDING = idempotency.SCOPE_ONBOARDING
+IDEMPOTENCY_REPLAY_ACTIONS = idempotency.REPLAY_ACTIONS
 
 
 def _action_attempts(action: str) -> int:
@@ -131,128 +155,16 @@ app.mount(
 )
 
 
-def _local_ui_actor() -> Actor:
-    return Actor(
-        subject="local-development",
-        roles=("automation.operator", "automation.admin"),
-        source="local",
-    )
-
-
-def _actor_from_header(
-    request: Request,
-    authorization: Optional[str] = Header(default=None),
-) -> Actor:
-    """Resolve a bearer actor or an authenticated browser session."""
-    if authorization:
-        try:
-            actor = authenticate_bearer(authorization)
-        except AuthenticationError as error:
-            raise HTTPException(status_code=401, detail=str(error)) from error
-        return replace(actor, source="bearer")
-    session = ui_session.read_session(request)
-    if session is not None:
-        return ui_session.actor_from_session(session)
-    try:
-        actor = authenticate_bearer(None)
-    except AuthenticationError as error:
-        raise HTTPException(status_code=401, detail=str(error)) from error
-    if ui_session.ui_auth_required() and actor.source == "local":
-        raise HTTPException(status_code=401, detail="Authentication required.")
-    return actor
-
-
-def _enforce_csrf(request: Optional[Request], actor: Actor) -> None:
-    """CSRF applies only to cookie-authenticated browser mutations."""
-    if request is None or actor.source != "session":
-        return
-    if request.method in ("GET", "HEAD", "OPTIONS"):
-        return
-    session = ui_session.read_session(request)
-    if session is None or not ui_session.csrf_matches(request, session):
-        raise HTTPException(
-            status_code=403,
-            detail="CSRF token missing or invalid; refresh and retry.",
-        )
-
-
-def _operator_actor(
-    request: Request,
-    actor: Actor = Depends(_actor_from_header),
-) -> Actor:
-    if not {"automation.operator", "automation.admin"} & set(actor.roles):
-        raise HTTPException(status_code=403, detail="Operator role is required.")
-    _enforce_csrf(request, actor)
-    _enforce_rate_limit(f"actor:{actor.subject}")
-    return actor
-
-
-def _admin_actor(
-    request: Request,
-    actor: Actor = Depends(_actor_from_header),
-) -> Actor:
-    if "automation.admin" not in actor.roles:
-        raise HTTPException(status_code=403, detail="Admin role is required.")
-    _enforce_csrf(request, actor)
-    _enforce_rate_limit(f"actor:{actor.subject}")
-    return actor
-
-
-def _webhook_actor(
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
-) -> str:
-    expected = os.environ.get("FLOWOPS_WEBHOOK_API_KEY")
-    if expected and x_api_key != expected:
-        raise HTTPException(status_code=401, detail="Invalid webhook API key.")
-    _enforce_rate_limit("webhook:intake")
-    return "webhook-api-key" if expected else "local-development"
-
-
-_METRICS_LOCK = threading.Lock()
-_METRICS: dict[tuple[str, str, int], int] = {}
-_METRICS_STARTED = time.time()
-_AI_METRICS_LOCK = threading.Lock()
-_AI_TRIAGE: dict[tuple[str, str], int] = {}
-_AI_APPLY: dict[str, int] = {}
-_AI_PROVIDER_ERRORS: dict[str, int] = {}
-_TRIGGER_METRICS_LOCK = threading.Lock()
-_TRIGGER_DELIVERIES: dict[tuple[str, str], int] = {}
-_TRIGGER_PROCESSING_SECONDS: list[float] = []
-
-
 def _ai_provider_name() -> str:
     return str(getattr(AI_ADAPTER, "provider", getattr(AI_ADAPTER, "name", "unknown")))
 
 
-def _record_ai_triage(adapter: str, outcome: str) -> None:
-    with _AI_METRICS_LOCK:
-        key = (adapter, outcome)
-        _AI_TRIAGE[key] = _AI_TRIAGE.get(key, 0) + 1
-
-
-def _record_ai_apply(field: str) -> None:
-    with _AI_METRICS_LOCK:
-        _AI_APPLY[field] = _AI_APPLY.get(field, 0) + 1
-
-
-def _record_ai_provider_error(provider: str) -> None:
-    with _AI_METRICS_LOCK:
-        _AI_PROVIDER_ERRORS[provider] = _AI_PROVIDER_ERRORS.get(provider, 0) + 1
-
-
-def _record_trigger_delivery(trigger_key: str, status: str, duration_seconds: float) -> None:
-    with _TRIGGER_METRICS_LOCK:
-        key = (trigger_key, status)
-        _TRIGGER_DELIVERIES[key] = _TRIGGER_DELIVERIES.get(key, 0) + 1
-        _TRIGGER_PROCESSING_SECONDS.append(duration_seconds)
-        if len(_TRIGGER_PROCESSING_SECONDS) > 1000:
-            _TRIGGER_PROCESSING_SECONDS[:] = _TRIGGER_PROCESSING_SECONDS[-1000:]
-
-
-def _record_request(method: str, route: str, status_code: int, duration: float) -> None:
-    key = (method, route, status_code)
-    with _METRICS_LOCK:
-        _METRICS[key] = _METRICS.get(key, 0) + 1
+# In-process HTTP/AI counters live in src.metrics; these thin wrappers keep the
+# call sites (and any monkeypatching in tests) stable.
+_record_ai_triage = metrics.record_ai_triage
+_record_ai_apply = metrics.record_ai_apply
+_record_ai_provider_error = metrics.record_ai_provider_error
+_record_request = metrics.record_request
 
 
 @app.middleware("http")
@@ -285,32 +197,6 @@ async def correlation_and_metrics(request: Request, call_next):
     return response
 
 
-_RATE_LIMIT_LOCK = threading.Lock()
-_RATE_LIMIT_BUCKETS: dict[str, tuple[float, int]] = {}
-
-
-def _enforce_rate_limit(actor_key: str) -> None:
-    """Simple in-process token bucket for the prototype (disabled by default)."""
-    try:
-        limit = int(os.environ.get("FLOWOPS_RATE_LIMIT_PER_MINUTE", "0") or 0)
-    except ValueError:
-        limit = 0
-    if limit <= 0:
-        return
-    now = time.monotonic()
-    with _RATE_LIMIT_LOCK:
-        window_start, count = _RATE_LIMIT_BUCKETS.get(actor_key, (now, 0))
-        if now - window_start >= 60:
-            window_start, count = now, 0
-        if count >= limit:
-            raise HTTPException(
-                status_code=429,
-                detail="Rate limit exceeded; retry later.",
-                headers={"Retry-After": "60"},
-            )
-        _RATE_LIMIT_BUCKETS[actor_key] = (window_start, count + 1)
-
-
 @app.on_event("startup")
 def _validate_auth_on_startup() -> None:
     validate_auth_configuration()
@@ -327,661 +213,26 @@ def auth_me(actor: Actor = Depends(_actor_from_header)) -> dict:
     }
 
 
-def _new_run_id() -> str:
-    return uuid.uuid4().hex[:12]
+# ---------------------------------------------------------------------------
+# Idempotency protocol helpers. The implementation lives in src.idempotency so
+# the ticket and onboarding routes share one fenced reservation protocol;
+# these module-level aliases keep existing call sites and tests stable.
 
-
-# Recovery lease for in-flight idempotency reservations (README: abandoned
-# requests can be reclaimed after five minutes). Used by the claim/takeover
-# logic below and by _reservation_is_stale().
-IDEMPOTENCY_PROCESSING_TIMEOUT = timedelta(minutes=5)
-
-
-def _request_fingerprint(request: BaseModel) -> str:
-    """Return a stable SHA-256 of a validated request body."""
-    return hashlib.sha256(
-        json.dumps(request.model_dump(), sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-
-
-def _validate_idempotency_key(key: Optional[str]) -> None:
-    if key is not None and len(key) > 128:
-        raise HTTPException(
-            status_code=422, detail="Idempotency-Key must be at most 128 characters."
-        )
-
-
-def _stored_resource_type(payload: dict[str, Any]) -> str:
-    """Legacy records predate resource scoping and are ticket reservations."""
-    return payload.get("resource_type", IDEMPOTENCY_SCOPE_TICKET)
-
-
-def _claim_idempotency_key(
-    session: Session,
-    key: str,
-    resource_id: str,
-    request_hash: str,
-    resource_type: str,
-) -> Optional[str]:
-    """Atomically claim a key or take over an expired processing reservation.
-
-    Returns a fresh fencing token when this request owns the reservation, or
-    ``None`` when another request owns it. A takeover replaces the token and
-    refreshes the lease timestamp in the same upsert, so the previous owner
-    loses the ability to finalize or remove the reservation.
-    """
-    table = db.IdempotencyRecord.__table__
-    now = db.utcnow()
-    stale_before = now - IDEMPOTENCY_PROCESSING_TIMEOUT
-    owner_token = uuid.uuid4().hex
-    values = {
-        "key": key,
-        "ticket_id": resource_id,
-        "response_json": json.dumps(
-            {
-                "request_hash": request_hash,
-                "state": "processing",
-                "resource_type": resource_type,
-            },
-            separators=(",", ":"),
-        ),
-        "owner_token": owner_token,
-        "resource_type": resource_type,
-        "created_at": now,
-    }
-    scope_matches = table.c.resource_type == resource_type
-    if resource_type == IDEMPOTENCY_SCOPE_TICKET:
-        # Reservations created before scoping existed are ticket reservations.
-        scope_matches = or_(scope_matches, table.c.resource_type.is_(None))
-    takeover = and_(
-        table.c.created_at < stale_before,
-        table.c.response_json.like('%"state":"processing"%'),
-        scope_matches,
-    )
-    set_values = {
-        "ticket_id": resource_id,
-        "response_json": values["response_json"],
-        "owner_token": owner_token,
-        "resource_type": resource_type,
-        "created_at": now,
-    }
-    dialect = session.get_bind().dialect.name
-    if dialect == "sqlite":
-        statement = sqlite_insert(table).values(**values).on_conflict_do_update(
-            index_elements=[table.c.key],
-            set_=set_values,
-            where=takeover,
-        )
-        # SQLite reports 1 for both the insert and the takeover update.
-        claimed = session.execute(statement).rowcount == 1
-    elif dialect == "postgresql":
-        statement = (
-            postgres_insert(table)
-            .values(**values)
-            .on_conflict_do_update(
-                index_elements=[table.c.key],
-                set_=set_values,
-                where=takeover,
-            )
-            .returning(table.c.owner_token)
-        )
-        # psycopg reports -1 for this upsert, so confirm the claim through the
-        # RETURNING row instead of relying on a driver-specific rowcount.
-        claimed = session.execute(statement).scalar_one_or_none() == owner_token
-    else:
-        raise RuntimeError(f"Idempotency reservations do not support database dialect {dialect!r}.")
-
-    session.commit()
-    return owner_token if claimed else None
-
-
-def _complete_idempotency_key(
-    session: Session,
-    key: str,
-    owner_token: str,
-    request_hash: str,
-    resource_type: str,
-    resource_id: str,
-    completion: dict[str, Any],
-) -> bool:
-    """Store the completed response only if this request still owns the key.
-
-    The conditional update runs in the same transaction as the resource and
-    execution-log writes, so losing the fencing token rolls all of them back
-    instead of committing a duplicate durable result.
-    """
-    table = db.IdempotencyRecord.__table__
-    payload = {
-        "request_hash": request_hash,
-        "state": "completed",
-        "resource_type": resource_type,
-        **completion,
-    }
-    result = session.execute(
-        update(table)
-        .where(
-            and_(
-                table.c.key == key,
-                table.c.owner_token == owner_token,
-                table.c.resource_type == resource_type,
-                table.c.response_json.like('%"state":"processing"%'),
-            )
-        )
-        .values(
-            ticket_id=resource_id,
-            response_json=json.dumps(payload, separators=(",", ":")),
-        )
-    )
-    return result.rowcount == 1
-
-
-def _release_idempotency_key(
-    session: Session, key: str, owner_token: str
-) -> bool:
-    """Delete a failed request's reservation, but only while it still owns it."""
-    table = db.IdempotencyRecord.__table__
-    result = session.execute(
-        delete(table).where(
-            and_(
-                table.c.key == key,
-                table.c.owner_token == owner_token,
-                table.c.response_json.like('%"state":"processing"%'),
-            )
-        )
-    )
-    released = result.rowcount == 1
-    if released:
-        session.commit()
-    else:
-        session.rollback()
-    return released
-
-
-def _reservation_is_stale(created_at: datetime) -> bool:
-    """Return whether a processing reservation has exceeded its recovery lease."""
-    if created_at.tzinfo is None:
-        created_at = created_at.replace(tzinfo=timezone.utc)
-    return created_at < db.utcnow() - IDEMPOTENCY_PROCESSING_TIMEOUT
-
-
-def _replay_stored_response(
-    stored: db.IdempotencyRecord,
-    payload: dict[str, Any],
-    request_hash: str,
-    resource_type: str,
-    response: Response,
-    session: Session,
-) -> dict[str, Any]:
-    """Validate and replay a stored completed response, or return a 409."""
-    if _stored_resource_type(payload) != resource_type:
-        raise HTTPException(
-            status_code=409,
-            detail="Idempotency-Key was already used for a different resource type.",
-        )
-    if payload.get("request_hash") != request_hash:
-        raise HTTPException(
-            status_code=409,
-            detail="Idempotency-Key was already used with a different request.",
-        )
-    if payload.get("state") == "processing":
-        raise HTTPException(
-            status_code=409,
-            detail="A request with this Idempotency-Key is still processing.",
-        )
-    response.status_code = http_status.HTTP_200_OK
-    response.headers["Idempotency-Replayed"] = "true"
-    db.log_execution(
-        session,
-        run_id=_new_run_id(),
-        action=IDEMPOTENCY_REPLAY_ACTIONS[resource_type],
-        status="success",
-        ticket_id=stored.ticket_id,
-        detail="replayed stored response without re-executing",
-    )
-    return payload
-
-
-def _reserve_idempotency_key(
-    session: Session,
-    response: Response,
-    key: Optional[str],
-    request_hash: str,
-    resource_type: str,
-    resource_id: str,
-) -> tuple[Optional[str], Optional[dict[str, Any]]]:
-    """Claim a reservation or return a completed stored response.
-
-    Returns ``(owner_token, None)`` for a new claim and ``(None, payload)`` for
-    a replay. Active, changed-payload, and cross-resource requests raise 409.
-    """
-    if not key:
-        return None, None
-    stored = session.get(db.IdempotencyRecord, key)
-    if stored is not None:
-        payload = json.loads(stored.response_json)
-        if _stored_resource_type(payload) != resource_type:
-            raise HTTPException(
-                status_code=409,
-                detail="Idempotency-Key was already used for a different resource type.",
-            )
-        if payload.get("state") == "processing":
-            if payload.get("request_hash") != request_hash:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Idempotency-Key was already used with a different request.",
-                )
-            if not _reservation_is_stale(stored.created_at):
-                return None, _replay_stored_response(
-                    stored, payload, request_hash, resource_type, response, session
-                )
-            owner_token = _claim_idempotency_key(
-                session, key, resource_id, request_hash, resource_type
-            )
-        else:
-            return None, _replay_stored_response(
-                stored, payload, request_hash, resource_type, response, session
-            )
-    else:
-        owner_token = _claim_idempotency_key(
-            session, key, resource_id, request_hash, resource_type
-        )
-    if owner_token is None:
-        session.expire_all()
-        stored = session.get(db.IdempotencyRecord, key)
-        if stored is None:
-            raise HTTPException(
-                409, "Unable to claim this Idempotency-Key; retry the request."
-            )
-        payload = json.loads(stored.response_json)
-        return None, _replay_stored_response(
-            stored, payload, request_hash, resource_type, response, session
-        )
-    return owner_token, None
+IDEMPOTENCY_PROCESSING_TIMEOUT = idempotency.PROCESSING_TIMEOUT
+_fingerprint_payload = idempotency.fingerprint_payload
+_request_fingerprint = idempotency.request_fingerprint
+_validate_idempotency_key = idempotency.validate_idempotency_key
+_stored_resource_type = idempotency._stored_resource_type
+_claim_idempotency_key = idempotency.claim_key
+_complete_idempotency_key = idempotency.complete_key
+_release_idempotency_key = idempotency.release_key
+_reservation_is_stale = idempotency._reservation_is_stale
+_replay_stored_response = idempotency.replay_stored_response
+_reserve_idempotency_key = idempotency.reserve_key
 
 
 # ---------------------------------------------------------------------------
 # Schemas
-
-
-class TicketIntakeRequest(BaseModel):
-    """Incoming ticket in the source format (same schema as the sample API)."""
-
-    userId: StrictInt = Field(ge=1, description="ID of the requester.")
-    id: StrictInt = Field(ge=1, description="Upstream ticket ID.")
-    title: StrictStr = Field(description="Short ticket description.")
-    completed: StrictBool = Field(description="Whether the upstream item is done.")
-
-    @field_validator("title")
-    @classmethod
-    def title_must_not_be_blank(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("title must be a non-empty string")
-        return value
-
-
-class Ticket(BaseModel):
-    """Normalized internal ticket format (also the API response shape)."""
-
-    ticket_id: str
-    requester_id: int
-    title: str
-    status: Literal["open", "closed"]
-    priority: str
-    category: Optional[str] = None
-    queue: Optional[str] = None
-
-
-class KnowledgeBaseArticleOut(BaseModel):
-    id: str
-    title: str
-    category: str
-    keywords: list[str]
-    steps: list[str]
-    summary: str
-
-
-class KnowledgeBaseMatchOut(BaseModel):
-    article: KnowledgeBaseArticleOut
-    score: int
-
-
-class AISummaryOut(BaseModel):
-    text: str
-    requester_id: int
-    title: str
-    status: str
-    priority: str
-    category: Optional[str] = None
-    queue: Optional[str] = None
-    urgency_signals: list[str]
-    history_count: int
-
-
-class AIRecommendationOut(BaseModel):
-    id: str
-    kind: str
-    title: str
-    current: Optional[str] = None
-    suggested: Optional[str] = None
-    rationale: str
-    confidence: int
-    applicable: bool
-
-
-class AITriageOut(BaseModel):
-    ticket_id: str
-    summary: AISummaryOut
-    knowledge_base: list[KnowledgeBaseMatchOut]
-    recommendations: list[AIRecommendationOut]
-    adapter: str
-    generated_at: datetime
-
-
-class AIApplyRequest(BaseModel):
-    recommendation_ids: list[StrictStr] = Field(min_length=1)
-
-
-class AIApplyOut(BaseModel):
-    ticket: Ticket
-    applied: list[str]
-
-
-class WorkflowJobOut(BaseModel):
-    """Durable workflow queue entry exposed to operators."""
-
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    job_type: str
-    status: str
-    attempts: int
-    max_attempts: int
-    available_at: datetime
-    last_error: Optional[str] = None
-    resource_type: Optional[str] = None
-    resource_id: Optional[str] = None
-    label: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
-    completed_at: Optional[datetime] = None
-
-
-class ExecutionLogOut(BaseModel):
-    id: int
-    run_id: str
-    action: str
-    status: str
-    ticket_id: Optional[str] = None
-    duration_ms: int
-    detail: Optional[str] = None
-    actor_subject: Optional[str] = None
-    correlation_id: Optional[str] = None
-    created_at: datetime
-
-
-class ActionExecutionOut(BaseModel):
-    id: int
-    request_id: int
-    checklist_item_id: int
-    action: str
-    actor_subject: Optional[str] = None
-    adapter: str
-    correlation_id: str
-    attempt: int
-    status: str
-    error_category: Optional[str] = None
-    error_detail: Optional[str] = None
-    external_reference: Optional[str] = None
-    started_at: datetime
-    completed_at: Optional[datetime] = None
-    duration_ms: Optional[int] = None
-class ChecklistItemOut(BaseModel):
-    id: int
-    step: str
-    # v0.6.1: stable identifier for the step; None on rows created before
-    # this change existed (they predate the offboarding completion ledger).
-    step_key: Optional[str] = None
-    queue: str
-    requires_approval: bool
-    status: str
-    action: Optional[str] = None
-    result: Optional[dict | list | str | int | float | bool | None] = None
-    depends_on: list[str] = []
-    output: Optional[dict] = None
-    join_mode: str = "all"
-    when: list[str] = []
-    sla_minutes: Optional[int] = None
-    overdue: bool = False
-    sla_remaining_minutes: Optional[int] = None
-
-
-
-
-class DefinitionCreateIn(BaseModel):
-    key: StrictStr
-    name: StrictStr
-    request_type: Literal["onboarding", "offboarding"]
-    steps: list[dict[str, Any]]
-
-
-class DefinitionVersionIn(BaseModel):
-    steps: list[dict[str, Any]]
-
-
-class DefinitionPublishIn(BaseModel):
-    version: StrictInt = Field(ge=1)
-
-
-class DefinitionMigrationIn(BaseModel):
-    version: StrictInt = Field(ge=1)
-    dry_run: StrictBool = True
-
-
-class DefinitionVersionOut(BaseModel):
-    version: int
-    checksum: str
-    steps: list[dict[str, Any]]
-    created_by: Optional[str] = None
-    created_at: datetime
-    published_at: Optional[datetime] = None
-
-
-class WorkflowDefinitionOut(BaseModel):
-    key: str
-    name: str
-    request_type: str
-    status: str
-    current_version: Optional[int] = None
-    versions: list[DefinitionVersionOut] = []
-
-
-class OnboardingRequestIn(BaseModel):
-    """A manager's onboarding/offboarding request (v0.5)."""
-
-    request_type: Literal["onboarding", "offboarding"]
-    employee_name: StrictStr
-    employee_email: StrictStr
-    department: StrictStr
-    requester_id: StrictInt = Field(ge=1)
-    start_date: Optional[StrictStr] = Field(
-        default=None, description="ISO date (YYYY-MM-DD) the employee starts or leaves."
-    )
-    definition_key: Optional[StrictStr] = Field(
-        default=None, description="Optional published workflow definition key."
-    )
-    definition_version: Optional[StrictInt] = Field(
-        default=None, ge=1, description="Optional pinned definition version."
-    )
-    template: Optional[StrictStr] = Field(
-        default=None,
-        description="Optional named workflow template (e.g. onboarding-dag).",
-    )
-
-    @field_validator("employee_name", "department")
-    @classmethod
-    def not_blank(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("must be a non-empty string")
-        return value
-
-    @field_validator("employee_email")
-    @classmethod
-    def must_look_like_email(cls, value: str) -> str:
-        if "@" not in value or " " in value:
-            raise ValueError("employee_email must be a valid email address")
-        return value.lower()
-
-    @field_validator("start_date")
-    @classmethod
-    def iso_date(cls, value: Optional[str]) -> Optional[str]:
-        import re
-
-        if value is not None:
-            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
-                raise ValueError("start_date must be an ISO date (YYYY-MM-DD)")
-            try:
-                date.fromisoformat(value)
-            except ValueError as error:
-                raise ValueError("start_date must be a valid calendar date") from error
-        return value
-
-
-class OnboardingRequestOut(BaseModel):
-    id: int
-    request_type: str
-    employee_name: str
-    employee_email: str
-    department: str
-    requester_id: int
-    start_date: Optional[str] = None
-    status: str
-    definition_key: Optional[str] = None
-    definition_version: Optional[int] = None
-    checklist: list[ChecklistItemOut]
-
-
-class WorkflowStepRunOut(BaseModel):
-    id: int
-    checklist_item_id: int
-    attempt: int
-    status: str
-    job_id: Optional[int] = None
-    scheduled_at: datetime
-    started_at: Optional[datetime] = None
-    completed_at: Optional[datetime] = None
-    output: Optional[dict] = None
-    error: Optional[str] = None
-
-
-class WorkflowEventOut(BaseModel):
-    id: int
-    event_type: str
-    step_run_id: Optional[int] = None
-    payload: Optional[dict] = None
-    created_at: datetime
-
-
-class WorkflowRunOut(BaseModel):
-    id: int
-    request_id: int
-    status: str
-    max_parallel: int
-    error: Optional[str] = None
-    created_at: datetime
-    started_at: Optional[datetime] = None
-    completed_at: Optional[datetime] = None
-    steps: list[WorkflowStepRunOut] = []
-    events: list[WorkflowEventOut] = []
-
-
-class OnboardingStatusSummaryOut(BaseModel):
-    id: int
-    request_type: str
-    employee_name: str
-    status: str
-    total_steps: int
-    completed_steps: int
-    pending_approval_steps: int
-    percent_complete: int
-
-
-# ---------------------------------------------------------------------------
-# Trigger schemas (v1.4)
-
-
-class EventSourceCreateIn(BaseModel):
-    key: StrictStr = Field(description="Unique identifier for the source.")
-    name: StrictStr = Field(description="Human-readable name.")
-    secret: StrictStr = Field(description="Shared secret for HMAC signature verification.")
-
-
-class EventSourceOut(BaseModel):
-    key: str
-    name: str
-    active: bool
-    created_at: datetime
-
-
-class TriggerCreateIn(BaseModel):
-    key: StrictStr = Field(description="Unique identifier for the trigger.")
-    name: StrictStr = Field(description="Human-readable name.")
-    source_key: StrictStr = Field(description="Event source key.")
-    event_type: StrictStr = Field(description="Event type to match.")
-    target_type: StrictStr = Field(description="Target: onboarding_request, offboarding_request, or ticket.")
-    definition_key: Optional[StrictStr] = Field(default=None, description="Definition key for onboarding/offboarding.")
-    mapping_json: dict[str, Any] = Field(description="Mapping from event to request fields.")
-    schedule_kind: StrictStr = Field(default="webhook", description="webhook, interval, or daily.")
-    interval_seconds: Optional[StrictInt] = Field(default=None, description="Interval in seconds for interval schedules.")
-    daily_at_utc: Optional[StrictStr] = Field(default=None, description="HH:MM UTC for daily schedules.")
-
-    @field_validator("target_type")
-    @classmethod
-    def valid_target_type(cls, value: str) -> str:
-        if value not in triggers.VALID_TARGET_TYPES:
-            raise ValueError(f"target_type must be one of {triggers.VALID_TARGET_TYPES}")
-        return value
-
-    @field_validator("schedule_kind")
-    @classmethod
-    def valid_schedule_kind(cls, value: str) -> str:
-        if value not in triggers.VALID_SCHEDULE_KINDS:
-            raise ValueError(f"schedule_kind must be one of {triggers.VALID_SCHEDULE_KINDS}")
-        return value
-
-
-class TriggerUpdateIn(BaseModel):
-    name: Optional[StrictStr] = None
-    active: Optional[StrictBool] = None
-    mapping_json: Optional[dict[str, Any]] = None
-
-
-class TriggerOut(BaseModel):
-    key: str
-    name: str
-    source_key: str
-    event_type: str
-    target_type: str
-    definition_key: Optional[str] = None
-    mapping_json: dict[str, Any]
-    schedule_kind: str
-    interval_seconds: Optional[int] = None
-    daily_at_utc: Optional[str] = None
-    active: bool
-    last_fired_at: Optional[datetime] = None
-    created_at: datetime
-    updated_at: datetime
-
-
-class TriggerDeliveryOut(BaseModel):
-    id: int
-    trigger_key: str
-    event_id: str
-    payload: dict[str, Any]
-    status: str
-    request_id: Optional[str] = None
-    error: Optional[str] = None
-    received_at: datetime
-    processed_at: Optional[datetime] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1045,10 +296,12 @@ def _process_intake(
     record = session.get(db.TicketRecord, ticket["ticket_id"])
     created = record is None
     if created:
-        session.add(db.TicketRecord(**ticket))
+        session.add(db.TicketRecord(**ticket, tenant_key=request.tenant))
     else:
         for field, value in ticket.items():
             setattr(record, field, value)
+        if request.tenant:
+            record.tenant_key = request.tenant
     session.flush()
 
     action = "ticket.created" if created else "ticket.updated"
@@ -1071,127 +324,6 @@ def _process_intake(
 # Routes: service
 
 
-def _site_stats(session: Session) -> dict[str, int]:
-    """Small aggregate snapshot used by the landing page."""
-    tickets = session.execute(select(db.TicketRecord)).scalars().all()
-    outbox = session.execute(select(db.NotificationOutboxRecord)).scalars().all()
-    onboarding = session.execute(select(db.OnboardingRequestRecord)).scalars().all()
-    return {
-        "tickets": len(tickets),
-        "open_tickets": sum(1 for ticket in tickets if ticket.status == "open"),
-        "auto_routed": sum(
-            1 for ticket in tickets if ticket.queue and ticket.queue != "it-service-desk"
-        ),
-        "onboarding_requests": len(onboarding),
-        "pending_notifications": sum(1 for item in outbox if item.status == "pending"),
-        "failed_notifications": sum(1 for item in outbox if item.status == "failed"),
-    }
-
-
-@app.get("/login", response_class=HTMLResponse, include_in_schema=False)
-def login_page(
-    request: Request,
-    next: str = Query(default=""),
-    error: str = Query(default=""),
-) -> Response:
-    """Render the local token login page."""
-    if not ui_session.ui_auth_required():
-        return RedirectResponse("/dashboard", status_code=303)
-    if ui_session.read_session(request) is not None:
-        return RedirectResponse(ui_session.safe_next(next), status_code=303)
-    return web.render(
-        request,
-        "login.html",
-        {
-            "active": "login",
-            "next": ui_session.safe_next(next),
-            "error": error,
-        },
-    )
-
-
-@app.post("/login", response_class=HTMLResponse, include_in_schema=False)
-def login_submit(
-    request: Request,
-    username: str = Form(default=""),
-    password: str = Form(default=""),
-    next: str = Form(default=""),
-    db_session: Session = Depends(db.get_session),
-) -> Response:
-    """Validate the admin username and password and create a signed browser session."""
-    if not ui_session.ui_auth_required():
-        return RedirectResponse("/dashboard", status_code=303)
-    actor = ui_session.authenticate_admin(username.strip(), password)
-    if actor is None:
-        return web.render(
-            request,
-            "login.html",
-            {
-                "active": "login",
-                "next": ui_session.safe_next(next),
-                "error": "Invalid username or password.",
-            },
-            status_code=401,
-        )
-    ui_data = ui_session.create_session(actor)
-    response = RedirectResponse(ui_session.safe_next(next), status_code=303)
-    ui_session.set_session_cookie(response, ui_data)
-    db.log_execution(
-        db_session,
-        run_id=_new_run_id(),
-        action="ui.login",
-        status="success",
-        duration_ms=0,
-        detail=f"source=session; roles={','.join(actor.roles)}",
-        actor_subject=actor.subject,
-        correlation_id=getattr(request.state, "correlation_id", None),
-    )
-    db_session.commit()
-    return response
-
-
-@app.post("/logout", response_class=HTMLResponse, include_in_schema=False)
-def logout(
-    request: Request,
-    csrf_token: str = Form(default=""),
-    session_db: Session = Depends(db.get_session),
-) -> Response:
-    """Clear the browser session after a CSRF check."""
-    session = ui_session.read_session(request)
-    if session is None:
-        response = RedirectResponse("/login", status_code=303)
-        ui_session.clear_session_cookie(response)
-        return response
-    if not csrf_token or not secrets.compare_digest(csrf_token, session.csrf_token):
-        raise HTTPException(status_code=403, detail="CSRF token missing or invalid.")
-    db.log_execution(
-        session_db,
-        run_id=_new_run_id(),
-        action="ui.logout",
-        status="success",
-        duration_ms=0,
-        detail="source=session",
-        actor_subject=session.subject,
-        correlation_id=getattr(request.state, "correlation_id", None),
-    )
-    session_db.commit()
-    response = RedirectResponse("/login", status_code=303)
-    ui_session.clear_session_cookie(response)
-    return response
-
-
-@app.get("/", response_class=HTMLResponse, include_in_schema=False)
-def root(
-    request: Request, session: Session = Depends(db.get_session)
-) -> HTMLResponse:
-    """Landing page with live counts and operator links."""
-    return web.render(
-        request,
-        "landing.html",
-        {"active": "home", "stats": _site_stats(session)},
-    )
-
-
 @app.get("/health")
 def health() -> dict:
     """Liveness probe."""
@@ -1210,14 +342,13 @@ def ready() -> dict:
 
 
 @app.get("/metrics", include_in_schema=False)
-def metrics(session: Session = Depends(db.get_session)) -> Response:
+def metrics_endpoint(session: Session = Depends(db.get_session)) -> Response:
     """Minimal Prometheus-style metrics for jobs, outbox, and HTTP requests."""
     lines = [
         "# HELP flowops_http_requests_total HTTP requests by method, route, and status",
         "# TYPE flowops_http_requests_total counter",
     ]
-    with _METRICS_LOCK:
-        counters = dict(_METRICS)
+    counters = metrics.snapshot_http()
     for (method, route, status_code), count in sorted(counters.items()):
         lines.append(
             "flowops_http_requests_total"
@@ -1250,10 +381,7 @@ def metrics(session: Session = Depends(db.get_session)) -> Response:
         lines.append(
             f'flowops_notification_outbox{{status="{state}"}} {outbox_counts.get(state, 0)}'
         )
-    with _AI_METRICS_LOCK:
-        triage_counts = dict(_AI_TRIAGE)
-        apply_counts = dict(_AI_APPLY)
-        provider_errors = dict(_AI_PROVIDER_ERRORS)
+    triage_counts, apply_counts, provider_errors = metrics.snapshot_ai()
     lines.extend(
         [
             "# HELP flowops_ai_triage_total AI triage calls by adapter and outcome",
@@ -1310,47 +438,8 @@ def metrics(session: Session = Depends(db.get_session)) -> Response:
     )
     for outcome, count in sorted(scheduler.TICK_COUNTS.items()):
         lines.append(f'flowops_dag_scheduler_ticks_total{{outcome="{outcome}"}} {count}')
-
-    # Trigger metrics (v1.4)
-    delivery_records = session.execute(select(db.TriggerDeliveryRecord)).scalars().all()
-    delivery_counts = Counter(delivery.status for delivery in delivery_records)
-    lines.extend(
-        [
-            "# HELP flowops_trigger_deliveries_total Trigger deliveries by trigger and status",
-            "# TYPE flowops_trigger_deliveries_total counter",
-        ]
-    )
-    with _TRIGGER_METRICS_LOCK:
-        delivery_metrics = dict(_TRIGGER_DELIVERIES)
-    for (trigger_key, status), count in sorted(delivery_metrics.items()):
-        lines.append(
-            f'flowops_trigger_deliveries_total{{trigger="{trigger_key}",status="{status}"}} {count}'
-        )
-    lines.extend(
-        [
-            "# HELP flowops_trigger_processing_seconds Trigger processing duration",
-            "# TYPE flowops_trigger_processing_seconds summary",
-        ]
-    )
-    with _TRIGGER_METRICS_LOCK:
-        processing_times = list(_TRIGGER_PROCESSING_SECONDS)
-    if processing_times:
-        processing_times.sort()
-        count = len(processing_times)
-        lines.append(f'flowops_trigger_processing_seconds{{quantile="0.5"}} {processing_times[count // 2]}')
-        lines.append(f'flowops_trigger_processing_seconds{{quantile="0.9"}} {processing_times[int(count * 0.9)]}')
-        lines.append(f'flowops_trigger_processing_seconds_count {count}')
-        lines.append(f'flowops_trigger_processing_seconds_sum {sum(processing_times)}')
-    lines.extend(
-        [
-            "# HELP flowops_trigger_scheduler_ticks_total Trigger scheduler ticks by outcome",
-            "# TYPE flowops_trigger_scheduler_ticks_total counter",
-        ]
-    )
-    for outcome, count in sorted(getattr(scheduler, "TRIGGER_TICK_COUNTS", {}).items()):
-        lines.append(f'flowops_trigger_scheduler_ticks_total{{outcome="{outcome}"}} {count}')
-
-    lines.append(f"flowops_uptime_seconds {time.time() - _METRICS_STARTED:.1f}")
+    lines.append(f"flowops_uptime_seconds {metrics.uptime_seconds():.1f}")
+    lines.extend(_trigger_routes.trigger_metrics_lines(session))
     return Response("\n".join(lines) + "\n", media_type="text/plain")
 
 
@@ -1827,423 +916,6 @@ def webhook_intake(
     return _process_intake(payload, session, actor_subject)
 
 
-@app.post("/webhooks/triggers/{trigger_key}")
-def trigger_webhook(
-    trigger_key: str,
-    request: Request,
-    x_flowops_timestamp: Optional[str] = Header(default=None, alias="X-FlowOps-Timestamp"),
-    x_flowops_signature: Optional[str] = Header(default=None, alias="X-FlowOps-Signature"),
-    x_flowops_event_id: Optional[str] = Header(default=None, alias="X-FlowOps-Event-ID"),
-    session: Session = Depends(db.get_session),
-) -> dict[str, Any]:
-    """Signed inbound webhook for event-driven triggers.
-
-    Headers:
-    * X-FlowOps-Timestamp: Unix seconds
-    * X-FlowOps-Signature: sha256=<hex HMAC>
-    * X-FlowOps-Event-ID: Optional event ID (can also be in body)
-
-    HMAC input: timestamp + "." + raw request body.
-    """
-    trigger = session.get(db.TriggerRecord, trigger_key)
-    if trigger is None or not trigger.active:
-        raise HTTPException(status_code=404, detail="Trigger not found or inactive.")
-
-    source = session.get(db.EventSourceRecord, trigger.source_key)
-    if source is None or not source.active:
-        raise HTTPException(status_code=404, detail="Event source not found or inactive.")
-
-    # Parse timestamp
-    try:
-        timestamp = int(x_flowops_timestamp) if x_flowops_timestamp else 0
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=401, detail="Invalid timestamp.")
-
-    # Read raw body
-    import asyncio
-    body_bytes = asyncio.run(request.body())
-
-    # Verify signature
-    if not triggers.verify_signature(body_bytes, x_flowops_signature or "", source.secret, timestamp):
-        raise HTTPException(status_code=401, detail="Invalid signature or expired timestamp.")
-
-    # Parse payload
-    try:
-        payload = json.loads(body_bytes.decode())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        raise HTTPException(status_code=422, detail="Malformed JSON payload.")
-
-    # Extract event ID from header or body
-    event_id = x_flowops_event_id or payload.get("event_id")
-    if not event_id:
-        raise HTTPException(status_code=422, detail="Event ID is required (header or body field).")
-
-    # Check for replay
-    existing = session.execute(
-        select(db.TriggerDeliveryRecord).where(
-            db.TriggerDeliveryRecord.trigger_key == trigger_key,
-            db.TriggerDeliveryRecord.event_id == event_id,
-        )
-    ).scalar_one_or_none()
-
-    if existing:
-        return {
-            "status": "replayed",
-            "delivery_id": existing.id,
-            "delivery_status": existing.status,
-            "request_id": existing.request_id,
-        }
-
-    # Record delivery
-    delivery = triggers.record_delivery(
-        session,
-        trigger_key=trigger.key,
-        event_id=event_id,
-        payload=payload,
-        status="queued",
-    )
-
-    # Enqueue job for processing
-    jobs.enqueue_job(
-        session,
-        job_type=jobs.JOB_TRIGGER_EXECUTE,
-        payload={
-            "delivery_id": delivery.id,
-            "trigger_key": trigger.key,
-            "event_id": event_id,
-            "event_payload": payload,
-        },
-        label=f"trigger:{trigger.key}",
-    )
-
-    # Log audit event
-    db.log_execution(
-        session,
-        run_id=_new_run_id(),
-        action="trigger.delivery.received",
-        status="success",
-        ticket_id=None,
-        duration_ms=0,
-        detail=f"trigger={trigger.key}, event_id={event_id}",
-        actor_subject=f"trigger:{trigger.key}",
-        correlation_id=getattr(request.state, "correlation_id", None),
-    )
-
-    session.commit()
-
-    return {
-        "status": "queued",
-        "delivery_id": delivery.id,
-        "event_id": event_id,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Trigger CRUD endpoints (v1.4)
-
-
-@app.get("/event-sources", response_model=list[EventSourceOut])
-def list_event_sources(
-    actor: Actor = Depends(_operator_actor),
-    session: Session = Depends(db.get_session),
-) -> list[EventSourceOut]:
-    sources = session.execute(select(db.EventSourceRecord)).scalars().all()
-    return [
-        EventSourceOut(
-            key=s.key,
-            name=s.name,
-            active=s.active,
-            created_at=s.created_at,
-        )
-        for s in sources
-    ]
-
-
-@app.post("/event-sources", response_model=EventSourceOut, status_code=http_status.HTTP_201_CREATED)
-def create_event_source(
-    payload: EventSourceCreateIn,
-    actor: Actor = Depends(_operator_actor),
-    session: Session = Depends(db.get_session),
-) -> EventSourceOut:
-    if session.get(db.EventSourceRecord, payload.key):
-        raise HTTPException(status_code=409, detail="Event source key already exists.")
-    source = db.EventSourceRecord(
-        key=payload.key,
-        name=payload.name,
-        secret=payload.secret,
-        active=True,
-        created_at=db.utcnow(),
-    )
-    session.add(source)
-    session.flush()
-    db.log_execution(
-        session,
-        run_id=_new_run_id(),
-        action="event_source.created",
-        status="success",
-        ticket_id=None,
-        duration_ms=0,
-        detail=f"key={payload.key}",
-        actor_subject=actor.subject,
-    )
-    session.commit()
-    return EventSourceOut(
-        key=source.key,
-        name=source.name,
-        active=source.active,
-        created_at=source.created_at,
-    )
-
-
-@app.get("/triggers", response_model=list[TriggerOut])
-def list_triggers(
-    actor: Actor = Depends(_operator_actor),
-    session: Session = Depends(db.get_session),
-) -> list[TriggerOut]:
-    trigger_records = session.execute(select(db.TriggerRecord)).scalars().all()
-    return [
-        TriggerOut(
-            key=t.key,
-            name=t.name,
-            source_key=t.source_key,
-            event_type=t.event_type,
-            target_type=t.target_type,
-            definition_key=t.definition_key,
-            mapping_json=json.loads(t.mapping_json),
-            schedule_kind=t.schedule_kind,
-            interval_seconds=t.interval_seconds,
-            daily_at_utc=t.daily_at_utc,
-            active=t.active,
-            last_fired_at=t.last_fired_at,
-            created_at=t.created_at,
-            updated_at=t.updated_at,
-        )
-        for t in trigger_records
-    ]
-
-
-@app.post("/triggers", response_model=TriggerOut, status_code=http_status.HTTP_201_CREATED)
-def create_trigger(
-    payload: TriggerCreateIn,
-    actor: Actor = Depends(_operator_actor),
-    session: Session = Depends(db.get_session),
-) -> TriggerOut:
-    if session.get(db.TriggerRecord, payload.key):
-        raise HTTPException(status_code=409, detail="Trigger key already exists.")
-    if payload.target_type in ("onboarding_request", "offboarding_request") and not payload.definition_key:
-        raise HTTPException(status_code=422, detail="definition_key is required for onboarding/offboarding targets.")
-    if payload.definition_key:
-        definition = definitions.get_definition(session, payload.definition_key)
-        if definition is None:
-            raise HTTPException(status_code=404, detail="Definition not found.")
-        if definition.status != "published":
-            raise HTTPException(status_code=422, detail="Definition must be published.")
-    if payload.schedule_kind == "interval" and not payload.interval_seconds:
-        raise HTTPException(status_code=422, detail="interval_seconds is required for interval schedules.")
-    if payload.schedule_kind == "daily" and not payload.daily_at_utc:
-        raise HTTPException(status_code=422, detail="daily_at_utc is required for daily schedules.")
-
-    trigger = db.TriggerRecord(
-        key=payload.key,
-        name=payload.name,
-        source_key=payload.source_key,
-        event_type=payload.event_type,
-        target_type=payload.target_type,
-        definition_key=payload.definition_key,
-        mapping_json=json.dumps(payload.mapping_json, separators=(",", ":")),
-        schedule_kind=payload.schedule_kind,
-        interval_seconds=payload.interval_seconds,
-        daily_at_utc=payload.daily_at_utc,
-        active=True,
-        created_at=db.utcnow(),
-        updated_at=db.utcnow(),
-    )
-    session.add(trigger)
-    session.flush()
-    db.log_execution(
-        session,
-        run_id=_new_run_id(),
-        action="trigger.created",
-        status="success",
-        ticket_id=None,
-        duration_ms=0,
-        detail=f"key={payload.key}, target_type={payload.target_type}",
-        actor_subject=actor.subject,
-    )
-    session.commit()
-    return TriggerOut(
-        key=trigger.key,
-        name=trigger.name,
-        source_key=trigger.source_key,
-        event_type=trigger.event_type,
-        target_type=trigger.target_type,
-        definition_key=trigger.definition_key,
-        mapping_json=json.loads(trigger.mapping_json),
-        schedule_kind=trigger.schedule_kind,
-        interval_seconds=trigger.interval_seconds,
-        daily_at_utc=trigger.daily_at_utc,
-        active=trigger.active,
-        last_fired_at=trigger.last_fired_at,
-        created_at=trigger.created_at,
-        updated_at=trigger.updated_at,
-    )
-
-
-@app.get("/triggers/{key}", response_model=TriggerOut)
-def get_trigger(
-    key: str,
-    actor: Actor = Depends(_operator_actor),
-    session: Session = Depends(db.get_session),
-) -> TriggerOut:
-    trigger = session.get(db.TriggerRecord, key)
-    if trigger is None:
-        raise HTTPException(status_code=404, detail="Trigger not found.")
-    return TriggerOut(
-        key=trigger.key,
-        name=trigger.name,
-        source_key=trigger.source_key,
-        event_type=trigger.event_type,
-        target_type=trigger.target_type,
-        definition_key=trigger.definition_key,
-        mapping_json=json.loads(trigger.mapping_json),
-        schedule_kind=trigger.schedule_kind,
-        interval_seconds=trigger.interval_seconds,
-        daily_at_utc=trigger.daily_at_utc,
-        active=trigger.active,
-        last_fired_at=trigger.last_fired_at,
-        created_at=trigger.created_at,
-        updated_at=trigger.updated_at,
-    )
-
-
-@app.put("/triggers/{key}", response_model=TriggerOut)
-def update_trigger(
-    key: str,
-    payload: TriggerUpdateIn,
-    actor: Actor = Depends(_operator_actor),
-    session: Session = Depends(db.get_session),
-) -> TriggerOut:
-    trigger = session.get(db.TriggerRecord, key)
-    if trigger is None:
-        raise HTTPException(status_code=404, detail="Trigger not found.")
-    if payload.name is not None:
-        trigger.name = payload.name
-    if payload.active is not None:
-        trigger.active = payload.active
-    if payload.mapping_json is not None:
-        trigger.mapping_json = json.dumps(payload.mapping_json, separators=(",", ":"))
-    trigger.updated_at = db.utcnow()
-    session.flush()
-    db.log_execution(
-        session,
-        run_id=_new_run_id(),
-        action="trigger.updated",
-        status="success",
-        ticket_id=None,
-        duration_ms=0,
-        detail=f"key={key}",
-        actor_subject=actor.subject,
-    )
-    session.commit()
-    return TriggerOut(
-        key=trigger.key,
-        name=trigger.name,
-        source_key=trigger.source_key,
-        event_type=trigger.event_type,
-        target_type=trigger.target_type,
-        definition_key=trigger.definition_key,
-        mapping_json=json.loads(trigger.mapping_json),
-        schedule_kind=trigger.schedule_kind,
-        interval_seconds=trigger.interval_seconds,
-        daily_at_utc=trigger.daily_at_utc,
-        active=trigger.active,
-        last_fired_at=trigger.last_fired_at,
-        created_at=trigger.created_at,
-        updated_at=trigger.updated_at,
-    )
-
-
-@app.delete("/triggers/{key}")
-def delete_trigger(
-    key: str,
-    actor: Actor = Depends(_operator_actor),
-    session: Session = Depends(db.get_session),
-) -> dict[str, str]:
-    trigger = session.get(db.TriggerRecord, key)
-    if trigger is None:
-        raise HTTPException(status_code=404, detail="Trigger not found.")
-    session.delete(trigger)
-    db.log_execution(
-        session,
-        run_id=_new_run_id(),
-        action="trigger.deleted",
-        status="success",
-        ticket_id=None,
-        duration_ms=0,
-        detail=f"key={key}",
-        actor_subject=actor.subject,
-    )
-    session.commit()
-    return {"status": "deleted"}
-
-
-@app.get("/triggers/{key}/deliveries", response_model=list[TriggerDeliveryOut])
-def list_trigger_deliveries(
-    key: str,
-    actor: Actor = Depends(_operator_actor),
-    session: Session = Depends(db.get_session),
-) -> list[TriggerDeliveryOut]:
-    trigger = session.get(db.TriggerRecord, key)
-    if trigger is None:
-        raise HTTPException(status_code=404, detail="Trigger not found.")
-    deliveries = session.execute(
-        select(db.TriggerDeliveryRecord)
-        .where(db.TriggerDeliveryRecord.trigger_key == key)
-        .order_by(db.TriggerDeliveryRecord.id.desc())
-        .limit(100)
-    ).scalars().all()
-    return [
-        TriggerDeliveryOut(
-            id=d.id,
-            trigger_key=d.trigger_key,
-            event_id=d.event_id,
-            payload=json.loads(d.payload_json),
-            status=d.status,
-            request_id=d.request_id,
-            error=d.error,
-            received_at=d.received_at,
-            processed_at=d.processed_at,
-        )
-        for d in deliveries
-    ]
-
-
-@app.post("/triggers/{key}/test")
-def test_trigger(
-    key: str,
-    payload: dict[str, Any],
-    actor: Actor = Depends(_operator_actor),
-    session: Session = Depends(db.get_session),
-) -> dict[str, Any]:
-    """Test a trigger with a synthetic payload (no external calls)."""
-    trigger = session.get(db.TriggerRecord, key)
-    if trigger is None:
-        raise HTTPException(status_code=404, detail="Trigger not found.")
-    if not trigger.active:
-        raise HTTPException(status_code=409, detail="Trigger is inactive.")
-
-    try:
-        mapped = triggers.apply_mapping(json.loads(trigger.mapping_json), payload, trigger)
-    except (triggers.MappingError, json.JSONDecodeError) as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-
-    return {
-        "trigger_key": trigger.key,
-        "target_type": trigger.target_type,
-        "mapped_payload": mapped,
-    }
-
-
 # ---------------------------------------------------------------------------
 # Routes: onboarding/offboarding workflows
 
@@ -2255,7 +927,7 @@ def _request_out(
         **{c: getattr(record, c) for c in (
             "id", "request_type", "employee_name", "employee_email",
             "department", "requester_id", "start_date", "status",
-            "definition_key", "definition_version",
+            "definition_key", "definition_version", "tenant_key",
         )},
         checklist=[
             ChecklistItemOut(
@@ -2515,6 +1187,10 @@ def _create_onboarding_request(
 ) -> OnboardingRequestOut:
     """Create the record and checklist, returning the API response shape."""
     started = time.perf_counter()
+    if request.tenant_key:
+        tenant = session.get(db.TenantRecord, request.tenant_key)
+        if tenant is None or not tenant.active:
+            raise HTTPException(422, f"Unknown or inactive tenant: {request.tenant_key}")
     record = db.OnboardingRequestRecord(
         request_type=request.request_type,
         employee_name=request.employee_name,
@@ -2522,6 +1198,7 @@ def _create_onboarding_request(
         department=request.department,
         requester_id=request.requester_id,
         start_date=request.start_date,
+        tenant_key=request.tenant_key,
     )
     session.add(record)
     session.flush()
@@ -2687,7 +1364,6 @@ def get_onboarding_request_status(
     )
 
 
-
 def _workflow_run_out(
     session: Session, run: db.WorkflowRunRecord
 ) -> WorkflowRunOut:
@@ -2822,435 +1498,6 @@ def cancel_workflow_run(
     session: Session = Depends(db.get_session),
 ) -> WorkflowRunOut:
     return _run_action(session, run_id, actor, "cancel")
-
-
-@app.get("/ui/tickets", response_class=HTMLResponse, include_in_schema=False)
-def ui_tickets(
-    request: Request, session: Session = Depends(db.get_session)
-) -> HTMLResponse:
-    """Operator ticket list with an AI-triage entry point."""
-    records = session.execute(
-        select(db.TicketRecord).order_by(db.TicketRecord.ticket_id)
-    ).scalars().all()
-    tickets = [Ticket.model_validate(row, from_attributes=True) for row in records]
-    tickets.sort(key=lambda ticket: int(ticket.ticket_id))
-    return web.render(
-        request,
-        "tickets.html",
-        {"active": "tickets", "tickets": tickets},
-    )
-
-
-@app.get(
-    "/ui/tickets/{ticket_id}",
-    response_class=HTMLResponse,
-    include_in_schema=False,
-)
-def ui_ticket_detail(
-    request: Request,
-    ticket_id: str,
-    triage: bool = Query(default=False),
-    session: Session = Depends(db.get_session),
-) -> HTMLResponse:
-    """Ticket detail page with an optional AI-triage panel."""
-    record = _load_ticket(session, ticket_id)
-    result: Optional[AITriageOut] = None
-    if triage:
-        history = _ticket_history(session, ticket_id)
-        analysis = _analyze_ticket(record, history)
-        correlation_id = getattr(request.state, "correlation_id", None)
-        started = time.perf_counter()
-        db.log_execution(
-            session,
-            run_id=_new_run_id(),
-            action="ai.summarize",
-            status="success",
-            ticket_id=ticket_id,
-            duration_ms=int((time.perf_counter() - started) * 1000),
-            detail=f"adapter={analysis.adapter}; source=operator-ui",
-            actor_subject="operator-ui",
-            correlation_id=correlation_id,
-        )
-        db.log_execution(
-            session,
-            run_id=_new_run_id(),
-            action="ai.recommend",
-            status="success",
-            ticket_id=ticket_id,
-            duration_ms=int((time.perf_counter() - started) * 1000),
-            detail=f"adapter={analysis.adapter}; source=operator-ui",
-            actor_subject="operator-ui",
-            correlation_id=correlation_id,
-        )
-        session.commit()
-        result = _triage_out(analysis)
-    return web.render(
-        request,
-        "ticket_detail.html",
-        {"active": "tickets", "ticket": record, "triage": result},
-    )
-
-
-@app.get(
-    "/ui/onboarding-requests",
-    response_class=HTMLResponse,
-    include_in_schema=False,
-)
-def ui_onboarding_requests(
-    request: Request, session: Session = Depends(db.get_session)
-) -> HTMLResponse:
-    """Operator list of onboarding/offboarding requests."""
-    records = session.execute(select(db.OnboardingRequestRecord)).scalars().all()
-    rows = []
-    for record in records:
-        _, items = _load_request(session, record.id)
-        total = len(items)
-        completed = sum(1 for item in items if item.status == "completed")
-        rows.append(
-            {
-                "id": record.id,
-                "request_type": record.request_type,
-                "employee_name": record.employee_name,
-                "department": record.department,
-                "status": record.status,
-                "completed": completed,
-                "total": total,
-                "percent": round((completed / total) * 100) if total else 0,
-            }
-        )
-    return web.render(
-        request,
-        "onboarding_list.html",
-        {"active": "onboarding", "requests": rows},
-    )
-
-
-@app.get(
-    "/ui/onboarding-requests/{request_id}",
-    response_class=HTMLResponse,
-    include_in_schema=False,
-)
-def ui_onboarding_request(
-    request: Request,
-    request_id: int,
-    session: Session = Depends(db.get_session),
-) -> HTMLResponse:
-    """Operator detail page for one checklist."""
-    try:
-        record, items = _load_request(session, request_id)
-    except HTTPException as error:
-        if error.status_code == 404:
-            return web.render(
-                request,
-                "404.html",
-                {"active": "onboarding"},
-                status_code=404,
-            )
-        raise
-    completed = sum(1 for item in items if item.status == "completed")
-    run = scheduler.get_run_for_request(session, record.id)
-    run_view = _workflow_run_out(session, run) if run is not None else None
-    by_key = {workflow.state_key(item): item for item in items}
-    item_views = []
-    for item in sorted(items, key=lambda entry: entry.id):
-        dependencies = workflow.dependencies_of(item)
-        links = (
-            chatops.approval_urls(record.id, item.id)
-            if item.requires_approval and item.status == "pending"
-            else {}
-        )
-        item_views.append(
-            {
-                "item": item,
-                "depends_on_names": [
-                    by_key[key].step for key in dependencies if key in by_key
-                ],
-                "missing": workflow.missing_prerequisites(item, items),
-                "output": workflow.step_output(item),
-                "chatops": links,
-            }
-        )
-    return web.render(
-        request,
-        "onboarding_detail.html",
-        {
-            "active": "onboarding",
-            "request_record": record,
-            "item_views": item_views,
-            "items": sorted(items, key=lambda item: item.id),
-            "completed": completed,
-            "total": len(items),
-            "run": run_view,
-        },
-    )
-
-
-@app.get("/ui/workflow-definitions", response_class=HTMLResponse, include_in_schema=False)
-def ui_workflow_definitions(
-    request: Request, session: Session = Depends(db.get_session)
-) -> HTMLResponse:
-    rows = [
-        _definition_out(session, definition)
-        for definition in definitions.list_definitions(session)
-    ]
-    return web.render(
-        request, "workflow_definitions.html", {"active": "definitions", "definitions": rows}
-    )
-
-
-@app.get(
-    "/ui/workflow-definitions/{key}",
-    response_class=HTMLResponse,
-    include_in_schema=False,
-)
-def ui_workflow_definition(
-    request: Request, key: str, session: Session = Depends(db.get_session)
-) -> HTMLResponse:
-    definition = definitions.get_definition(session, key)
-    if definition is None:
-        return web.render(request, "404.html", {"active": "definitions"}, status_code=404)
-    return web.render(
-        request,
-        "workflow_definition.html",
-        {"active": "definitions", "definition": _definition_out(session, definition)},
-    )
-
-
-@app.get("/ui/triggers", response_class=HTMLResponse, include_in_schema=False)
-def ui_triggers(
-    request: Request, session: Session = Depends(db.get_session)
-) -> HTMLResponse:
-    trigger_records = session.execute(select(db.TriggerRecord)).scalars().all()
-    rows = [
-        TriggerOut(
-            key=t.key,
-            name=t.name,
-            source_key=t.source_key,
-            event_type=t.event_type,
-            target_type=t.target_type,
-            definition_key=t.definition_key,
-            mapping_json=json.loads(t.mapping_json),
-            schedule_kind=t.schedule_kind,
-            interval_seconds=t.interval_seconds,
-            daily_at_utc=t.daily_at_utc,
-            active=t.active,
-            last_fired_at=t.last_fired_at,
-            created_at=t.created_at,
-            updated_at=t.updated_at,
-        )
-        for t in trigger_records
-    ]
-    return web.render(
-        request,
-        "triggers.html",
-        {"active": "triggers", "triggers": rows},
-    )
-
-
-@app.get("/ui/triggers/{key}", response_class=HTMLResponse, include_in_schema=False)
-def ui_trigger_detail(
-    key: str,
-    request: Request,
-    session: Session = Depends(db.get_session),
-) -> HTMLResponse:
-    trigger = session.get(db.TriggerRecord, key)
-    if trigger is None:
-        return web.render(request, "404.html", {"active": "triggers"}, status_code=404)
-    trigger_out = TriggerOut(
-        key=trigger.key,
-        name=trigger.name,
-        source_key=trigger.source_key,
-        event_type=trigger.event_type,
-        target_type=trigger.target_type,
-        definition_key=trigger.definition_key,
-        mapping_json=json.loads(trigger.mapping_json),
-        schedule_kind=trigger.schedule_kind,
-        interval_seconds=trigger.interval_seconds,
-        daily_at_utc=trigger.daily_at_utc,
-        active=trigger.active,
-        last_fired_at=trigger.last_fired_at,
-        created_at=trigger.created_at,
-        updated_at=trigger.updated_at,
-    )
-    deliveries = session.execute(
-        select(db.TriggerDeliveryRecord)
-        .where(db.TriggerDeliveryRecord.trigger_key == key)
-        .order_by(db.TriggerDeliveryRecord.id.desc())
-        .limit(20)
-    ).scalars().all()
-    delivery_rows = [
-        TriggerDeliveryOut(
-            id=d.id,
-            trigger_key=d.trigger_key,
-            event_id=d.event_id,
-            payload=json.loads(d.payload_json),
-            status=d.status,
-            request_id=d.request_id,
-            error=d.error,
-            received_at=d.received_at,
-            processed_at=d.processed_at,
-        )
-        for d in deliveries
-    ]
-    return web.render(
-        request,
-        "trigger_detail.html",
-        {"active": "triggers", "trigger": trigger_out, "deliveries": delivery_rows},
-    )
-
-
-@app.get("/ui/workflow-runs", response_class=HTMLResponse, include_in_schema=False)
-def ui_workflow_runs(
-    request: Request,
-    status: Optional[str] = Query(default=None),
-    session: Session = Depends(db.get_session),
-) -> HTMLResponse:
-    """Operator view of DAG runs and their step attempts."""
-    query = select(db.WorkflowRunRecord).order_by(db.WorkflowRunRecord.id.desc())
-    if status:
-        query = query.where(db.WorkflowRunRecord.status == status)
-    runs = session.execute(query.limit(100)).scalars().all()
-    rows = []
-    for run in runs:
-        record = session.get(db.OnboardingRequestRecord, run.request_id)
-        rows.append(
-            {
-                "run": _workflow_run_out(session, run),
-                "employee_name": record.employee_name if record else "—",
-            }
-        )
-    return web.render(
-        request,
-        "workflow_runs.html",
-        {"active": "workflow_runs", "runs": rows, "status_filter": status or ""},
-    )
-
-
-@app.get("/ui/notifications", response_class=HTMLResponse, include_in_schema=False)
-def ui_notifications(
-    request: Request,
-    session: Session = Depends(db.get_session),
-    page: int = Query(default=1, ge=1),
-) -> HTMLResponse:
-    """Operator page for pending and dead-letter webhook deliveries."""
-    page_size = 25
-    records = session.execute(
-        select(db.NotificationOutboxRecord)
-        .order_by(db.NotificationOutboxRecord.id)
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-    ).scalars().all()
-    return web.render(
-        request,
-        "notifications.html",
-        {
-            "active": "notifications",
-            "pending": [item for item in records if item.status == "pending"],
-            "failed": [item for item in records if item.status == "failed"],
-            "page": page,
-            "has_previous": page > 1,
-            "has_next": len(records) == page_size,
-        },
-    )
-
-
-@app.get("/ui/workflow-jobs", response_class=HTMLResponse, include_in_schema=False)
-def ui_workflow_jobs(
-    request: Request,
-    session: Session = Depends(db.get_session),
-    page: int = Query(default=1, ge=1),
-) -> HTMLResponse:
-    """Operator page for the durable workflow queue."""
-    page_size = 25
-    records = jobs.list_jobs(
-        session, limit=page_size, offset=(page - 1) * page_size
-    )
-    return web.render(
-        request,
-        "jobs.html",
-        {
-            "active": "jobs",
-            "jobs": records,
-            "page": page,
-            "has_previous": page > 1,
-            "has_next": len(records) == page_size,
-        },
-    )
-
-
-@app.get("/ui/audit", response_class=HTMLResponse, include_in_schema=False)
-def ui_audit(
-    request: Request,
-    session: Session = Depends(db.get_session),
-    status_filter: Optional[str] = Query(default=None, alias="status"),
-    actor_filter: Optional[str] = Query(default=None, alias="actor"),
-    page: int = Query(default=1, ge=1),
-) -> HTMLResponse:
-    """Operator audit page for actor-attributed execution rows."""
-    query = select(db.ExecutionLogRecord).where(
-        db.ExecutionLogRecord.actor_subject.is_not(None)
-    )
-    if status_filter in ("success", "failure"):
-        query = query.where(db.ExecutionLogRecord.status == status_filter)
-    if actor_filter:
-        query = query.where(db.ExecutionLogRecord.actor_subject == actor_filter)
-    page_size = 25
-    records = session.execute(
-        query.order_by(db.ExecutionLogRecord.id.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-    ).scalars().all()
-    return web.render(
-        request,
-        "audit.html",
-        {
-            "active": "audit",
-            "logs": records,
-            "status_filter": status_filter,
-            "actor_filter": actor_filter or "",
-            "page": page,
-            "has_previous": page > 1,
-            "has_next": len(records) == page_size,
-        },
-    )
-
-
-@app.get(
-    "/ui/workflow-jobs/{job_id}",
-    response_class=HTMLResponse,
-    include_in_schema=False,
-)
-def ui_workflow_job_detail(
-    request: Request, job_id: int, session: Session = Depends(db.get_session)
-) -> HTMLResponse:
-    """Operator detail page for one durable workflow job."""
-    job = session.get(db.WorkflowJobRecord, job_id)
-    if job is None:
-        return web.render(request, "404.html", {"active": "jobs"}, status_code=404)
-    try:
-        payload = json.loads(job.payload_json)
-    except json.JSONDecodeError:
-        payload = {}
-    try:
-        result = json.loads(job.result_json) if job.result_json else {}
-    except json.JSONDecodeError:
-        result = {}
-    return web.render(
-        request,
-        "job_detail.html",
-        {
-            "active": "jobs",
-            "job": job,
-            "payload": json.dumps(payload, indent=2, sort_keys=True),
-            "result": json.dumps(result, indent=2, sort_keys=True),
-        },
-    )
-
-
-@app.get("/ui/{rest:path}", response_class=HTMLResponse, include_in_schema=False)
-def ui_not_found(request: Request, rest: str) -> HTMLResponse:
-    """Friendly HTML 404 for unknown operator pages."""
-    return web.render(request, "404.html", {"active": ""}, status_code=404)
 
 
 def _get_item(
@@ -3516,24 +1763,6 @@ def complete_item(
     return _transition_item(
         session, request_id, item_id, request, "complete", actor.subject
     )
-
-
-
-class OffboardingStepResultOut(BaseModel):
-    """Stored outcome of one offboarding step (v0.6.1)."""
-
-    step_key: StrictStr
-    status: str
-    executor_called: bool
-    executed_at: datetime
-
-
-class OffboardingCompletionOut(BaseModel):
-    """Response body of the idempotent offboarding completion endpoint."""
-
-    checklist_id: int
-    employee_name: str
-    step: OffboardingStepResultOut
 
 
 # Module-level *simulated* side-effect executor for offboarding steps.
@@ -3835,14 +2064,6 @@ def complete_offboarding_step(
         session.commit()
         raise
 
-class M365StatusOut(BaseModel):
-    """Shape of the *simulated* M365 status response (v0.6 placeholder)."""
-
-    simulated: StrictBool
-    id: StrictStr
-    provisioning_state: StrictStr
-    last_sync: StrictStr
-
 
 @app.get("/onboarding-requests/m365-status/{user_id}", response_model=M365StatusOut)
 def get_m365_status(user_id: str) -> M365StatusOut:
@@ -3850,7 +2071,7 @@ def get_m365_status(user_id: str) -> M365StatusOut:
 
     This never contacts real Microsoft services; see src/m365_simulator.py.
     """
-    return M365StatusOut.model_validate(m365_simulator.get_status(user_id))
+    return M365StatusOut.model_validate(M365Simulator().get_status(user_id))
 
 
 # ---------------------------------------------------------------------------
@@ -4010,18 +2231,6 @@ def cancel_workflow_job(
 
 # ---------------------------------------------------------------------------
 # Routes: monitoring
-
-
-class NotificationOutboxOut(BaseModel):
-    """One stored notification delivery, exposed for operators (v1.0 preview)."""
-
-    id: int
-    url: str
-    ticket_id: Optional[str] = None
-    status: str
-    attempts: int
-    last_error: Optional[str] = None
-    created_at: datetime
 
 
 def _outbox_out(record: db.NotificationOutboxRecord) -> NotificationOutboxOut:
@@ -4254,126 +2463,13 @@ def list_audit_trail(
     ]
 
 
-@app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
-def dashboard(
-    request: Request,
-    session: Session = Depends(db.get_session),
-    status_filter: Optional[str] = Query(default=None, alias="status"),
-    auto_refresh: bool = Query(default=False),
-) -> HTMLResponse:
-    """Server-rendered monitoring dashboard over tickets and execution logs."""
-    tickets = session.execute(select(db.TicketRecord)).scalars().all()
-    log_query = select(db.ExecutionLogRecord).order_by(
-        db.ExecutionLogRecord.id.desc()
-    ).limit(200)
-    if status_filter in ("success", "failure"):
-        log_query = log_query.where(db.ExecutionLogRecord.status == status_filter)
-    logs = session.execute(log_query).scalars().all()
-    outbox_records = session.execute(
-        select(db.NotificationOutboxRecord)
-    ).scalars().all()
-    pending_deliveries = [
-        item for item in outbox_records if item.status == "pending"
-    ]
-    failed_deliveries = [
-        item for item in outbox_records if item.status == "failed"
-    ]
+from src.routes import reports as _report_routes  # noqa: E402
+from src.routes import tenants as _tenant_routes  # noqa: E402
+from src.routes import triggers as _trigger_routes  # noqa: E402
+from src.routes import ui as _ui_routes  # noqa: E402  (registered last: owns the /ui catch-all)
 
-    total = len(tickets)
-    open_count = sum(1 for t in tickets if t.status == "open")
-    closed_count = total - open_count
-    auto_routed = sum(
-        1 for t in tickets if t.queue and t.queue != "it-service-desk"
-    )
-    success_count = sum(1 for log in logs if log.status == "success")
-    failure_count = len(logs) - success_count
-    avg_duration = (
-        round(sum(log.duration_ms for log in logs) / len(logs)) if logs else 0
-    )
-    outbox_counts = Counter(item.status for item in outbox_records)
+app.include_router(_tenant_routes.router)
+app.include_router(_report_routes.router)
+app.include_router(_trigger_routes.router)
 
-    def bars(counter: Counter) -> list[dict[str, object]]:
-        maximum = max(counter.values(), default=0)
-        return [
-            {
-                "label": str(label),
-                "count": count,
-                "percent": round((count / maximum) * 100) if maximum else 0,
-            }
-            for label, count in counter.most_common()
-        ]
-
-    stats = {
-        "total": total,
-        "open": open_count,
-        "closed": closed_count,
-        "auto_routed": auto_routed,
-        "success_count": success_count,
-        "failure_count": failure_count,
-        "avg_duration": avg_duration,
-        "hours_saved": round(auto_routed * 15 / 60, 1),
-        "pending_notifications": outbox_counts.get("pending", 0),
-        "delivered_notifications": outbox_counts.get("delivered", 0),
-        "failed_notifications": outbox_counts.get("failed", 0),
-        "notification_retries": sum(
-            max(item.attempts - 1, 0) for item in outbox_records
-        ),
-    }
-    log_rows = [
-        {
-            "id": log.id,
-            "created_at": log.created_at.strftime("%Y-%m-%d %H:%M:%S"),
-            "action": log.action,
-            "status": log.status,
-            "ticket_id": log.ticket_id,
-            "actor_subject": log.actor_subject,
-            "correlation_id": log.correlation_id,
-            "duration_ms": log.duration_ms,
-        }
-        for log in logs[:50]
-    ]
-    offboarding_rows = []
-    for onboarding_record in session.execute(
-        select(db.OnboardingRequestRecord)
-    ).scalars().all():
-        if onboarding_record.request_type != "offboarding":
-            continue
-        checklist = session.execute(
-            select(db.ChecklistItemRecord).where(
-                db.ChecklistItemRecord.request_id == onboarding_record.id
-            )
-        ).scalars().all()
-        total = len(checklist)
-        completed = sum(1 for item in checklist if item.status == "completed")
-        offboarding_rows.append(
-            {
-                "id": onboarding_record.id,
-                "employee_name": onboarding_record.employee_name,
-                "status": onboarding_record.status,
-                "completed": completed,
-                "total": total,
-                "percent": round((completed / total) * 100) if total else 0,
-            }
-        )
-    return web.render(
-        request,
-        "dashboard.html",
-        {
-            "active": "dashboard",
-            "stats": stats,
-            "queues": bars(Counter(t.queue or "unrouted" for t in tickets)),
-            "priorities": bars(Counter(t.priority for t in tickets)),
-            "logs": log_rows,
-            "status_filter": status_filter,
-            "pending": pending_deliveries,
-            "failed": failed_deliveries,
-            "auto_refresh": auto_refresh,
-            "last_updated": db.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-            "offboarding_rows": offboarding_rows,
-            "ai_stats": {
-                "triage": sum(_AI_TRIAGE.values()),
-                "applies": sum(_AI_APPLY.values()),
-                "errors": sum(_AI_PROVIDER_ERRORS.values()),
-            },
-        },
-    )
+app.include_router(_ui_routes.router)

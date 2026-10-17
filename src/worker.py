@@ -163,6 +163,7 @@ def _complete_onboarding_job(
         "employee_name": request.employee_name,
         "employee_email": request.employee_email,
         "department": request.department,
+        "tenant_key": request.tenant_key,
         "idempotency_key": idempotency_key,
         "job_id": job.id,
         **workflow.action_context_outputs(item, items),
@@ -494,7 +495,9 @@ def _execute_job(
         _notify_worker_failure(session, job, payload, str(error))
         session.commit()
         return "failed"
-    except Exception as error:  # adapter failures are retryable
+    except Exception as error:
+        # Retryable unless the adapter says otherwise (Graph 4xx, licence
+        # exhausted, invalid PowerShell input): those go straight to failed.
         session.rollback()
         reloaded = session.get(db.WorkflowJobRecord, job.id)
         if reloaded is None:
@@ -504,7 +507,7 @@ def _execute_job(
             reloaded.id,
             reloaded.lease_owner_token or "",
             str(error),
-            retryable=True,
+            retryable=getattr(error, "retryable", True) is not False,
         )
         if status == "failed":
             _cascade_terminal_failure(session, payload)

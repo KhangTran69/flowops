@@ -17,6 +17,9 @@ pytestmark = pytest.mark.skipif(
 def pg_session():
     url = os.environ["FLOWOPS_TEST_POSTGRES_URL"]
     db.use_database(url)
+    # Other PostgreSQL modules recreate the schema per test; do the same so the
+    # fixed keys used by the helpers below cannot collide across tests.
+    db.Base.metadata.drop_all(bind=db.engine)
     db.Base.metadata.create_all(bind=db.engine)
     session = db.SessionLocal()
     try:
@@ -79,9 +82,9 @@ def _create_trigger(
         definition_key=definition_key,
         mapping_json=json.dumps(
             {
-                "employee_name": "event.data.name",
-                "employee_email": "event.data.email",
-                "department": "event.data.department",
+                "employee_name": "$event.data.name",
+                "employee_email": "$event.data.email",
+                "department": "$event.data.department",
                 "requester_id": 1,
             },
             separators=(",", ":"),
@@ -169,7 +172,7 @@ def test_pg_trigger_worker_creates_onboarding_request(pg_session, monkeypatch):
 
     request = pg_session.execute(
         select(db.OnboardingRequestRecord).where(
-            db.OnboardingRequestRecord.employee_name == "Trigger Employee"
+            db.OnboardingRequestRecord.employee_name == "Alice"
         )
     ).scalar_one_or_none()
     assert request is not None

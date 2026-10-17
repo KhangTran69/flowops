@@ -10,7 +10,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0010_triggers"
-down_revision: Union[str, None] = "0009_reporting_view"
+down_revision: Union[str, None] = "0009_tenants_reporting"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
