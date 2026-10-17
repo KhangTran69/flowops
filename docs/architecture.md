@@ -34,7 +34,9 @@ local verification and GitHub Actions.
 ## Reliability boundaries
 
 - Strict validation rejects malformed or ambiguous source data at the API edge.
-- Idempotency keys prevent duplicate ticket workflow execution during retries.
+- Idempotency keys reserve each ticket operation with a fencing token. A stale
+  owner that loses its lease to a takeover cannot finalize or delete the new
+  reservation, and its ticket/log writes roll back with a retryable 409.
 - Webhook delivery retries transient failures and records the final outcome.
 - Onboarding steps use explicit approval and completion state transitions.
 - Execution logs make each workflow action visible to the dashboard.

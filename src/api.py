@@ -115,33 +115,38 @@ def _claim_idempotency_key(
         table.c.created_at < stale_before,
         table.c.response_json.like('%"state":"processing"%'),
     )
+    set_values = {
+        "ticket_id": ticket_id,
+        "response_json": values["response_json"],
+        "owner_token": owner_token,
+        "created_at": now,
+    }
     dialect = session.get_bind().dialect.name
     if dialect == "sqlite":
         statement = sqlite_insert(table).values(**values).on_conflict_do_update(
             index_elements=[table.c.key],
-            set_={
-                "ticket_id": ticket_id,
-                "response_json": values["response_json"],
-                "owner_token": owner_token,
-                "created_at": now,
-            },
+            set_=set_values,
             where=takeover,
         )
+        # SQLite reports 1 for both the insert and the takeover update.
+        claimed = session.execute(statement).rowcount == 1
     elif dialect == "postgresql":
-        statement = postgres_insert(table).values(**values).on_conflict_do_update(
-            index_elements=[table.c.key],
-            set_={
-                "ticket_id": ticket_id,
-                "response_json": values["response_json"],
-                "owner_token": owner_token,
-                "created_at": now,
-            },
-            where=takeover,
+        statement = (
+            postgres_insert(table)
+            .values(**values)
+            .on_conflict_do_update(
+                index_elements=[table.c.key],
+                set_=set_values,
+                where=takeover,
+            )
+            .returning(table.c.owner_token)
         )
+        # psycopg reports -1 for this upsert, so confirm the claim through the
+        # RETURNING row instead of relying on a driver-specific rowcount.
+        claimed = session.execute(statement).scalar_one_or_none() == owner_token
     else:
         raise RuntimeError(f"Idempotency reservations do not support database dialect {dialect!r}.")
 
-    claimed = session.execute(statement).rowcount == 1
     session.commit()
     return owner_token if claimed else None
 
