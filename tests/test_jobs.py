@@ -295,3 +295,18 @@ def test_worker_terminal_failure_triggers_notification_webhook(client, monkeypat
 
     logs = client.get("/execution-logs").json()
     assert any(log["action"] == "notification.action_failure" for log in logs)
+
+
+def test_control_plane_propagates_correlation_and_exposes_history(client):
+    request_id, item_id = _create_onboarding_item(client)
+    response = client.post(
+        f"/onboarding-requests/{request_id}/items/{item_id}/jobs",
+        headers={"X-Correlation-ID": "control-plane-test"},
+    )
+    assert response.status_code == 202
+    job_id = response.json()["id"]
+    history = client.get(f"/workflow-jobs/{job_id}/history")
+    assert history.status_code == 200
+    assert history.json() == []
+    metrics = client.get("/metrics").text
+    assert "flowops_workflow_job_attempts_total" in metrics

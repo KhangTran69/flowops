@@ -6,7 +6,7 @@ workflow or API layer.
 """
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import requests
@@ -18,6 +18,7 @@ class ActionResult:
 
     action: str
     detail: str
+    output: dict[str, Any] = field(default_factory=dict)
 
 
 class ActionAdapter(Protocol):

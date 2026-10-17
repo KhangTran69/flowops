@@ -90,4 +90,4 @@ jobs:
         run: |
           pytest -q tests/test_idempotency_postgres.py tests/test_outbox_postgres.py \
             tests/test_jobs_postgres.py tests/test_outbox_worker_postgres.py \
-            tests/test_offboarding_postgres.py tests/test_ai_postgres.py
+            tests/test_offboarding_postgres.py tests/test_ai_postgres.py tests/test_orchestrator_postgres.py
