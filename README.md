@@ -217,9 +217,13 @@ The AI boundary is suggest-only by default:
 - `POST /tickets/{id}/ai-recommendations/apply` requires an operator actor and
   an explicit list of recommendation IDs. It re-runs triage server-side and
   applies only those IDs; status is never changed by AI.
-- The simulated adapter is deterministic and credential-free. `FLOWOPS_AI_ADAPTER=llm`
-  with `FLOWOPS_AI_API_KEY` selects the optional pluggable `LLMAIAdapter`, which
-  requires an injected completion client (tests use a fake; no network calls).
+- The simulated adapter is deterministic and credential-free. `FLOWOPS_AI_ADAPTER`
+  can select an OpenAI-compatible provider: `gemini`, `groq`, `openai`,
+  `openrouter`, `ollama`, or generic `llm`. Set `FLOWOPS_AI_API_KEY` plus
+  optional `FLOWOPS_AI_BASE_URL`, `FLOWOPS_AI_MODEL`, and `FLOWOPS_AI_TIMEOUT`.
+  The built-in client calls `/chat/completions`; tests inject
+  `httpx.MockTransport` and never touch the network. `ollama` runs locally and
+  needs no key.
 - Every triage and apply action writes `ai.summarize`, `ai.recommend`, or
   `ai.recommendation_applied` execution logs with actor, duration, and
   correlation ID.
@@ -351,7 +355,7 @@ No real secrets or Microsoft tenant are included.
 ## Running the tests
 
 ```bash
-pytest    # 197 passed, 13 skipped locally; the skips are PostgreSQL-only tests
+pytest    # 201 passed, 13 skipped locally; the skips are PostgreSQL-only tests
 python -m compileall -q src tests
 ```
 

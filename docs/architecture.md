@@ -81,8 +81,9 @@ The AI layer is intentionally suggest-only. `src/ai_agent.py` produces a
 deterministic summary, keyword-ranked KB matches, and stable recommendation
 IDs. `POST /tickets/{id}/ai-recommendations/apply` re-runs triage and only
 applies the IDs an operator explicitly approves, and only queue/priority
-fields. The optional LLM adapter is a pluggable client boundary; the default
-simulated adapter needs no credentials and is what tests exercise. Every AI
+fields. The optional LLM adapter is an OpenAI-compatible client boundary for Gemini,
+Groq, OpenRouter, OpenAI, or local Ollama; the default simulated adapter needs
+no credentials and is what tests exercise. Every AI
 action is written to the execution log with actor and correlation ID.
 
 ## Deliberate limits

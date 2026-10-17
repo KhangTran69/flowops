@@ -1,5 +1,8 @@
 """Offline tests for the v0.7 AI support agent, KB, and approval gate."""
 
+import json
+
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -173,7 +176,7 @@ def test_llm_adapter_boundary_uses_injected_client():
     assert calls
 
     with pytest.raises(ai_agent.AIAvailabilityError):
-        ai_agent.LLMAIAdapter("test-key").analyze(_snapshot())
+        ai_agent.LLMAIAdapter("test-key", provider="llm").analyze(_snapshot())
 
 
 def test_adapter_selection_is_credential_free_by_default():
@@ -201,3 +204,74 @@ def test_ui_ticket_list_and_triage_panel(client):
     assert "AI Triage" in detail.text
     assert "queue-reassign" in detail.text
     assert f"/tickets/{ticket_id}/ai-recommendations/apply" in detail.text
+
+
+def test_openai_compatible_client_uses_mock_transport():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": '{"summary": "Mock provider summary.", "recommendations": []}'}}
+                ]
+            },
+        )
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    adapter = ai_agent.LLMAIAdapter(
+        "secret-key",
+        provider="gemini",
+        base_url="https://example.test/v1",
+        model="test-model",
+        http_client=http_client,
+    )
+    result = adapter.analyze(_snapshot())
+    assert result.summary.text == "Mock provider summary."
+    assert requests
+    request = requests[0]
+    assert str(request.url) == "https://example.test/v1/chat/completions"
+    assert request.headers["authorization"] == "Bearer secret-key"
+    body = json.loads(request.content)
+    assert body["model"] == "test-model"
+    assert body["messages"][0]["role"] == "user"
+
+
+def test_openai_compatible_client_surfaces_provider_errors():
+    http_client = httpx.Client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(503, text="unavailable"))
+    )
+    adapter = ai_agent.LLMAIAdapter(
+        "key",
+        provider="groq",
+        base_url="https://example.test/v1",
+        model="test-model",
+        http_client=http_client,
+    )
+    with pytest.raises(ai_agent.AIAvailabilityError):
+        adapter.analyze(_snapshot())
+
+
+def test_provider_settings_and_ollama_selection():
+    base, model, timeout = ai_agent.provider_settings("groq", {})
+    assert base == "https://api.groq.com/openai/v1"
+    assert model == "openai/gpt-oss-20b"
+    assert timeout == 30.0
+
+    cloud = ai_agent.adapter_from_environment(
+        {"FLOWOPS_AI_ADAPTER": "groq", "FLOWOPS_AI_API_KEY": "key"}
+    )
+    assert isinstance(cloud, ai_agent.LLMAIAdapter)
+    assert cloud.provider == "groq"
+
+    local = ai_agent.adapter_from_environment({"FLOWOPS_AI_ADAPTER": "ollama"})
+    assert isinstance(local, ai_agent.LLMAIAdapter)
+    assert local.provider == "ollama"
+
+
+def test_llm_adapter_requires_base_and_model_for_generic_provider():
+    adapter = ai_agent.LLMAIAdapter("key", provider="llm")
+    with pytest.raises(ai_agent.AIAvailabilityError, match="FLOWOPS_AI_BASE_URL"):
+        adapter.analyze(_snapshot())

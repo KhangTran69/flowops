@@ -7,9 +7,12 @@ LLM adapter is an optional pluggable boundary.
 """
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
+
+import httpx
 
 from src.routing import route_ticket
 
@@ -390,6 +393,90 @@ class SimulatedAIAdapter:
         )
 
 
+PROVIDER_DEFAULTS: dict[str, tuple[str, Optional[str]]] = {
+    "gemini": (
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+        "gemini-2.5-flash",
+    ),
+    "groq": ("https://api.groq.com/openai/v1", "openai/gpt-oss-20b"),
+    "openai": ("https://api.openai.com/v1", "gpt-4o-mini"),
+    "openrouter": ("https://openrouter.ai/api/v1", None),
+    "ollama": ("http://localhost:11434/v1", "llama3.2"),
+    "llm": (None, None),
+}
+
+
+def provider_settings(
+    provider: str, environ: Optional[Mapping[str, str]] = None
+) -> tuple[Optional[str], Optional[str], float]:
+    """Resolve base URL, model, and timeout from provider defaults and env."""
+    values = environ if environ is not None else os.environ
+    default_base, default_model = PROVIDER_DEFAULTS.get(provider, (None, None))
+    base_url = values.get("FLOWOPS_AI_BASE_URL") or default_base
+    model = values.get("FLOWOPS_AI_MODEL") or default_model
+    try:
+        timeout = float(values.get("FLOWOPS_AI_TIMEOUT", "30"))
+    except (TypeError, ValueError):
+        timeout = 30.0
+    return base_url, model, max(1.0, timeout)
+
+
+class OpenAICompatibleClient:
+    """Minimal OpenAI-compatible chat client used by the LLM adapter.
+
+    Works with Gemini's OpenAI-compatible endpoint, Groq, OpenRouter, OpenAI,
+    and local Ollama. ``http_client`` is injectable so tests can use
+    ``httpx.MockTransport`` and never touch the network.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        *,
+        api_key: str = "",
+        timeout: float = 30.0,
+        http_client: Optional[httpx.Client] = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.api_key = api_key
+        self.timeout = timeout
+        self.http_client = http_client
+
+    def __call__(self, prompt: str) -> str:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+        }
+        owned_client = self.http_client is None
+        client = self.http_client or httpx.Client(timeout=self.timeout)
+        try:
+            response = client.post(
+                f"{self.base_url}/chat/completions",
+                json=payload,
+                headers=headers,
+            )
+            response.raise_for_status()
+            body = response.json()
+            content = body["choices"][0]["message"]["content"]
+        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as error:
+            raise AIAvailabilityError(
+                f"LLM request to {self.base_url} failed: {error}"
+            ) from error
+        finally:
+            if owned_client:
+                client.close()
+        if not isinstance(content, str) or not content.strip():
+            raise AIAvailabilityError("LLM response did not contain text content.")
+        return content
+
+
 class LLMAIAdapter:
     """Optional pluggable LLM boundary.
 
@@ -406,10 +493,40 @@ class LLMAIAdapter:
         *,
         provider: str = "openai",
         client: Optional[Callable[[str], str]] = None,
+        base_url: Optional[str] = None,
+        model: Optional[str] = None,
+        timeout: float = 30.0,
+        http_client: Optional[httpx.Client] = None,
     ) -> None:
         self.api_key = api_key
         self.provider = provider
         self.client = client
+        self.base_url = base_url
+        self.model = model
+        self.timeout = timeout
+        self.http_client = http_client
+
+    def _client(self) -> Callable[[str], str]:
+        if self.client is not None:
+            return self.client
+        environ = dict(os.environ)
+        if self.base_url:
+            environ["FLOWOPS_AI_BASE_URL"] = self.base_url
+        if self.model:
+            environ["FLOWOPS_AI_MODEL"] = self.model
+        base_url, model, timeout = provider_settings(self.provider, environ)
+        if not base_url or not model:
+            raise AIAvailabilityError(
+                "LLM adapter requires FLOWOPS_AI_BASE_URL and FLOWOPS_AI_MODEL "
+                f"for provider {self.provider!r}."
+            )
+        return OpenAICompatibleClient(
+            base_url,
+            model,
+            api_key=self.api_key,
+            timeout=timeout,
+            http_client=self.http_client,
+        )
 
     def _prompt(self, ticket: TicketSnapshot) -> str:
         articles = ", ".join(article.id for article in KNOWLEDGE_BASE)
@@ -426,14 +543,11 @@ class LLMAIAdapter:
         ticket: TicketSnapshot,
         history: Sequence[Mapping[str, Any]] = (),
     ) -> TriageResult:
-        if not self.api_key:
+        if not self.api_key and self.provider != "ollama":
             raise AIAvailabilityError("FLOWOPS_AI_API_KEY is required for the LLM adapter.")
-        if self.client is None:
-            raise AIAvailabilityError(
-                "LLM adapter selected but no completion client is configured."
-            )
+        client = self._client()
         try:
-            payload = json.loads(self.client(self._prompt(ticket)))
+            payload = json.loads(client(self._prompt(ticket)))
         except (TypeError, ValueError, json.JSONDecodeError) as error:
             raise AIAvailabilityError("LLM adapter returned invalid JSON.") from error
         summary_text = str(payload.get("summary", "")).strip()
@@ -480,6 +594,8 @@ def adapter_from_environment(environ: Optional[Mapping[str, str]] = None) -> AIA
     values = values or process_environ
     name = values.get("FLOWOPS_AI_ADAPTER", "simulated").lower()
     api_key = values.get("FLOWOPS_AI_API_KEY", "")
-    if name in ("llm", "openai", "claude", "gemini") and api_key:
+    if name == "ollama":
+        return LLMAIAdapter("", provider="ollama")
+    if name in PROVIDER_DEFAULTS and api_key:
         return LLMAIAdapter(api_key, provider=name)
     return SimulatedAIAdapter()
