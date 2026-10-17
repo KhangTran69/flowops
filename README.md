@@ -51,6 +51,8 @@ flowops/
 ├── .github/workflows/ci.yml  # GitHub Actions: install dependencies and run pytest
 ├── Dockerfile                # Small API image
 ├── docker-compose.yml        # API + PostgreSQL demo stack
+├── docs/portfolio-demo.md    # Guided interview/portfolio walkthrough
+├── scripts/demo_smoke.sh     # Local end-to-end smoke test
 ├── .gitignore  .env.example  requirements.txt  README.md
 ```
 
@@ -70,6 +72,14 @@ uvicorn src.api:app --reload        # http://127.0.0.1:8000
 ```
 
 Key URLs: `/` landing page · `/docs` interactive API docs · `/dashboard` monitoring.
+
+For a guided five-minute walkthrough, see
+[`docs/portfolio-demo.md`](docs/portfolio-demo.md). Once the API is running,
+the repeatable local smoke test is:
+
+```bash
+./scripts/demo_smoke.sh
+```
 
 ### PostgreSQL (optional)
 
@@ -156,6 +166,7 @@ curl -X POST http://127.0.0.1:8000/onboarding-requests -H 'Content-Type: applica
 
 ```bash
 pytest    # 82 tests, fully offline: mocked HTTP, SQLite in tmp dirs
+python -m compileall -q src tests
 ```
 
 ## Roadmap status
@@ -164,4 +175,5 @@ pytest    # 82 tests, fully offline: mocked HTTP, SQLite in tmp dirs
 - ⬜ v0.6 — Power Automate / Microsoft Graph / PowerShell behind the onboarding checklists (needs real credentials)
 - ⬜ v0.7 — Controlled MCP and Claude-powered ticket assistance with human approval gates (needs AI credentials)
 - ✅ v1.0 foundation — Offline CI workflow and Docker Compose PostgreSQL demo
-- ⬜ v1.0 — Deployment, screenshots, and portfolio demonstration
+- ✅ v1.0 foundation — Guided portfolio demo and repeatable local smoke test
+- ⬜ v1.0 — Public deployment and screenshots
