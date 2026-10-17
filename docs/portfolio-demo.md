@@ -168,3 +168,35 @@ check for concurrent intake/replay, not a benchmark.
 - Auth is optional locally, role-aware when enabled, and records the actor in
   the audit trail.
 - Migrations run in the container entrypoint; the image runs as non-root.
+
+
+## 8. Show the AI support agent
+
+1. Create a ticket, then open `/ui/tickets` and select it.
+2. Click **Run AI triage** or call:
+
+```bash
+curl -X POST http://127.0.0.1:8000/tickets/42/ai-triage
+```
+
+The response contains a deterministic summary, urgency signals, ranked
+knowledge-base matches, and stable recommendation IDs. The ticket is unchanged.
+
+3. Review the suggestions. Apply only the ones you approve:
+
+```bash
+curl -X POST http://127.0.0.1:8000/tickets/42/ai-recommendations/apply \
+  -H 'Content-Type: application/json' \
+  -d '{"recommendation_ids":["queue-reassign","priority-upgrade"]}'
+```
+
+Only queue and priority can change; status is never modified by AI. The UI
+(`/ui/tickets/42?triage=1`) provides checkboxes and an Apply button.
+
+4. Inspect `/execution-logs?actor=local-development` or `/ui/audit` for
+`ai.summarize`, `ai.recommend`, and `ai.recommendation_applied` with actor and
+correlation ID.
+
+The simulated adapter is credential-free. The optional `LLMAIAdapter` is a
+pluggable boundary and is not called by tests; no paid LLM key is required to
+run the demo.

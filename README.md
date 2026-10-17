@@ -32,7 +32,7 @@ FlowOps is an IT workflow automation platform. It receives support tickets and o
 | v1.0 Operations: readiness, metrics, migrations | ✅ | `/ready`, `/metrics`, correlation IDs, Alembic baseline, container migration entrypoint |
 | v1.0 CI + Docker | ✅ | GitHub Actions runs pytest, a Docker Compose API + PostgreSQL smoke test, and PostgreSQL reliability tests |
 | v0.6 Microsoft 365 actions | ⬜ | Real account creation via Power Automate / Microsoft Graph / PowerShell (needs credentials) |
-| v0.7 AI support agent | ⬜ | MCP/Claude assistance with human approval gates (needs AI credentials) |
+| v0.7 AI support agent | ✅ | Simulated AI triage, KB search, suggest-only recommendations, human-approved apply gate |
 
 ## Technology stack
 
@@ -60,6 +60,7 @@ flowops/
 │   ├── outbox.py             # leased outbox claim/finalize helpers
 │   ├── outbox_worker.py      # automatic notification dispatcher
 │   ├── auth.py               # bearer/Entra auth and role helpers
+│   ├── ai_agent.py           # simulated AI agent, KB search, optional LLM boundary
 │   ├── web.py                # Jinja2 rendering helpers
 │   ├── templates/            # shared layout, landing, dashboard, operator pages
 │   └── static/               # local CSS and vanilla JavaScript
@@ -70,6 +71,7 @@ flowops/
 ├── Dockerfile                # Non-root API/worker image with migration entrypoint
 ├── docker-compose.yml        # API + worker + PostgreSQL demo stack
 ├── alembic.ini               # Migration configuration
+├── src/ai_agent.py           # simulated AI agent, KB, optional LLM boundary
 ├── docs/portfolio-demo.md    # Guided interview/portfolio walkthrough
 ├── docs/architecture.md      # Data flow and reliability boundaries
 ├── scripts/demo_smoke.sh     # Local end-to-end smoke test
@@ -163,6 +165,10 @@ services without deleting the stored PostgreSQL data. Use
 | `POST /workflow-jobs/{id}/cancel` | Cancel a queued or retry-scheduled job |
 | `GET /execution-logs?status=&actor=&limit=` | Recent workflow runs, newest first |
 | `GET /audit?limit=` | Actor-attributed execution rows |
+| `POST /tickets/{id}/ai-triage` | Summarize a ticket, search the KB, and return suggestions (no mutation) |
+| `POST /tickets/{id}/ai-recommendations/apply` | Operator-approved apply of queue/priority recommendations |
+| `GET /knowledge-base?query=&category=` | List or search the simulated IT knowledge base |
+| `GET /ui/tickets[/{id}]` | Operator ticket list/detail with an AI triage panel |
 | `GET /ready` | Readiness probe including database connectivity |
 | `GET /metrics` | Prometheus-style request, job, and outbox metrics |
 | `GET /dashboard` | Server-rendered HTML monitoring dashboard |
@@ -198,6 +204,27 @@ A failed in-request webhook delivery is stored in `notification_outbox` as `pend
 - `POST /notifications/retry` never selects `failed` rows; an operator must requeue them first.
 
 Requeue preserves the attempt history and last error, so each requeue grants one more delivery attempt and a still-failing delivery returns to `failed`. The conditional transition prevents two operators from requeueing the same row twice. Delivery remains **at-least-once**: the outbox prevents silent loss, but receivers should deduplicate using the ticket ID or event data.
+
+### AI support agent (v0.7)
+
+The AI boundary is suggest-only by default:
+
+- `POST /tickets/{id}/ai-triage` returns a structured summary, urgency signals,
+  ranked knowledge-base matches, and recommendations. It never mutates the
+  ticket.
+- Recommendations are stable IDs such as `queue-reassign`, `priority-upgrade`,
+  `reply-draft`, and `onboarding-checklist`. Only queue/priority are applicable.
+- `POST /tickets/{id}/ai-recommendations/apply` requires an operator actor and
+  an explicit list of recommendation IDs. It re-runs triage server-side and
+  applies only those IDs; status is never changed by AI.
+- The simulated adapter is deterministic and credential-free. `FLOWOPS_AI_ADAPTER=llm`
+  with `FLOWOPS_AI_API_KEY` selects the optional pluggable `LLMAIAdapter`, which
+  requires an injected completion client (tests use a fake; no network calls).
+- Every triage and apply action writes `ai.summarize`, `ai.recommend`, or
+  `ai.recommendation_applied` execution logs with actor, duration, and
+  correlation ID.
+- `/ui/tickets/{id}?triage=1` renders the summary, KB guidance, and approval
+  checkboxes; the Apply button calls the approval endpoint.
 
 ## How routing works
 
@@ -324,7 +351,7 @@ No real secrets or Microsoft tenant are included.
 ## Running the tests
 
 ```bash
-pytest    # 183 passed, 12 skipped locally; the skips are PostgreSQL-only tests
+pytest    # 197 passed, 13 skipped locally; the skips are PostgreSQL-only tests
 python -m compileall -q src tests
 ```
 
@@ -334,7 +361,7 @@ The default suite is fully offline: mocked HTTP and temporary SQLite databases. 
 FLOWOPS_TEST_POSTGRES_URL="postgresql+psycopg://flowops:flowops@127.0.0.1:5432/flowops" \
   pytest -q tests/test_idempotency_postgres.py tests/test_outbox_postgres.py \
            tests/test_jobs_postgres.py tests/test_outbox_worker_postgres.py \
-           tests/test_offboarding_postgres.py
+           tests/test_offboarding_postgres.py tests/test_ai_postgres.py
 ```
 
 The CI `postgres-idempotency` job supplies a `postgres:16` service, runs
@@ -348,7 +375,7 @@ a live local API (not a benchmark).
 
 - ✅ v0.1–v0.5 and the monitoring dashboard (see table above)
 - ⬜ v0.6 — Power Automate / Microsoft Graph / PowerShell behind the onboarding checklists (needs real credentials)
-- ⬜ v0.7 — Controlled MCP and Claude-powered ticket assistance with human approval gates (needs AI credentials)
+- ✅ v0.7 — Simulated AI triage, KB search, and human-approved recommendations (optional pluggable LLM boundary)
 - ✅ v1.0 foundation — Offline CI workflow and Docker Compose PostgreSQL demo
 - ✅ v1.0 reliability — Fenced idempotency ownership with stale-takeover protection on SQLite and PostgreSQL
 - ✅ v1.0 reliability — Onboarding idempotency and notification dead-letter/requeue workflow

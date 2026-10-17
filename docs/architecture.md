@@ -75,6 +75,16 @@ require a dev bearer token or Entra JWT and record the actor on execution logs.
 `/ready` checks the database; `/metrics` exposes request, job, and outbox
 gauges; every response carries a correlation ID.
 
+## AI assistance boundary
+
+The AI layer is intentionally suggest-only. `src/ai_agent.py` produces a
+deterministic summary, keyword-ranked KB matches, and stable recommendation
+IDs. `POST /tickets/{id}/ai-recommendations/apply` re-runs triage and only
+applies the IDs an operator explicitly approves, and only queue/priority
+fields. The optional LLM adapter is a pluggable client boundary; the default
+simulated adapter needs no credentials and is what tests exercise. Every AI
+action is written to the execution log with actor and correlation ID.
+
 ## Deliberate limits
 
 This is a localhost learning prototype. Real Microsoft 365 actions and

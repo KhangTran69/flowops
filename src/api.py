@@ -28,7 +28,7 @@ from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
-from src import db, jobs, web
+from src import ai_agent, db, jobs, web
 from src.actions import (
     ACTION_BY_STEP,
     ActionAdapter,
@@ -50,6 +50,7 @@ from src.routing import route_ticket
 from src.ticket_processor import normalize_ticket
 
 ACTION_ADAPTER: ActionAdapter = adapter_from_environment()
+AI_ADAPTER: ai_agent.AIAdapter = ai_agent.adapter_from_environment()
 DEFAULT_ACTION_ATTEMPTS = 3
 DEFAULT_NOTIFICATION_MAX_ATTEMPTS = 5
 IDEMPOTENCY_PROCESSING_TIMEOUT = timedelta(minutes=5)
@@ -526,6 +527,61 @@ class Ticket(BaseModel):
     queue: Optional[str] = None
 
 
+class KnowledgeBaseArticleOut(BaseModel):
+    id: str
+    title: str
+    category: str
+    keywords: list[str]
+    steps: list[str]
+    summary: str
+
+
+class KnowledgeBaseMatchOut(BaseModel):
+    article: KnowledgeBaseArticleOut
+    score: int
+
+
+class AISummaryOut(BaseModel):
+    text: str
+    requester_id: int
+    title: str
+    status: str
+    priority: str
+    category: Optional[str] = None
+    queue: Optional[str] = None
+    urgency_signals: list[str]
+    history_count: int
+
+
+class AIRecommendationOut(BaseModel):
+    id: str
+    kind: str
+    title: str
+    current: Optional[str] = None
+    suggested: Optional[str] = None
+    rationale: str
+    confidence: int
+    applicable: bool
+
+
+class AITriageOut(BaseModel):
+    ticket_id: str
+    summary: AISummaryOut
+    knowledge_base: list[KnowledgeBaseMatchOut]
+    recommendations: list[AIRecommendationOut]
+    adapter: str
+    generated_at: datetime
+
+
+class AIApplyRequest(BaseModel):
+    recommendation_ids: list[StrictStr] = Field(min_length=1)
+
+
+class AIApplyOut(BaseModel):
+    ticket: Ticket
+    applied: list[str]
+
+
 class WorkflowJobOut(BaseModel):
     """Durable workflow queue entry exposed to operators."""
 
@@ -555,6 +611,7 @@ class ExecutionLogOut(BaseModel):
     duration_ms: int
     detail: Optional[str] = None
     actor_subject: Optional[str] = None
+    correlation_id: Optional[str] = None
     created_at: datetime
 
 
@@ -891,6 +948,225 @@ def create_ticket(
         raise
 
 
+# ---------------------------------------------------------------------------
+# Routes: AI triage and knowledge base
+
+
+def _load_ticket(session: Session, ticket_id: str) -> db.TicketRecord:
+    if not ticket_id.isdigit():
+        raise HTTPException(status_code=404, detail="Ticket not found.")
+    record = session.get(db.TicketRecord, ticket_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Ticket not found.")
+    return record
+
+
+def _ticket_history(
+    session: Session, ticket_id: str, limit: int = 20
+) -> list[dict[str, Any]]:
+    records = session.execute(
+        select(db.ExecutionLogRecord)
+        .where(db.ExecutionLogRecord.ticket_id == ticket_id)
+        .order_by(db.ExecutionLogRecord.id.desc())
+        .limit(limit)
+    ).scalars().all()
+    return [
+        {
+            "action": row.action,
+            "status": row.status,
+            "detail": row.detail,
+            "created_at": row.created_at,
+        }
+        for row in records
+    ]
+
+
+def _article_out(article: ai_agent.KnowledgeBaseArticle) -> KnowledgeBaseArticleOut:
+    return KnowledgeBaseArticleOut(
+        id=article.id,
+        title=article.title,
+        category=article.category,
+        keywords=list(article.keywords),
+        steps=list(article.steps),
+        summary=article.summary,
+    )
+
+
+def _triage_out(result: ai_agent.TriageResult) -> AITriageOut:
+    return AITriageOut(
+        ticket_id=result.ticket.ticket_id,
+        summary=AISummaryOut(
+            text=result.summary.text,
+            requester_id=result.summary.requester_id,
+            title=result.summary.title,
+            status=result.summary.status,
+            priority=result.summary.priority,
+            category=result.summary.category,
+            queue=result.summary.queue,
+            urgency_signals=list(result.summary.urgency_signals),
+            history_count=result.summary.history_count,
+        ),
+        knowledge_base=[
+            KnowledgeBaseMatchOut(
+                article=_article_out(match.article), score=match.score
+            )
+            for match in result.knowledge_base
+        ],
+        recommendations=[
+            AIRecommendationOut(
+                id=recommendation.id,
+                kind=recommendation.kind,
+                title=recommendation.title,
+                current=recommendation.current,
+                suggested=recommendation.suggested,
+                rationale=recommendation.rationale,
+                confidence=recommendation.confidence,
+                applicable=recommendation.applicable,
+            )
+            for recommendation in result.recommendations
+        ],
+        adapter=result.adapter,
+        generated_at=db.utcnow(),
+    )
+
+
+def _analyze_ticket(
+    record: db.TicketRecord, history: list[dict[str, Any]]
+) -> ai_agent.TriageResult:
+    snapshot = ai_agent.TicketSnapshot.from_record(record)
+    try:
+        return AI_ADAPTER.analyze(snapshot, history)
+    except ai_agent.AIAvailabilityError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+
+@app.post("/tickets/{ticket_id}/ai-triage", response_model=AITriageOut)
+def triage_ticket(
+    ticket_id: str,
+    request: Request,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> AITriageOut:
+    """Run AI triage and return suggestions without changing ticket state."""
+    record = _load_ticket(session, ticket_id)
+    history = _ticket_history(session, ticket_id)
+    started = time.perf_counter()
+    result = _analyze_ticket(record, history)
+    duration_ms = int((time.perf_counter() - started) * 1000)
+    correlation_id = getattr(request.state, "correlation_id", None)
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="ai.summarize",
+        status="success",
+        ticket_id=ticket_id,
+        duration_ms=duration_ms,
+        detail=f"adapter={result.adapter}; history={len(history)}",
+        actor_subject=actor.subject,
+        correlation_id=correlation_id,
+    )
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="ai.recommend",
+        status="success",
+        ticket_id=ticket_id,
+        duration_ms=duration_ms,
+        detail=(
+            f"adapter={result.adapter}; recommendations={len(result.recommendations)}; "
+            f"kb={len(result.knowledge_base)}"
+        ),
+        actor_subject=actor.subject,
+        correlation_id=correlation_id,
+    )
+    session.commit()
+    return _triage_out(result)
+
+
+@app.post(
+    "/tickets/{ticket_id}/ai-recommendations/apply",
+    response_model=AIApplyOut,
+)
+def apply_ai_recommendations(
+    ticket_id: str,
+    payload: AIApplyRequest,
+    request: Request,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> AIApplyOut:
+    """Apply explicitly approved AI suggestions to queue/priority only.
+
+    The server re-runs triage and applies only recommendation IDs the operator
+    submitted. Informational suggestions and status changes are never applied.
+    """
+    record = _load_ticket(session, ticket_id)
+    history = _ticket_history(session, ticket_id)
+    started = time.perf_counter()
+    result = _analyze_ticket(record, history)
+    by_id = {recommendation.id: recommendation for recommendation in result.recommendations}
+    unknown = [item for item in payload.recommendation_ids if item not in by_id]
+    if unknown:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown AI recommendation id(s): {', '.join(unknown)}.",
+        )
+
+    applied: list[str] = []
+    applied_fields: list[str] = []
+    for recommendation in (by_id[item] for item in payload.recommendation_ids):
+        if not recommendation.applicable or recommendation.id in applied:
+            continue
+        if recommendation.kind == "queue" and recommendation.suggested:
+            record.queue = recommendation.suggested
+            applied.append(recommendation.id)
+            applied_fields.append(f"queue={recommendation.suggested}")
+        elif recommendation.kind == "priority" and recommendation.suggested:
+            record.priority = recommendation.suggested
+            applied.append(recommendation.id)
+            applied_fields.append(f"priority={recommendation.suggested}")
+
+    if not applied:
+        raise HTTPException(
+            status_code=409,
+            detail="No applicable AI recommendations were selected.",
+        )
+
+    session.flush()
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="ai.recommendation_applied",
+        status="success",
+        ticket_id=ticket_id,
+        duration_ms=int((time.perf_counter() - started) * 1000),
+        detail=f"recommendations={','.join(applied)}; {'; '.join(applied_fields)}",
+        actor_subject=actor.subject,
+        correlation_id=getattr(request.state, "correlation_id", None),
+    )
+    session.commit()
+    return AIApplyOut(
+        ticket=Ticket.model_validate(record, from_attributes=True),
+        applied=applied,
+    )
+
+
+@app.get("/knowledge-base", response_model=list[KnowledgeBaseArticleOut])
+def get_knowledge_base(
+    query: Optional[str] = Query(default=None),
+    category: Optional[str] = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=50),
+) -> list[KnowledgeBaseArticleOut]:
+    """List or search the simulated IT knowledge base."""
+    if query:
+        matches = ai_agent.search_knowledge_base(query, limit=limit)
+        articles = [match.article for match in matches]
+    else:
+        articles = list(ai_agent.list_knowledge_base())
+    if category:
+        articles = [article for article in articles if article.category == category]
+    return [_article_out(article) for article in articles]
+
+
 @app.get("/tickets", response_model=list[Ticket])
 def list_tickets(
     session: Session = Depends(db.get_session),
@@ -1120,6 +1396,73 @@ def get_onboarding_request_status(
         percent_complete=percent,
     )
 
+
+
+@app.get("/ui/tickets", response_class=HTMLResponse, include_in_schema=False)
+def ui_tickets(
+    request: Request, session: Session = Depends(db.get_session)
+) -> HTMLResponse:
+    """Operator ticket list with an AI-triage entry point."""
+    records = session.execute(
+        select(db.TicketRecord).order_by(db.TicketRecord.ticket_id)
+    ).scalars().all()
+    tickets = [Ticket.model_validate(row, from_attributes=True) for row in records]
+    tickets.sort(key=lambda ticket: int(ticket.ticket_id))
+    return web.render(
+        request,
+        "tickets.html",
+        {"active": "tickets", "tickets": tickets},
+    )
+
+
+@app.get(
+    "/ui/tickets/{ticket_id}",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+)
+def ui_ticket_detail(
+    request: Request,
+    ticket_id: str,
+    triage: bool = Query(default=False),
+    session: Session = Depends(db.get_session),
+) -> HTMLResponse:
+    """Ticket detail page with an optional AI-triage panel."""
+    record = _load_ticket(session, ticket_id)
+    result: Optional[AITriageOut] = None
+    if triage:
+        history = _ticket_history(session, ticket_id)
+        analysis = _analyze_ticket(record, history)
+        correlation_id = getattr(request.state, "correlation_id", None)
+        started = time.perf_counter()
+        db.log_execution(
+            session,
+            run_id=_new_run_id(),
+            action="ai.summarize",
+            status="success",
+            ticket_id=ticket_id,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            detail=f"adapter={analysis.adapter}; source=operator-ui",
+            actor_subject="operator-ui",
+            correlation_id=correlation_id,
+        )
+        db.log_execution(
+            session,
+            run_id=_new_run_id(),
+            action="ai.recommend",
+            status="success",
+            ticket_id=ticket_id,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            detail=f"adapter={analysis.adapter}; source=operator-ui",
+            actor_subject="operator-ui",
+            correlation_id=correlation_id,
+        )
+        session.commit()
+        result = _triage_out(analysis)
+    return web.render(
+        request,
+        "ticket_detail.html",
+        {"active": "tickets", "ticket": record, "triage": result},
+    )
 
 
 @app.get(
@@ -2201,7 +2544,7 @@ def list_execution_logs(
         ExecutionLogOut(
             **{c: getattr(record, c) for c in (
                 "id", "run_id", "action", "status", "ticket_id",
-                "duration_ms", "detail", "actor_subject", "created_at",
+                "duration_ms", "detail", "actor_subject", "correlation_id", "created_at",
             )}
         )
         for record in records
@@ -2231,7 +2574,7 @@ def list_audit_trail(
         ExecutionLogOut(
             **{c: getattr(record, c) for c in (
                 "id", "run_id", "action", "status", "ticket_id",
-                "duration_ms", "detail", "actor_subject", "created_at",
+                "duration_ms", "detail", "actor_subject", "correlation_id", "created_at",
             )}
         )
         for record in records
@@ -2311,6 +2654,7 @@ def dashboard(
             "status": log.status,
             "ticket_id": log.ticket_id,
             "actor_subject": log.actor_subject,
+            "correlation_id": log.correlation_id,
             "duration_ms": log.duration_ms,
         }
         for log in logs[:50]

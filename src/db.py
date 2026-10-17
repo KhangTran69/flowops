@@ -85,6 +85,7 @@ class ExecutionLogRecord(Base):
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     actor_subject: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    correlation_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
@@ -470,6 +471,7 @@ def log_execution(
     duration_ms: int = 0,
     detail: Optional[str] = None,
     actor_subject: Optional[str] = None,
+    correlation_id: Optional[str] = None,
 ) -> None:
     """Append an execution-log row for the current run."""
     session.add(
@@ -481,5 +483,6 @@ def log_execution(
             duration_ms=duration_ms,
             detail=detail,
             actor_subject=actor_subject,
+            correlation_id=correlation_id,
         )
     )

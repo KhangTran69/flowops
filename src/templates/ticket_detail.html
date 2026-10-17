@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}Ticket #{{ ticket.ticket_id }} — FlowOps{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <span class="eyebrow"><a href="/ui/tickets">Tickets</a> / #{{ ticket.ticket_id }}</span>
+    <h1>{{ ticket.title }}</h1>
+    <p class="muted">Requester #{{ ticket.requester_id }} · {{ ticket.category or 'unclassified' }} · {{ ticket.queue or 'unrouted' }}</p>
+  </div>
+  <div class="toolbar">
+    <span class="badge {{ 'ok' if ticket.status == 'closed' else 'info' }}">{{ ticket.status }}</span>
+    <span class="badge">{{ ticket.priority }}</span>
+    {% if not triage %}
+    <a class="button primary" href="/ui/tickets/{{ ticket.ticket_id }}?triage=1">Run AI triage</a>
+    {% else %}
+    <a class="button" href="/ui/tickets/{{ ticket.ticket_id }}?triage=1">Re-run triage</a>
+    {% endif %}
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Ticket details</h2>
+  <dl class="details">
+    <dt>Status</dt><dd>{{ ticket.status }}</dd>
+    <dt>Priority</dt><dd>{{ ticket.priority }}</dd>
+    <dt>Category</dt><dd>{{ ticket.category or '—' }}</dd>
+    <dt>Queue</dt><dd>{{ ticket.queue or '—' }}</dd>
+    <dt>Created</dt><dd>{{ ticket.created_at }}</dd>
+    <dt>Resolution</dt><dd>{{ ticket.resolution_note or '—' }}</dd>
+  </dl>
+</section>
+
+{% if triage %}
+<section class="panel" aria-labelledby="ai-heading">
+  <div class="panel-head">
+    <h2 id="ai-heading">AI Triage</h2>
+    <span class="badge info">adapter: {{ triage.adapter }}</span>
+  </div>
+  <p>{{ triage.summary.text }}</p>
+  {% if triage.summary.urgency_signals %}
+  <p class="small muted">Urgency signals:
+    {% for signal in triage.summary.urgency_signals %}<span class="badge">{{ signal }}</span> {% endfor %}
+  </p>
+  {% endif %}
+
+  <h3>Knowledge base matches</h3>
+  {% if triage.knowledge_base %}
+  <div class="feature-grid">
+    {% for match in triage.knowledge_base %}
+    <article class="feature-card">
+      <h3><a href="/knowledge-base?query={{ match.article.id }}">{{ match.article.title }}</a></h3>
+      <p>{{ match.article.summary }}</p>
+      <p class="small muted">score {{ match.score }} · {{ match.article.category }}</p>
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="empty">No knowledge-base match.</p>
+  {% endif %}
+
+  <h3>Recommendations</h3>
+  {% if triage.recommendations %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Approve</th><th>Recommendation</th><th>Current</th><th>Suggested</th><th>Why</th><th>Confidence</th></tr></thead>
+      <tbody>
+        {% for recommendation in triage.recommendations %}
+        <tr>
+          <td>
+            {% if recommendation.applicable %}
+            <input type="checkbox" name="ai-recommendation" value="{{ recommendation.id }}" aria-label="Approve {{ recommendation.title }}">
+            {% else %}
+            <span class="muted small">info only</span>
+            {% endif %}
+          </td>
+          <td>{{ recommendation.title }}</td>
+          <td>{{ recommendation.current or '—' }}</td>
+          <td>{{ recommendation.suggested or '—' }}</td>
+          <td class="muted small">{{ recommendation.rationale }}</td>
+          <td>{{ recommendation.confidence }}%</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="toolbar" style="margin-top: 0.8rem;">
+    <button class="button primary" type="button" data-ai-apply="/tickets/{{ ticket.ticket_id }}/ai-recommendations/apply">Apply selected</button>
+    <span class="muted small">Applying changes only queue/priority. Status is never changed by AI.</span>
+  </div>
+  {% else %}
+  <p class="empty">No recommendations for this ticket.</p>
+  {% endif %}
+</section>
+{% endif %}
+{% endblock %}
