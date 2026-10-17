@@ -107,8 +107,7 @@ class CompiledPredicate:
     max_depth: int
 
     def __call__(self, context: Optional[Dict[str, Any]] = None) -> bool:
-        outcome = evaluate(self.source, context or {})
-        return outcome.value
+        return evaluate(self.source, context or {})
 
     @property
     def unknown_roots(self) -> Tuple[str, ...]:
@@ -283,14 +282,14 @@ class _Parser:
             return ("compare", nxt[1], left, self.parse_operand())
         if nxt == ("keyword", "in"):
             self.pos += 1
-            return ("compare", "in", self.parse_operand(), left)
+            return ("compare", "in", left, self.parse_operand())
         if nxt == ("keyword", "not"):
             # Only "X not in Y" is legal here; anything else is a syntax error.
             self.pos += 1
             if self.peek() != ("keyword", "in"):
                 raise ExpressionSyntaxError(f"unexpected token {self.peek()}")
             self.pos += 1
-            return ("not", ("compare", "in", self.parse_operand(), left))
+            return ("not", ("compare", "in", left, self.parse_operand()))
         if nxt == ("keyword", "contains"):
             self.pos += 1
             return ("compare", "contains", left, self.parse_operand())
@@ -399,9 +398,14 @@ def _compare(op: str, left: Any, right: Any) -> bool:
     if left is _MISSING or right is _MISSING:
         return False
     if op == "==":
-        return type(left) is type(right) and left == right if not isinstance(
-            left, (int, float)
-        ) else left == right
+        if isinstance(left, bool) != isinstance(right, bool):
+            # true/false are their own type here: 1 == true is False.
+            return False
+        if isinstance(left, bool):
+            return left is right
+        if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+            return left == right
+        return type(left) is type(right) and left == right
     if op == "!=":
         return not _compare("==", left, right)
     if op in {"<", "<=", ">", ">="}:

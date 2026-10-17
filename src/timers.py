@@ -317,3 +317,30 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
+
+
+def sync_timers(session, request_id: int, *, now: Optional[datetime] = None) -> int:
+    """Reconcile pending SLA timers with current step statuses.
+
+    * steps still ``pending`` (and with an SLA): ensure a live timer exists,
+      re-arming the deadline for steps that just became ready;
+    * steps that left ``pending``: cancel any leftover pending timer.
+
+    Returns the number of timers created or updated.  Cheap and idempotent —
+    callers (API/worker/scheduler) invoke it after every status change.
+    """
+    from src import db as _db  # local import to avoid cycles
+
+    items = session.execute(
+        select(_db.ChecklistItemRecord).where(
+            _db.ChecklistItemRecord.request_id == request_id
+        )
+    ).scalars().all()
+    touched = 0
+    for item in items:
+        if item.status == "pending" and getattr(item, "sla_minutes", None):
+            if ensure_step_timer(session, item, now=now) is not None:
+                touched += 1
+        elif item.status != "pending":
+            cancel_step_timer(session, item.id)
+    return touched

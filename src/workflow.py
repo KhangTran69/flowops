@@ -37,6 +37,21 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from src import expressions
 
+# Output keys that look secret-ish are redacted from audit rows (v1.3).
+_SENSITIVE_KEY_MARKERS = ("password", "secret", "token", "credential")
+
+
+def _redact_output(output: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy of ``output`` with password-like values replaced by '***'."""
+    safe: Dict[str, Any] = {}
+    for name, value in output.items():
+        lowered = str(name).lower()
+        if any(marker in lowered for marker in _SENSITIVE_KEY_MARKERS):
+            safe[name] = "***"
+        else:
+            safe[name] = value
+    return safe
+
 # Statuses used by checklist items (kept as plain strings, matching db.py).
 PENDING = "pending"
 IN_PROGRESS = "in_progress"
@@ -372,3 +387,231 @@ def states_from_records(items: Sequence[Any]) -> Dict[str, StepState]:
         key = getattr(item, "step_key", None) or f"legacy_{item.id}"
         states[key] = StepState(key=key, status=item.status, output=output)
     return states
+
+
+# ---------------------------------------------------------------------------
+# Record helpers: adapt ChecklistItemRecord rows for callers that need more
+# than specs/states (dependency lists, blockers, stored outputs).  All of
+# these accept either ORM rows or plain dicts so tests can stay lightweight.
+# ---------------------------------------------------------------------------
+def _as_dict(obj: Any) -> Dict[str, Any]:
+    """ORM row -> dict; dict -> dict(copy)."""
+    if isinstance(obj, dict):
+        return dict(obj)
+    keys = (
+        "id", "request_id", "step", "step_key", "queue", "requires_approval",
+        "status", "action", "result", "depends_on", "join_mode", "when_json",
+        "sla_minutes", "escalation_queue", "skip_reason",
+    )
+    return {key: getattr(obj, key, None) for key in keys}
+
+
+def _parsed_list(raw: Any) -> List[Any]:
+    """Parse a JSON-list column ('' / None / bad JSON all mean [])."""
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return list(raw)
+    try:
+        loaded = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return loaded if isinstance(loaded, list) else []
+
+
+def _parsed_dict(raw: Any) -> Dict[str, Any]:
+    """Parse a JSON-dict column into a dict (never raises)."""
+    if isinstance(raw, dict):
+        return dict(raw)
+    if not raw:
+        return {}
+    try:
+        loaded = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def state_key(item: Any) -> str:
+    """Stable graph key for one checklist row (legacy rows fall back to id)."""
+    data = item if isinstance(item, dict) else _as_dict(item)
+    return data.get("step_key") or f"legacy_{data.get('id')}"
+
+
+def dependencies_of(item: Any) -> List[str]:
+    """Prerequisite step keys recorded on this row."""
+    data = item if isinstance(item, dict) else _as_dict(item)
+    return [str(dep) for dep in _parsed_list(data.get("depends_on"))]
+
+
+def step_output(item: Any) -> Dict[str, Any]:
+    """Stored action output of one row (password-like values redacted)."""
+    data = item if isinstance(item, dict) else _as_dict(item)
+    return _redact_output(_parsed_dict(data.get("result")))
+
+
+def record_output(item: Any, output: Optional[Dict[str, Any]]) -> None:
+    """Persist an action's output dict onto the row (call before flush)."""
+    payload = json.dumps(output or {}, sort_keys=True, default=str)
+    if isinstance(item, dict):
+        item["result"] = payload
+    else:
+        item.result = payload
+
+
+def missing_prerequisites(item: Any, items: Sequence[Any]) -> List[str]:
+    """Keys of prerequisites that are not completed yet ([] when unmet-free).
+
+    'any'-join steps are satisfied as soon as ONE prerequisite completed;
+    'all' joins require every prerequisite to be completed.
+    """
+    data = item if isinstance(item, dict) else _as_dict(item)
+    deps = [str(dep) for dep in _parsed_list(data.get("depends_on"))]
+    if not deps:
+        return []
+    states = {state_key(other): (other if isinstance(other, dict) else _as_dict(other))
+              for other in items}
+    completed = [dep for dep in deps if states.get(dep, {}).get("status") == COMPLETED]
+    join = data.get("join_mode") or "all"
+    if join == "any":
+        return [] if completed else list(deps)
+    return [dep for dep in deps if dep not in completed]
+
+
+def blocked_status_detail(item: Any, missing: Sequence[str]) -> str:
+    """Human-readable 409 detail naming the unmet prerequisites."""
+    data = item if isinstance(item, dict) else _as_dict(item)
+    names = ", ".join(str(dep) for dep in missing)
+    return (
+        f"Step '{data.get('step')}' cannot run yet: unmet prerequisites: {names}. "
+        "Complete them first."
+    )
+
+
+def action_context_outputs(item: Any, items: Sequence[Any]) -> Dict[str, Any]:
+    """Outputs of completed prerequisite steps, merged for adapter contexts.
+
+    Earlier prerequisites (by row id) lose to later ones on key collisions;
+    password-like keys are always redacted before they reach a context.
+    """
+    ordered = sorted(items, key=lambda entry: _as_dict(entry).get("id") or 0)
+    merged: Dict[str, Any] = {}
+    for dep_key in dependencies_of(item):
+        for other in ordered:
+            other_data = other if isinstance(other, dict) else _as_dict(other)
+            if state_key(other) == dep_key and other_data.get("status") == COMPLETED:
+                merged.update(_redact_output(step_output(other)))
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# Shared transition engine (used by API, worker, scheduler, and ChatOps)
+# ---------------------------------------------------------------------------
+def apply_graph_transitions(
+    session: Any,
+    items: Sequence[Any],
+    *,
+    request_id: Optional[int] = None,
+    actor_subject: Optional[str] = None,
+    reason: Optional[str] = None,
+    now: Optional[Any] = None,
+) -> List[str]:
+    """Re-resolve the DAG against current statuses and persist outcomes.
+
+    * false predicates and 'any' joins whose prerequisites ALL ended
+      failed/skipped cascade to terminal ``skipped`` (transitively);
+    * every skip writes an audit-visible ``onboarding.item.skipped`` log row
+      naming the predicate/reason with password-like output values redacted;
+    * SLA timers are armed when a step enters pending (promotion time starts
+      the clock) and cancelled the moment it leaves pending;
+    * a request whose steps are ALL completed-or-skipped becomes completed.
+
+    Returns the step keys newly skipped this call.  Safe to call repeatedly;
+    it never marks completed work pending again.
+    """
+    from src import db  # local import keeps workflow.py DB-library-agnostic
+    from src import timers as timers_module
+
+    records = [item for item in items if not isinstance(item, dict)]
+    if request_id is None and records:
+        request_id = getattr(records[0], "request_id", None)
+
+    def _snapshot() -> Dict[str, StepState]:
+        states: Dict[str, StepState] = {}
+        for item in records:
+            key = state_key(item)
+            states[key] = StepState(
+                key=key,
+                status=item.status,
+                output=_parsed_dict(getattr(item, "result", None)),
+            )
+        return states
+
+    specs = specs_from_records(records)
+    spec_by_key = {spec.key: spec for spec in specs}
+    newly_skipped: List[str] = []
+    changed_any = False
+
+    for _round in range(len(specs) + 1):  # bounded: at most one skip per round
+        states = _snapshot()
+        decisions = resolve_graph(specs, states)
+        changed = False
+        for item in records:
+            key = state_key(item)
+            resolution = decisions.get(key)
+            if resolution is None:
+                continue
+            if (
+                resolution.decision == "skipped"
+                and item.status not in TERMINAL_STATUSES
+            ):
+                item.status = SKIPPED
+                item.skip_reason = resolution.reason
+                timers_module.cancel_step_timer(session, item.id)
+                detail = f"step '{item.step}' skipped: {resolution.reason}"
+                if reason:
+                    detail += f"; trigger: {reason}"
+                db.log_execution(
+                    session,
+                    run_id=f"graph-{key}",
+                    action="onboarding.item.skipped",
+                    status="success",
+                    ticket_id=str(request_id) if request_id is not None else None,
+                    duration_ms=0,
+                    detail=detail,
+                    actor_subject=actor_subject,
+                )
+                newly_skipped.append(key)
+                changed = True
+                changed_any = True
+            elif item.status == PENDING and resolution.decision == "ready":
+                if getattr(item, "sla_minutes", None):
+                    if timers_module.ensure_step_timer(session, item, now=now):
+                        changed = True  # re-armed on promotion
+        if not changed:
+            break
+        session.flush()
+
+    # Cancel timers for any step that left pending by other means too.
+    for item in records:
+        if item.status != PENDING:
+            timers_module.cancel_step_timer(session, item.id)
+
+    if records:
+        done = all(item.status in (COMPLETED, SKIPPED) for item in records)
+        if done and request_id is not None:
+            record = session.get(db.OnboardingRequestRecord, request_id)
+            if record is not None and record.status != "completed":
+                record.status = "completed"
+                db.log_execution(
+                    session,
+                    run_id=f"finalize-{request_id}",
+                    action="onboarding.request.completed",
+                    status="success",
+                    ticket_id=str(request_id),
+                    duration_ms=0,
+                    detail=f"all checklist steps done for request #{record.id}",
+                    actor_subject=actor_subject,
+                )
+    _ = changed_any
+    return newly_skipped

@@ -2014,8 +2014,6 @@ def _request_out(
             "department", "requester_id", "start_date", "status",
             "definition_key", "definition_version",
         )},
-        definition_key=record.definition_key,
-        definition_version=record.definition_version,
         checklist=checklist,
     )
 
@@ -2027,8 +2025,8 @@ def get_session_for_read():
 
 def apply_graph_transitions(
     session: Session,
-    record: db.OnboardingRequestRecord,
-    items: list[db.ChecklistItemRecord],
+    record_or_items,
+    items=None,
     *,
     actor_subject: Optional[str] = None,
     run_id: Optional[str] = None,
@@ -2047,49 +2045,25 @@ def apply_graph_transitions(
     API (onboarding + offboarding), worker, scheduler, and ChatOps so all
     entry points share identical semantics.
     """
-    from src import timers as timers_module
-    from src import workflow
+    """Delegate to the shared resolver in src.workflow (single source of truth).
 
-    specs = workflow.specs_from_records(items)
-    changed_any = False
-    for _round in range(len(specs) + 1):  # bounded: at most one skip per round
-        states = workflow.states_from_records(items)
-        decisions = workflow.resolve_graph(specs, states)
-        changed = False
-        for item in items:
-            resolution = decisions.get(item.step_key)
-            if resolution is None:
-                continue
-            if resolution.decision == "skipped" and item.status not in workflow.TERMINAL_STATUSES:
-                item.status = workflow.SKIPPED
-                item.skip_reason = resolution.reason
-                timers_module.cancel_step_timer(session, item.id)
-                db.log_execution(
-                    session,
-                    run_id=run_id or _new_run_id(),
-                    action="onboarding.item.skipped",
-                    status="success",
-                    duration_ms=0,
-                    detail=(
-                        f"step '{item.step}' skipped: {resolution.reason}"
-                    ),
-                    actor_subject=actor_subject,
-                )
-                changed = True
-                changed_any = True
-            elif item.status == "pending" and resolution.decision == "ready":
-                if timers_module.ensure_step_timer(session, item):
-                    changed = True  # re-armed on promotion
-        if not changed:
-            break
-        # refresh in-memory state objects after writes
-        session.flush()
-        items_map = {i.step_key: i for i in items}
-        states = workflow.states_from_records(items)
-        decisions = workflow.resolve_graph(specs, states)
-    if changed_any:
-        _finalize_request_status(session, record, items, actor_subject)
-    return items
+    Accepts either (record, items) or just (items,) with request_id=... so
+    every entry point — API, worker, scheduler, ChatOps — runs identical
+    graph semantics.
+    """
+    if items is None:  # called as apply_graph_transitions(session, items, ...)
+        resolved_items = list(record_or_items)
+        request_id = None
+    else:
+        resolved_items = list(items)
+        request_id = getattr(record_or_items, "id", None)
+    workflow.apply_graph_transitions(
+        session,
+        resolved_items,
+        request_id=request_id,
+        actor_subject=actor_subject,
+    )
+    return resolved_items
 
 
 def _finalize_request_status(
