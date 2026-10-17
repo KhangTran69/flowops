@@ -49,6 +49,8 @@ app = FastAPI(
     version="1.0.0-preview",
 )
 
+IDEMPOTENCY_PROCESSING_TIMEOUT = timedelta(minutes=5)
+
 
 def _new_run_id() -> str:
     return uuid.uuid4().hex[:12]
