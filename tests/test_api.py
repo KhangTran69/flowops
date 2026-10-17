@@ -3,6 +3,8 @@
 Fully offline: SQLite in a temp directory, HTTP via TestClient.
 """
 
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -149,6 +151,87 @@ def test_overlong_idempotency_key_rejected(client):
         "/tickets", json=VALID_REQUEST, headers={"Idempotency-Key": "x" * 129}
     )
     assert response.status_code == 422
+
+
+def test_same_payload_same_key_replays_without_reexecuting(client):
+    """Replaying the exact same payload + key returns the stored result.
+
+    The workflow must not run again: no second ticket row, no second
+    create/update log — only a `ticket.idempotent_replay` log entry.
+    """
+    headers = {"Idempotency-Key": "replay-key"}
+    first = client.post("/tickets", json=VALID_REQUEST, headers=headers)
+    actions_after_first = [log["action"] for log in client.get("/execution-logs").json()]
+
+    replay = client.post("/tickets", json=VALID_REQUEST, headers=headers)
+
+    assert first.status_code == 201
+    assert replay.status_code == 200
+    assert replay.headers["Idempotency-Replayed"] == "true"
+    assert replay.json() == first.json()
+    # Nothing was re-executed: still one ticket, and the only new log is the replay.
+    assert len(client.get("/tickets").json()) == 1
+    actions_after_replay = [log["action"] for log in client.get("/execution-logs").json()]
+    assert actions_after_replay == ["ticket.idempotent_replay"] + actions_after_first
+
+
+def test_different_payload_same_key_returns_409_without_reexecuting(client):
+    """A key bound to one payload must reject a different payload with 409."""
+    headers = {"Idempotency-Key": "conflict-key"}
+    client.post("/tickets", json=VALID_REQUEST, headers=headers)
+    actions_before_conflict = [
+        log["action"] for log in client.get("/execution-logs").json()
+    ]
+
+    conflict = client.post(
+        "/tickets", json={**VALID_REQUEST, "title": "Changed title"}, headers=headers
+    )
+
+    assert conflict.status_code == 409
+    assert "different request" in conflict.json()["detail"]
+    # The rejected request must not execute: original ticket untouched, no new logs.
+    assert client.get("/tickets/42").json()["title"] == VALID_REQUEST["title"]
+    assert [log["action"] for log in client.get("/execution-logs").json()] == (
+        actions_before_conflict
+    )
+
+
+def test_legacy_idempotency_record_without_fingerprint_fails_safe(client):
+    """Records saved before payload binding have no `request_hash`.
+
+    Reusing such a key must return 409 (fail safe: we cannot prove the
+    payload matches) instead of replaying or silently re-executing.
+    """
+    legacy_ticket = {
+        "ticket_id": "42",
+        "requester_id": 7,
+        "title": "Laptop will not start",
+        "status": "open",
+        "priority": "normal",
+        "category": "hardware",
+        "queue": "it-hardware",
+    }
+    legacy_payload = {"ticket": legacy_ticket}
+    # Create the schema up front (normally done lazily on the first request),
+    # then insert a pre-binding record directly, as an old deployment would have.
+    db.Base.metadata.create_all(db.engine)
+    with db.SessionLocal() as session:
+        session.add(
+            db.IdempotencyRecord(
+                key="legacy-key",
+                ticket_id="42",
+                response_json=json.dumps(legacy_payload),
+            )
+        )
+        session.commit()
+
+    response = client.post(
+        "/tickets", json=VALID_REQUEST, headers={"Idempotency-Key": "legacy-key"}
+    )
+
+    assert response.status_code == 409
+    # Fail-safe: nothing executed, so the tickets table stays empty.
+    assert client.get("/tickets").json() == []
 
 
 # --- Webhook intake (v0.4) ---
