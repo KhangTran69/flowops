@@ -2,7 +2,8 @@
 
 v0.3 adds database persistence and execution logs; v0.4 adds rule-based
 routing, outbound notifications, and an n8n-friendly webhook; v0.5 adds
-onboarding/offboarding checklists, idempotency keys, and delivery retries.
+onboarding/offboarding checklists, idempotency keys, and delivery retries;
+the v1.0 preview keeps failed webhook deliveries in a retryable outbox.
 """
 
 import hashlib
@@ -152,14 +153,18 @@ class OnboardingRequestOut(BaseModel):
 
 
 def _notify(event: str, ticket: Ticket, run_id: str, session: Session) -> None:
-    """Deliver the outbound webhook if configured; never raises."""
+    """Deliver the outbound webhook if configured; never raises.
+
+    A delivery that fails after all in-request retries is stored in the
+    notification outbox so it stays visible on the dashboard and can be
+    retried later via ``POST /notifications/retry``.
+    """
     webhook_url = os.environ.get("FLOWOPS_NOTIFICATION_WEBHOOK_URL")
     if not webhook_url:
         return
+    payload = {"event": event, "ticket": ticket.model_dump()}
     started = time.perf_counter()
-    delivery = deliver_webhook(
-        webhook_url, {"event": event, "ticket": ticket.model_dump()}
-    )
+    delivery = deliver_webhook(webhook_url, payload)
     duration_ms = int((time.perf_counter() - started) * 1000)
     detail = f"attempts={delivery.attempts}"
     if delivery.last_error:
@@ -173,6 +178,17 @@ def _notify(event: str, ticket: Ticket, run_id: str, session: Session) -> None:
         duration_ms=duration_ms,
         detail=detail,
     )
+    if not delivery.success:
+        session.add(
+            db.NotificationOutboxRecord(
+                url=webhook_url,
+                payload_json=json.dumps(payload, separators=(",", ":")),
+                ticket_id=ticket.ticket_id,
+                status="pending",
+                attempts=delivery.attempts,
+                last_error=delivery.last_error,
+            )
+        )
 
 
 def _process_intake(request: TicketIntakeRequest, session: Session) -> Ticket:
@@ -241,6 +257,7 @@ LANDING_PAGE = """<!doctype html>
     <li>GET /tickets &middot; GET /tickets/{ticket_id}</li>
     <li>POST /webhooks/intake &nbsp;(single or bulk, for n8n)</li>
     <li>POST / GET /onboarding-requests &middot; approve/complete items</li>
+    <li>GET /notifications/pending &middot; POST /notifications/retry</li>
     <li>GET /execution-logs &middot; GET /dashboard</li>
   </ul>
   <p><a href="/docs">Interactive API docs</a> &middot; <a href="/dashboard">Monitoring dashboard</a></p>
@@ -533,6 +550,83 @@ def complete_item(
 # Routes: monitoring
 
 
+class NotificationOutboxOut(BaseModel):
+    """One stored notification delivery, exposed for operators (v1.0 preview)."""
+
+    id: int
+    url: str
+    ticket_id: Optional[str] = None
+    status: str
+    attempts: int
+    last_error: Optional[str] = None
+    created_at: datetime
+
+
+def _outbox_out(record: db.NotificationOutboxRecord) -> NotificationOutboxOut:
+    return NotificationOutboxOut(
+        **{c: getattr(record, c) for c in (
+            "id", "url", "ticket_id", "status", "attempts",
+            "last_error", "created_at",
+        )}
+    )
+
+
+@app.get("/notifications/pending", response_model=list[NotificationOutboxOut])
+def list_pending_notifications(
+    session: Session = Depends(db.get_session),
+) -> list[NotificationOutboxOut]:
+    """List webhook deliveries that failed all retries and await a manual retry."""
+    records = session.execute(
+        select(db.NotificationOutboxRecord)
+        .where(db.NotificationOutboxRecord.status == "pending")
+        .order_by(db.NotificationOutboxRecord.id)
+    ).scalars().all()
+    return [_outbox_out(record) for record in records]
+
+
+@app.post("/notifications/retry", response_model=list[NotificationOutboxOut])
+def retry_failed_notifications(
+    session: Session = Depends(db.get_session),
+    limit: int = Query(default=20, ge=1, le=100),
+) -> list[NotificationOutboxOut]:
+    """Retry pending webhook deliveries once each (oldest first).
+
+    Successful retries are marked ``delivered``; still-failing ones stay
+    ``pending`` with an incremented attempt count. Every outcome is written
+    to the execution log as ``notification.retry``.
+    """
+    records = session.execute(
+        select(db.NotificationOutboxRecord)
+        .where(db.NotificationOutboxRecord.status == "pending")
+        .order_by(db.NotificationOutboxRecord.id)
+        .limit(limit)
+    ).scalars().all()
+    results = []
+    for record in records:
+        payload = json.loads(record.payload_json)
+        started = time.perf_counter()
+        # One bounded retry per call; the operator can call again later.
+        delivery = deliver_webhook(record.url, payload, max_attempts=1)
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        record.attempts += delivery.attempts
+        if delivery.success:
+            record.status = "delivered"
+            record.last_error = None
+        else:
+            record.last_error = delivery.last_error
+        db.log_execution(
+            session,
+            run_id=_new_run_id(),
+            action="notification.retry",
+            status="success" if delivery.success else "failure",
+            ticket_id=record.ticket_id,
+            duration_ms=duration_ms,
+            detail=f"outbox #{record.id}: now '{record.status}'",
+        )
+        results.append(_outbox_out(record))
+    return results
+
+
 @app.get("/execution-logs", response_model=list[ExecutionLogOut])
 def list_execution_logs(
     session: Session = Depends(db.get_session),
@@ -564,6 +658,11 @@ def dashboard(session: Session = Depends(db.get_session)) -> str:
     logs = session.execute(
         select(db.ExecutionLogRecord).order_by(db.ExecutionLogRecord.id.desc()).limit(200)
     ).scalars().all()
+    pending_deliveries = session.execute(
+        select(db.NotificationOutboxRecord).where(
+            db.NotificationOutboxRecord.status == "pending"
+        )
+    ).scalars().all()
 
     total = len(tickets)
     open_count = sum(1 for t in tickets if t.status == "open")
@@ -594,6 +693,32 @@ def dashboard(session: Session = Depends(db.get_session)) -> str:
         for log in logs[:15]
     )
 
+    outbox_card = (
+        f'<div class="card"><div class="value fail">{len(pending_deliveries)}'
+        '</div><div class="label">pending webhook retries</div></div>'
+        if pending_deliveries
+        else ""
+    )
+    outbox_section = ""
+    if pending_deliveries:
+        outbox_rows = "".join(
+            "<tr>"
+            f"<td>#{item.id}</td>"
+            f"<td>{html.escape(item.ticket_id or '')}</td>"
+            f"<td>{html.escape(item.url)}</td>"
+            f"<td>{item.attempts}</td>"
+            f"<td class=\"fail\">{html.escape(item.last_error or '')}</td>"
+            "</tr>"
+            for item in pending_deliveries[:15]
+        )
+        outbox_section = f"""<section>
+<h2>Failed webhook deliveries ({len(pending_deliveries)} pending)</h2>
+<p>Retry them with <code>POST /notifications/retry</code> &middot;
+list with <code>GET /notifications/pending</code>.</p>
+<table><tr><th>#</th><th>ticket</th><th>url</th><th>attempts</th><th>last error</th></tr>{outbox_rows}</table>
+</section>
+"""
+
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -612,6 +737,7 @@ def dashboard(session: Session = Depends(db.get_session)) -> str:
   th, td {{ text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #eef0f3; }}
   th {{ color: #5f6b7a; font-weight: 600; }}
   td.ok {{ color: #137333; }} td.fail {{ color: #c5221f; font-weight: 600; }}
+  .card .value.fail {{ color: #c5221f; }}
   .cols {{ display: flex; gap: 1.5rem; flex-wrap: wrap; }}
   .cols section {{ flex: 1; min-width: 16rem; }}
   a {{ color: #2563eb; }}
@@ -629,12 +755,13 @@ def dashboard(session: Session = Depends(db.get_session)) -> str:
   <div class="card"><div class="value">{failure_count}</div><div class="label">failed runs</div></div>
   <div class="card"><div class="value">{avg_duration} ms</div><div class="label">avg run duration</div></div>
   <div class="card"><div class="value">{hours_saved} h</div><div class="label">est. staff time saved</div></div>
+  {outbox_card}
 </div>
 <div class="cols">
   <section><h2>Tickets by queue</h2><table>{counter_rows(by_queue)}</table></section>
   <section><h2>Tickets by priority</h2><table>{counter_rows(by_priority)}</table></section>
 </div>
-<section>
+{outbox_section}<section>
   <h2>Recent workflow runs</h2>
   <table><tr><th>run</th><th>time</th><th>action</th><th>status</th><th>ticket</th><th>duration</th></tr>{recent_rows}</table>
 </section>
