@@ -135,3 +135,35 @@ def test_per_action_retry_limit_and_failure_notification(client, monkeypatch):
     assert notifications[0][1]["attempts"] == 2
     logs = client.get("/execution-logs").json()
     assert any(log["action"] == "notification.action_failure" for log in logs)
+
+
+def test_action_execution_audit_records_success(client):
+    request = client.post("/onboarding-requests", json=VALID_REQUEST).json()
+    item = request["checklist"][1]
+    response = client.post(f"/onboarding-requests/{request['id']}/items/{item['id']}/execute")
+    assert response.status_code == 200
+    executions = client.get(f"/onboarding-requests/{request['id']}/action-executions").json()
+    assert len(executions) == 1
+    execution = executions[0]
+    assert execution["action"] == "provision_hardware"
+    assert execution["status"] == "succeeded"
+    assert execution["adapter"] == "SimulatedMicrosoftAdapter"
+    assert execution["actor_subject"] == "local-development"
+    assert execution["attempt"] == 1
+    assert execution["correlation_id"]
+
+
+def test_action_execution_audit_records_retries(client, monkeypatch):
+    class FailingAdapter:
+        def execute(self, action, context):
+            raise RuntimeError("temporary adapter failure")
+
+    monkeypatch.setattr(api, "ACTION_ADAPTER", FailingAdapter())
+    request = client.post("/onboarding-requests", json=VALID_REQUEST).json()
+    item = request["checklist"][1]
+    response = client.post(f"/onboarding-requests/{request['id']}/items/{item['id']}/execute")
+    assert response.status_code == 502
+    executions = client.get(f"/onboarding-requests/{request['id']}/action-executions").json()
+    assert [entry["status"] for entry in executions] == ["retrying", "retrying", "failed"]
+    assert [entry["attempt"] for entry in executions] == [1, 2, 3]
+    assert all(entry["error_category"] == "adapter_error" for entry in executions)

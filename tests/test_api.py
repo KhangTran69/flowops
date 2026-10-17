@@ -43,6 +43,15 @@ def test_root_returns_html_landing_page(client):
     assert "/docs" in response.text
 
 
+def test_landing_page_has_no_merge_conflict_markers(client):
+    page = client.get("/").text
+    for marker in ("<<<<<<<", "=======", ">>>>>>>"):
+        assert marker not in page
+    assert "/onboarding-requests" in page
+    assert "/ui/notifications" in page
+    assert "/ui/onboarding-requests" in page
+
+
 # --- Ticket intake ---
 
 
@@ -57,9 +66,6 @@ def test_valid_ticket_is_routed_and_stored(client):
         "priority": "normal",
         "category": "hardware",
         "queue": "it-hardware",
-        # Ticket closing fields (v1.0 preview); set only via POST /tickets/42/close.
-        "resolution_note": None,
-        "closed_at": None,
     }
 
 
@@ -603,6 +609,7 @@ def test_existing_idempotency_table_gains_fencing_column(tmp_path):
         for column in inspect(db.engine).get_columns("idempotency_keys")
     }
     assert "owner_token" in columns
+    assert "resource_type" in columns
 
 
 # --- Webhook intake (v0.4) ---
@@ -743,8 +750,6 @@ def test_retry_endpoint_redelivers_pending_and_marks_delivered(client, monkeypat
             "ticket_id": "42", "requester_id": 7, "title": "Laptop will not start",
             "status": "open", "priority": "normal", "category": "hardware",
             "queue": "it-hardware",
-            # Closing fields are part of the ticket shape since v1.0 preview.
-            "resolution_note": None, "closed_at": None,
         },
     }
     assert client.get("/notifications/pending").json() == []
@@ -773,6 +778,87 @@ def test_retry_keeps_still_failing_delivery_pending(client, monkeypatch):
     )
 
 
+def test_retry_dead_letters_delivery_at_attempt_limit(client, monkeypatch):
+    fake = FakeDelivery([_failing_delivery(), _failing_delivery(attempts=1)])
+    monkeypatch.setattr(api, "deliver_webhook", fake)
+    monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
+    monkeypatch.setenv("FLOWOPS_NOTIFICATION_MAX_ATTEMPTS", "4")
+    client.post("/tickets", json=VALID_REQUEST)
+
+    retried = client.post("/notifications/retry").json()
+    assert [entry["status"] for entry in retried] == ["failed"]
+    assert retried[0]["attempts"] == 4
+    assert client.get("/notifications/pending").json() == []
+    failed = client.get("/notifications/failed").json()
+    assert len(failed) == 1
+    assert failed[0]["id"] == retried[0]["id"]
+    logs = client.get("/execution-logs").json()
+    assert any(log["action"] == "notification.dead_lettered" for log in logs)
+
+    # A dead-letter row is not retried again until an operator requeues it.
+    calls_before = len(fake.calls)
+    assert client.post("/notifications/retry").json() == []
+    assert len(fake.calls) == calls_before
+
+
+def test_requeue_failed_delivery_and_retry_succeeds(client, monkeypatch):
+    fake = FakeDelivery(
+        [
+            _failing_delivery(),
+            _failing_delivery(attempts=1),
+            _succeeding_delivery(attempts=1),
+        ]
+    )
+    monkeypatch.setattr(api, "deliver_webhook", fake)
+    monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
+    monkeypatch.setenv("FLOWOPS_NOTIFICATION_MAX_ATTEMPTS", "4")
+    client.post("/tickets", json=VALID_REQUEST)
+    client.post("/notifications/retry")  # 3 + 1 attempts -> dead-letter
+
+    failed = client.get("/notifications/failed").json()
+    assert len(failed) == 1
+    requeued = client.post(f"/notifications/{failed[0]['id']}/requeue")
+    assert requeued.status_code == 200
+    assert requeued.json()["status"] == "pending"
+    assert requeued.json()["attempts"] == 4
+    assert requeued.json()["last_error"] == "boom"
+    assert client.get("/notifications/failed").json() == []
+
+    retried = client.post("/notifications/retry").json()
+    assert [entry["status"] for entry in retried] == ["delivered"]
+    assert retried[0]["attempts"] == 5
+    assert retried[0]["last_error"] is None
+    assert client.get("/notifications/pending").json() == []
+    logs = client.get("/execution-logs").json()
+    assert any(log["action"] == "notification.requeued" for log in logs)
+
+
+def test_requeue_rejects_non_failed_or_unknown_delivery(client, monkeypatch):
+    fake = FakeDelivery([_failing_delivery()])
+    monkeypatch.setattr(api, "deliver_webhook", fake)
+    monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
+    client.post("/tickets", json=VALID_REQUEST)
+
+    pending = client.get("/notifications/pending").json()[0]
+    response = client.post(f"/notifications/{pending['id']}/requeue")
+    assert response.status_code == 409
+    assert "Only failed deliveries" in response.json()["detail"]
+    assert client.post("/notifications/999/requeue").status_code == 404
+
+
+def test_requeue_failed_delivery_only_once(client, monkeypatch):
+    fake = FakeDelivery([_failing_delivery(), _failing_delivery(attempts=1)])
+    monkeypatch.setattr(api, "deliver_webhook", fake)
+    monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
+    monkeypatch.setenv("FLOWOPS_NOTIFICATION_MAX_ATTEMPTS", "4")
+    client.post("/tickets", json=VALID_REQUEST)
+    client.post("/notifications/retry")
+
+    failed = client.get("/notifications/failed").json()[0]
+    assert client.post(f"/notifications/{failed['id']}/requeue").status_code == 200
+    assert client.post(f"/notifications/{failed['id']}/requeue").status_code == 409
+
+
 def test_retry_with_empty_queue_is_a_noop(client, monkeypatch):
     fake = FakeDelivery([])
     monkeypatch.setattr(api, "deliver_webhook", fake)
@@ -787,9 +873,23 @@ def test_dashboard_shows_pending_retries_section(client, monkeypatch):
     client.post("/tickets", json=VALID_REQUEST)
 
     page = client.get("/dashboard").text
-    assert "Failed webhook deliveries" in page
-    assert "pending webhook retries" in page
+    assert "Pending webhook deliveries" in page
+    assert "Pending notifications" in page
     assert "hooks.example" in page  # the failing URL is surfaced
+
+
+def test_dashboard_shows_dead_letter_section(client, monkeypatch):
+    fake = FakeDelivery([_failing_delivery(), _failing_delivery(attempts=1)])
+    monkeypatch.setattr(api, "deliver_webhook", fake)
+    monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
+    monkeypatch.setenv("FLOWOPS_NOTIFICATION_MAX_ATTEMPTS", "4")
+    client.post("/tickets", json=VALID_REQUEST)
+    client.post("/notifications/retry")
+
+    page = client.get("/dashboard").text
+    assert "Dead-letter notifications" in page
+    assert "requeue" in page
+    assert "hooks.example" in page
 
 
 # --- Dashboard (v1.0 preview) ---
@@ -802,154 +902,8 @@ def test_dashboard_renders_stats(client):
     assert "text/html" in response.headers["content-type"]
     assert "FlowOps monitoring dashboard" in response.text
     assert "ticket.created" in response.text
-    assert "pending notifications" in response.text
-    assert "delivered notifications" in response.text
-    assert "failed notifications" in response.text
-    assert "notification retries" in response.text
-
-
-# --- Ticket closing (v1.0 preview) ---
-
-CLOSE_BODY = {"resolution_note": "Replaced the power adapter; laptop boots again."}
-
-
-def test_close_open_ticket_succeeds(client):
-    """open -> closed is the one allowed transition."""
-    client.post("/tickets", json=VALID_REQUEST)
-
-    response = client.post("/tickets/42/close", json=CLOSE_BODY)
-    assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == "closed"
-    assert body["resolution_note"] == CLOSE_BODY["resolution_note"]
-    assert body["closed_at"] is not None  # timestamp recorded by the API
-    # The stored ticket reflects the close on later reads too.
-    assert client.get("/tickets/42").json()["status"] == "closed"
-
-
-def test_double_close_is_rejected_and_preserves_original(client):
-    """closed -> closed returns 409 and never overwrites the first close."""
-    client.post("/tickets", json=VALID_REQUEST)
-    first = client.post("/tickets/42/close", json=CLOSE_BODY).json()
-
-    second = client.post(
-        "/tickets/42/close", json={"resolution_note": "Second attempt"}
-    )
-    assert second.status_code == 409
-    assert "already 'closed'" in second.json()["detail"]
-
-    stored = client.get("/tickets/42").json()
-    assert stored["resolution_note"] == first["resolution_note"]
-    assert stored["closed_at"] == first["closed_at"]
-
-
-def test_close_nonexistent_ticket_returns_404(client):
-    response = client.post("/tickets/999/close", json=CLOSE_BODY)
-    assert response.status_code == 404
-    assert response.json()["detail"] == "Ticket not found."
-
-
-def test_close_non_numeric_ticket_id_returns_404(client):
-    assert client.post("/tickets/not-a-number/close", json=CLOSE_BODY).status_code == 404
-
-
-def test_close_ticket_created_as_closed_is_invalid_transition(client):
-    """Tickets already closed at intake (completed=true) cannot be closed again."""
-    client.post("/tickets", json={**VALID_REQUEST, "completed": True})
-
-    response = client.post("/tickets/42/close", json=CLOSE_BODY)
-    assert response.status_code == 409
-    assert "only 'open' tickets can be closed" in response.json()["detail"]
-
-
-@pytest.mark.parametrize(
-    "body",
-    [
-        {},                                        # missing note
-        {"resolution_note": ""},                   # empty
-        {"resolution_note": "   "},                # blank whitespace
-        {"resolution_note": 123},                  # wrong type (strict str)
-        {"resolution_note": "x" * 2001},           # too long (max 2000)
-    ],
-)
-def test_close_with_invalid_body_returns_422(client, body):
-    client.post("/tickets", json=VALID_REQUEST)
-    assert client.post("/tickets/42/close", json=body).status_code == 422
-
-
-def test_close_logs_success_and_failure_executions(client):
-    client.post("/tickets", json=VALID_REQUEST)
-    client.post("/tickets/42/close", json=CLOSE_BODY)          # success
-    client.post("/tickets/42/close", json=CLOSE_BODY)          # rejected (409)
-
-    logs = client.get("/execution-logs", params={"limit": 5}).json()
-    close_logs = [log for log in logs if log["action"] == "ticket.closed"]
-    assert [(log["status"], log["ticket_id"]) for log in close_logs] == [
-        ("failure", "42"),
-        ("success", "42"),
-    ]  # newest first: the 409 attempt logged a failure row
-    assert any("invalid transition" in (log["detail"] or "") for log in close_logs)
-
-
-def test_dashboard_counts_open_and_closed_accurately(client):
-    for ticket_id in (42, 43, 44):
-        client.post("/tickets", json={**VALID_REQUEST, "id": ticket_id})
-    client.post("/tickets/42/close", json=CLOSE_BODY)
-
-    page = client.get("/dashboard").text
-    # Cards render as <div class="value">N</div><div class="label">name</div>.
-    assert '<div class="value">3</div><div class="label">tickets</div>' in page
-    assert '<div class="value">2</div><div class="label">open</div>' in page
-    assert '<div class="value">1</div><div class="label">closed</div>' in page
-
-
-def test_dashboard_counts_include_intake_closed_tickets(client):
-    """Tickets closed upstream (completed=true) count as closed too."""
-    client.post("/tickets", json=VALID_REQUEST)
-    client.post("/tickets", json={**VALID_REQUEST, "id": 45, "completed": True})
-
-    page = client.get("/dashboard").text
-    assert '<div class="value">2</div><div class="label">tickets</div>' in page
-    assert '<div class="value">1</div><div class="label">open</div>' in page
-    assert '<div class="value">1</div><div class="label">closed</div>' in page
-
-
-def test_legacy_database_gains_closing_columns_without_data_loss(tmp_path):
-    """An older flowops.db (no resolution_note/closed_at columns) still works.
-
-    Simulates opening a pre-close database with the new code: the tiny
-    SQLite migration adds the missing nullable columns and keeps rows.
-    """
-    import sqlite3
-
-    from sqlalchemy import text as sa_text
-
-    db_path = tmp_path / "legacy.db"
-    connection = sqlite3.connect(db_path)
-    connection.execute(
-        "CREATE TABLE tickets (ticket_id VARCHAR(64) NOT NULL PRIMARY KEY, "
-        "requester_id INTEGER NOT NULL, title VARCHAR(500) NOT NULL, "
-        "status VARCHAR(16) NOT NULL, priority VARCHAR(16) NOT NULL, "
-        "category VARCHAR(32), queue VARCHAR(64), "
-        "created_at DATETIME, updated_at DATETIME)"
-    )
-    connection.execute(
-        "INSERT INTO tickets VALUES ('7', 1, 'Old ticket', 'open', 'normal', "
-        "NULL, NULL, '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
-    )
-    connection.commit()
-    connection.close()
-
-    db.use_database(f"sqlite:///{db_path}")
-    client = TestClient(api.app)  # first request triggers create_all + migration
-
-    assert client.get("/tickets/7").json()["resolution_note"] is None
-    closed = client.post("/tickets/7/close", json=CLOSE_BODY)
-    assert closed.status_code == 200
-    assert closed.json()["status"] == "closed"
-
-    with db.engine.connect() as connection:
-        rows = connection.execute(
-            sa_text("SELECT title, resolution_note FROM tickets")
-        ).all()
-    assert rows == [("Old ticket", CLOSE_BODY["resolution_note"])]
+    page = response.text.lower()
+    assert "pending notifications" in page
+    assert "delivered notifications" in page
+    assert "failed notifications" in page
+    assert "notification retries" in page

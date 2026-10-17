@@ -1,0 +1,137 @@
+{% extends "base.html" %}
+{% block title %}FlowOps monitoring dashboard{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <span class="eyebrow">Monitoring</span>
+    <h1>FlowOps monitoring dashboard</h1>
+    <p class="muted">Run outcomes, routing, and notification health for the local prototype.</p>
+  </div>
+  <div class="toolbar">
+    <label class="check"><input type="checkbox" id="auto-refresh" {% if auto_refresh %}checked{% endif %}> Auto-refresh</label>
+    <button class="button small" type="button" id="refresh-now">Refresh now</button>
+    <span class="muted small">Last updated <span id="last-updated">{{ last_updated }}</span></span>
+  </div>
+</section>
+
+<section class="kpi-grid" aria-label="Key metrics">
+  <div class="kpi"><span class="kpi-value">{{ stats.total }}</span><span class="kpi-label">Tickets</span></div>
+  <div class="kpi"><span class="kpi-value">{{ stats.open }}</span><span class="kpi-label">Open</span></div>
+  <div class="kpi"><span class="kpi-value">{{ stats.closed }}</span><span class="kpi-label">Closed</span></div>
+  <div class="kpi"><span class="kpi-value">{{ stats.auto_routed }}</span><span class="kpi-label">Auto-routed</span></div>
+  <div class="kpi"><span class="kpi-value ok">{{ stats.success_count }}</span><span class="kpi-label">Successful runs</span></div>
+  <div class="kpi"><span class="kpi-value {% if stats.failure_count %}fail{% endif %}">{{ stats.failure_count }}</span><span class="kpi-label">Failed runs</span></div>
+  <div class="kpi"><span class="kpi-value">{{ stats.avg_duration }} ms</span><span class="kpi-label">Avg duration</span></div>
+  <div class="kpi"><span class="kpi-value">{{ stats.hours_saved }} h</span><span class="kpi-label">Est. time saved</span></div>
+  <div class="kpi"><span class="kpi-value">{{ stats.pending_notifications }}</span><span class="kpi-label">Pending notifications</span></div>
+  <div class="kpi"><span class="kpi-value">{{ stats.pending_notifications }}</span><span class="kpi-label">Pending webhook retries</span></div>
+  <div class="kpi"><span class="kpi-value">{{ stats.delivered_notifications }}</span><span class="kpi-label">Delivered notifications</span></div>
+  <div class="kpi"><span class="kpi-value {% if stats.failed_notifications %}fail{% endif %}">{{ stats.failed_notifications }}</span><span class="kpi-label">Failed notifications</span></div>
+  <div class="kpi"><span class="kpi-value">{{ stats.notification_retries }}</span><span class="kpi-label">Notification retries</span></div>
+</section>
+
+<section class="split-grid">
+  <div class="panel">
+    <h2>Tickets by queue</h2>
+    {% if queues %}
+    <ul class="bars">
+      {% for row in queues %}
+      <li><span class="bar-label">{{ row.label }}</span><span class="bar-track"><span class="bar-fill" style="width: {{ row.percent }}%"></span></span><span class="bar-value">{{ row.count }}</span></li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">No tickets yet. Create one with <code>POST /tickets</code>.</p>
+    {% endif %}
+  </div>
+  <div class="panel">
+    <h2>Tickets by priority</h2>
+    {% if priorities %}
+    <ul class="bars">
+      {% for row in priorities %}
+      <li><span class="bar-label">{{ row.label }}</span><span class="bar-track"><span class="bar-fill" style="width: {{ row.percent }}%"></span></span><span class="bar-value">{{ row.count }}</span></li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">No priority data yet.</p>
+    {% endif %}
+  </div>
+</section>
+
+<section class="panel" aria-labelledby="runs-heading">
+  <div class="panel-head">
+    <h2 id="runs-heading">Recent workflow runs</h2>
+    <div class="segmented" role="group" aria-label="Filter runs">
+      <a class="button small {% if not status_filter %}active{% endif %}" href="/dashboard">All</a>
+      <a class="button small {% if status_filter == 'success' %}active{% endif %}" href="/dashboard?status=success">Success</a>
+      <a class="button small {% if status_filter == 'failure' %}active{% endif %}" href="/dashboard?status=failure">Failure</a>
+    </div>
+  </div>
+  {% if logs %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Time</th><th>Action</th><th>Status</th><th>Ticket</th><th>Duration</th></tr></thead>
+      <tbody>
+        {% for log in logs %}
+        <tr>
+          <td>#{{ log.id }}</td>
+          <td>{{ log.created_at }}</td>
+          <td>{{ log.action }}</td>
+          <td><span class="badge {{ 'ok' if log.status == 'success' else 'fail' }}">{{ log.status }}</span></td>
+          <td>{{ log.ticket_id or '—' }}</td>
+          <td>{{ log.duration_ms }} ms</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">No workflow runs yet.</p>
+  {% endif %}
+</section>
+
+<section class="panel" aria-labelledby="pending-heading">
+  <div class="panel-head">
+    <h2 id="pending-heading">Pending webhook deliveries ({{ stats.pending_notifications }})</h2>
+    <button class="button small" type="button" data-action-url="/notifications/retry" data-method="POST" data-reload="true">Retry pending</button>
+  </div>
+  <p class="muted small">Retry once each; failures become dead letters at the configured attempt limit.</p>
+  {% if pending %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Ticket</th><th>URL</th><th>Attempts</th><th>Last error</th></tr></thead>
+      <tbody>
+        {% for item in pending %}
+        <tr><td>#{{ item.id }}</td><td>{{ item.ticket_id or '—' }}</td><td class="mono">{{ item.url }}</td><td>{{ item.attempts }}</td><td class="fail">{{ item.last_error or '—' }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">No pending deliveries.</p>
+  {% endif %}
+</section>
+
+<section class="panel" aria-labelledby="dead-heading">
+  <div class="panel-head">
+    <h2 id="dead-heading">Dead-letter notifications ({{ stats.failed_notifications }})</h2>
+    <a class="button small ghost" href="/ui/notifications">Manage outbox</a>
+  </div>
+  {% if failed %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Ticket</th><th>URL</th><th>Attempts</th><th>Last error</th><th>Action</th></tr></thead>
+      <tbody>
+        {% for item in failed %}
+        <tr>
+          <td>#{{ item.id }}</td><td>{{ item.ticket_id or '—' }}</td><td class="mono">{{ item.url }}</td><td>{{ item.attempts }}</td><td class="fail">{{ item.last_error or '—' }}</td>
+          <td><button class="button small" type="button" data-action-url="/notifications/{{ item.id }}/requeue" data-method="POST" data-reload="true" data-confirm="Requeue this dead-letter delivery?">Requeue</button></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">No dead letters. Nice.</p>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}{{ request_record.employee_name }} — Onboarding — FlowOps{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <span class="eyebrow"><a href="/ui/onboarding-requests">Onboarding</a> / #{{ request_record.id }}</span>
+    <h1>{{ request_record.employee_name }}</h1>
+    <p class="muted">{{ request_record.employee_email }} · {{ request_record.department }} · {{ request_record.request_type }}</p>
+  </div>
+  <div class="toolbar">
+    <span class="badge {{ 'ok' if request_record.status == 'completed' else 'info' }}">{{ request_record.status }}</span>
+    <span class="small muted">{{ completed }}/{{ total }} steps complete</span>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>Checklist</h2>
+    <span class="muted small">Actions call the JSON API; the page reloads after success.</span>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Step</th><th>Queue</th><th>Approval</th><th>Status</th><th>Actions</th></tr></thead>
+      <tbody>
+        {% for item in items %}
+        <tr>
+          <td>{{ loop.index }}</td>
+          <td>{{ item.step }}</td>
+          <td>{{ item.queue }}</td>
+          <td>{{ 'Required' if item.requires_approval else 'Not required' }}</td>
+          <td><span class="badge {{ 'ok' if item.status == 'completed' else ('info' if item.status == 'approved' else '') }}">{{ item.status }}</span></td>
+          <td class="actions">
+            {% if item.requires_approval and item.status == 'pending' %}
+            <button class="button small" type="button" data-action-url="/onboarding-requests/{{ request_record.id }}/items/{{ item.id }}/approve" data-method="POST" data-reload="true">Approve</button>
+            {% endif %}
+            {% if (item.requires_approval and item.status == 'approved') or (not item.requires_approval and item.status == 'pending') %}
+            <button class="button small" type="button" data-action-url="/onboarding-requests/{{ request_record.id }}/items/{{ item.id }}/complete" data-method="POST" data-reload="true">Complete</button>
+            {% endif %}
+            {% if item.status in ('approved', 'pending') %}
+            <button class="button small ghost" type="button" data-action-url="/onboarding-requests/{{ request_record.id }}/items/{{ item.id }}/execute" data-method="POST" data-reload="true" data-confirm="Run the simulated action for this step?">Execute</button>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Request details</h2>
+  <dl class="details">
+    <dt>Requester ID</dt><dd>{{ request_record.requester_id }}</dd>
+    <dt>Start date</dt><dd>{{ request_record.start_date or '—' }}</dd>
+    <dt>Created</dt><dd>{{ request_record.created_at }}</dd>
+  </dl>
+  <p><a class="button small ghost" href="/onboarding-requests/{{ request_record.id }}/action-executions">Action attempts (JSON)</a></p>
+</section>
+{% endblock %}

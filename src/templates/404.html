@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Page not found — FlowOps{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <span class="eyebrow">404</span>
+    <h1>Page not found</h1>
+    <p class="muted">That operator page does not exist. Try the dashboard or onboarding list.</p>
+  </div>
+</section>
+<section class="panel">
+  <div class="hero-actions">
+    <a class="button primary" href="/dashboard">Dashboard</a>
+    <a class="button" href="/ui/onboarding-requests">Onboarding</a>
+    <a class="button ghost" href="/">Home</a>
+  </div>
+</section>
+{% endblock %}
