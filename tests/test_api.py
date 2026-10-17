@@ -53,6 +53,9 @@ def test_valid_ticket_is_routed_and_stored(client):
         "priority": "normal",
         "category": "hardware",
         "queue": "it-hardware",
+        # Ticket closing fields (v1.0 preview); set only via POST /tickets/42/close.
+        "resolution_note": None,
+        "closed_at": None,
     }
 
 
@@ -372,6 +375,8 @@ def test_retry_endpoint_redelivers_pending_and_marks_delivered(client, monkeypat
             "ticket_id": "42", "requester_id": 7, "title": "Laptop will not start",
             "status": "open", "priority": "normal", "category": "hardware",
             "queue": "it-hardware",
+            # Closing fields are part of the ticket shape since v1.0 preview.
+            "resolution_note": None, "closed_at": None,
         },
     }
     assert client.get("/notifications/pending").json() == []
@@ -429,3 +434,150 @@ def test_dashboard_renders_stats(client):
     assert "text/html" in response.headers["content-type"]
     assert "FlowOps monitoring dashboard" in response.text
     assert "ticket.created" in response.text
+
+
+# --- Ticket closing (v1.0 preview) ---
+
+CLOSE_BODY = {"resolution_note": "Replaced the power adapter; laptop boots again."}
+
+
+def test_close_open_ticket_succeeds(client):
+    """open -> closed is the one allowed transition."""
+    client.post("/tickets", json=VALID_REQUEST)
+
+    response = client.post("/tickets/42/close", json=CLOSE_BODY)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "closed"
+    assert body["resolution_note"] == CLOSE_BODY["resolution_note"]
+    assert body["closed_at"] is not None  # timestamp recorded by the API
+    # The stored ticket reflects the close on later reads too.
+    assert client.get("/tickets/42").json()["status"] == "closed"
+
+
+def test_double_close_is_rejected_and_preserves_original(client):
+    """closed -> closed returns 409 and never overwrites the first close."""
+    client.post("/tickets", json=VALID_REQUEST)
+    first = client.post("/tickets/42/close", json=CLOSE_BODY).json()
+
+    second = client.post(
+        "/tickets/42/close", json={"resolution_note": "Second attempt"}
+    )
+    assert second.status_code == 409
+    assert "already 'closed'" in second.json()["detail"]
+
+    stored = client.get("/tickets/42").json()
+    assert stored["resolution_note"] == first["resolution_note"]
+    assert stored["closed_at"] == first["closed_at"]
+
+
+def test_close_nonexistent_ticket_returns_404(client):
+    response = client.post("/tickets/999/close", json=CLOSE_BODY)
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Ticket not found."
+
+
+def test_close_non_numeric_ticket_id_returns_404(client):
+    assert client.post("/tickets/not-a-number/close", json=CLOSE_BODY).status_code == 404
+
+
+def test_close_ticket_created_as_closed_is_invalid_transition(client):
+    """Tickets already closed at intake (completed=true) cannot be closed again."""
+    client.post("/tickets", json={**VALID_REQUEST, "completed": True})
+
+    response = client.post("/tickets/42/close", json=CLOSE_BODY)
+    assert response.status_code == 409
+    assert "only 'open' tickets can be closed" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},                                        # missing note
+        {"resolution_note": ""},                   # empty
+        {"resolution_note": "   "},                # blank whitespace
+        {"resolution_note": 123},                  # wrong type (strict str)
+        {"resolution_note": "x" * 2001},           # too long (max 2000)
+    ],
+)
+def test_close_with_invalid_body_returns_422(client, body):
+    client.post("/tickets", json=VALID_REQUEST)
+    assert client.post("/tickets/42/close", json=body).status_code == 422
+
+
+def test_close_logs_success_and_failure_executions(client):
+    client.post("/tickets", json=VALID_REQUEST)
+    client.post("/tickets/42/close", json=CLOSE_BODY)          # success
+    client.post("/tickets/42/close", json=CLOSE_BODY)          # rejected (409)
+
+    logs = client.get("/execution-logs", params={"limit": 5}).json()
+    close_logs = [log for log in logs if log["action"] == "ticket.closed"]
+    assert [(log["status"], log["ticket_id"]) for log in close_logs] == [
+        ("failure", "42"),
+        ("success", "42"),
+    ]  # newest first: the 409 attempt logged a failure row
+    assert any("invalid transition" in (log["detail"] or "") for log in close_logs)
+
+
+def test_dashboard_counts_open_and_closed_accurately(client):
+    for ticket_id in (42, 43, 44):
+        client.post("/tickets", json={**VALID_REQUEST, "id": ticket_id})
+    client.post("/tickets/42/close", json=CLOSE_BODY)
+
+    page = client.get("/dashboard").text
+    # Cards render as <div class="value">N</div><div class="label">name</div>.
+    assert '<div class="value">3</div><div class="label">tickets</div>' in page
+    assert '<div class="value">2</div><div class="label">open</div>' in page
+    assert '<div class="value">1</div><div class="label">closed</div>' in page
+
+
+def test_dashboard_counts_include_intake_closed_tickets(client):
+    """Tickets closed upstream (completed=true) count as closed too."""
+    client.post("/tickets", json=VALID_REQUEST)
+    client.post("/tickets", json={**VALID_REQUEST, "id": 45, "completed": True})
+
+    page = client.get("/dashboard").text
+    assert '<div class="value">2</div><div class="label">tickets</div>' in page
+    assert '<div class="value">1</div><div class="label">open</div>' in page
+    assert '<div class="value">1</div><div class="label">closed</div>' in page
+
+
+def test_legacy_database_gains_closing_columns_without_data_loss(tmp_path):
+    """An older flowops.db (no resolution_note/closed_at columns) still works.
+
+    Simulates opening a pre-close database with the new code: the tiny
+    SQLite migration adds the missing nullable columns and keeps rows.
+    """
+    import sqlite3
+
+    from sqlalchemy import text as sa_text
+
+    db_path = tmp_path / "legacy.db"
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "CREATE TABLE tickets (ticket_id VARCHAR(64) NOT NULL PRIMARY KEY, "
+        "requester_id INTEGER NOT NULL, title VARCHAR(500) NOT NULL, "
+        "status VARCHAR(16) NOT NULL, priority VARCHAR(16) NOT NULL, "
+        "category VARCHAR(32), queue VARCHAR(64), "
+        "created_at DATETIME, updated_at DATETIME)"
+    )
+    connection.execute(
+        "INSERT INTO tickets VALUES ('7', 1, 'Old ticket', 'open', 'normal', "
+        "NULL, NULL, '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+    )
+    connection.commit()
+    connection.close()
+
+    db.use_database(f"sqlite:///{db_path}")
+    client = TestClient(api.app)  # first request triggers create_all + migration
+
+    assert client.get("/tickets/7").json()["resolution_note"] is None
+    closed = client.post("/tickets/7/close", json=CLOSE_BODY)
+    assert closed.status_code == 200
+    assert closed.json()["status"] == "closed"
+
+    with db.engine.connect() as connection:
+        rows = connection.execute(
+            sa_text("SELECT title, resolution_note FROM tickets")
+        ).all()
+    assert rows == [("Old ticket", CLOSE_BODY["resolution_note"])]

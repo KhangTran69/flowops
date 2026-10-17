@@ -43,6 +43,12 @@ class TicketRecord(Base):
     priority: Mapped[str] = mapped_column(String(16), nullable=False)
     category: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     queue: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # Ticket closing (v1.0 preview): both columns are nullable, so rows
+    # written before this change stay valid (NULL = never closed).
+    resolution_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    closed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
@@ -174,12 +180,43 @@ def _ensure_sqlite_dir() -> None:
         os.makedirs(parent, exist_ok=True)
 
 
+def _add_missing_columns() -> None:
+    """Add newly introduced nullable columns to pre-existing SQLite tables.
+
+    ``Base.metadata.create_all`` only creates *missing tables*; it never
+    changes an existing table. So an older ``flowops.db`` would keep its
+    old ``tickets`` shape and break new code that reads, for example,
+    ``resolution_note``. This tiny migration adds any missing nullable
+    column with ``ALTER TABLE ... ADD COLUMN`` (no data is touched).
+    New databases created by ``create_all`` already have every column,
+    so this is a no-op for them.
+    """
+    if engine.dialect.name != "sqlite":
+        return  # PostgreSQL deployments should use Alembic-style migrations.
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    with engine.begin() as connection:
+        for table in Base.metadata.sorted_tables:
+            if not inspector.has_table(table.name):
+                continue
+            existing = {column["name"] for column in inspector.get_columns(table.name)}
+            for column in table.columns:
+                if column.name in existing or not column.nullable:
+                    continue  # Only safe to auto-add optional columns.
+                spec = column.type.compile(dialect=engine.dialect)
+                connection.execute(
+                    text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {spec}')
+                )
+
+
 def get_session():
     """FastAPI dependency yielding a session; commits on success."""
     global _tables_ready
     if not _tables_ready:
         _ensure_sqlite_dir()
         Base.metadata.create_all(engine)
+        _add_missing_columns()
         _tables_ready = True
     session = SessionLocal()
     try:

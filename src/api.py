@@ -3,7 +3,8 @@
 v0.3 adds database persistence and execution logs; v0.4 adds rule-based
 routing, outbound notifications, and an n8n-friendly webhook; v0.5 adds
 onboarding/offboarding checklists, idempotency keys, and delivery retries;
-the v1.0 preview keeps failed webhook deliveries in a retryable outbox.
+the v1.0 preview keeps failed webhook deliveries in a retryable outbox and
+adds explicit ticket closing (POST /tickets/{id}/close).
 """
 
 import hashlib
@@ -74,6 +75,25 @@ class Ticket(BaseModel):
     priority: str
     category: Optional[str] = None
     queue: Optional[str] = None
+    resolution_note: Optional[str] = None
+    closed_at: Optional[datetime] = None
+
+
+class TicketCloseRequest(BaseModel):
+    """Body for POST /tickets/{ticket_id}/close (v1.0 preview)."""
+
+    resolution_note: StrictStr = Field(
+        min_length=1,
+        max_length=2000,
+        description="How and why the ticket was resolved.",
+    )
+
+    @field_validator("resolution_note")
+    @classmethod
+    def note_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("resolution_note must be a non-empty string")
+        return value
 
 
 class ExecutionLogOut(BaseModel):
@@ -254,7 +274,7 @@ LANDING_PAGE = """<!doctype html>
   <ul>
     <li>GET /health</li>
     <li>POST /tickets &nbsp;(supports Idempotency-Key)</li>
-    <li>GET /tickets &middot; GET /tickets/{ticket_id}</li>
+    <li>GET /tickets &middot; GET /tickets/{ticket_id} &middot; POST /tickets/{ticket_id}/close</li>
     <li>POST /webhooks/intake &nbsp;(single or bulk, for n8n)</li>
     <li>POST / GET /onboarding-requests &middot; approve/complete items</li>
     <li>GET /notifications/pending &middot; POST /notifications/retry</li>
@@ -360,6 +380,105 @@ def get_ticket(
     if record is None:
         raise HTTPException(status_code=404, detail="Ticket not found.")
     return Ticket.model_validate(record, from_attributes=True)
+
+
+# The only allowed ticket status transition for the close endpoint.
+# open  -> closed : allowed (this endpoint)
+# closed -> closed: rejected with 409 (already closed; never overwritten)
+# Re-opening a ticket is intentionally NOT part of this prototype; intake
+# updates (POST /tickets with an existing id) do not change status either.
+ALLOWED_CLOSE_FROM = "open"
+
+
+@app.post("/tickets/{ticket_id}/close", response_model=Ticket)
+def close_ticket(
+    ticket_id: str,
+    request: TicketCloseRequest,
+    session: Session = Depends(db.get_session),
+) -> Ticket:
+    """Close an open ticket and store its resolution note.
+
+    State-transition rules (see ALLOWED_CLOSE_FROM):
+      * open   -> closed: allowed, returns 200 with the updated ticket.
+      * closed -> closed: rejected with 409; the original resolution note
+        and closed_at timestamp are preserved.
+      * unknown or non-numeric ticket id: 404.
+      * blank / non-string / too-long resolution_note: 422 (strict Pydantic).
+
+    Tickets linked to onboarding checklists are independent workflows, so
+    pending approvals do not block closing a ticket (documented limitation
+    of the prototype).
+
+    Idempotency-Key headers are deliberately NOT supported here: closing is
+    guarded by the state machine itself — replaying a close hits the
+    closed -> closed rule and gets 409 instead of re-executing anything,
+    which is safer than caching responses for a mutating endpoint.
+    """
+    run_id = _new_run_id()
+    started = time.perf_counter()
+
+    def log_failure(detail: str) -> None:
+        """Write one execution-log row describing a rejected close attempt.
+
+        The request will be aborted with an HTTPException, which makes the
+        session dependency roll back — so this row is written through its
+        own short-lived session and stays in the log no matter how the
+        main transaction ends.
+        """
+        failure_session = db.SessionLocal()
+        try:
+            db.log_execution(
+                failure_session,
+                run_id=run_id,
+                action="ticket.closed",
+                status="failure",
+                ticket_id=ticket_id,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                detail=detail,
+            )
+            failure_session.commit()
+        finally:
+            failure_session.close()
+
+    if not ticket_id.isdigit():
+        log_failure("ticket not found (invalid ticket id)")
+        raise HTTPException(status_code=404, detail="Ticket not found.")
+    record = session.get(db.TicketRecord, ticket_id)
+    if record is None:
+        log_failure("ticket not found")
+        raise HTTPException(status_code=404, detail="Ticket not found.")
+    if record.status != ALLOWED_CLOSE_FROM:
+        log_failure(f"invalid transition: {record.status} -> closed")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Ticket '{ticket_id}' is already '{record.status}'; "
+                f"only '{ALLOWED_CLOSE_FROM}' tickets can be closed."
+            ),
+        )
+
+    record.status = "closed"
+    record.resolution_note = request.resolution_note
+    closed_at = db.utcnow()
+    # SQLite does not keep timezone info in DateTime columns, so a value
+    # read back from the database comes out naive. Storing the offset-free
+    # UTC value keeps responses identical whether the object is still in
+    # the session cache or re-read from disk (same convention as created_at).
+    record.closed_at = closed_at.replace(tzinfo=None)
+    session.flush()
+
+    db.log_execution(
+        session,
+        run_id=run_id,
+        action="ticket.closed",
+        status="success",
+        ticket_id=record.ticket_id,
+        duration_ms=int((time.perf_counter() - started) * 1000),
+        detail=f"resolution: {request.resolution_note}",
+    )
+    result = Ticket.model_validate(record, from_attributes=True)
+    _notify("ticket.closed", result, run_id, session)
+    return result
 
 
 @app.post("/webhooks/intake")
