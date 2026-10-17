@@ -4,6 +4,8 @@
 
 FlowOps is an IT workflow automation platform. It receives support tickets and onboarding/offboarding requests, validates their data, classifies and routes them according to business rules, persists records, logs every workflow execution, and exposes a monitoring dashboard.
 
+> **MSP automation highlights:** [integrations guide](docs/integrations.md) (Graph, Exchange Online PowerShell, ConnectWise, Claude, MCP, multi-tenant) · [n8n workflows](flows/n8n/) · [SQL reports](sql/reporting_queries.sql) · [runbooks](docs/runbooks/).
+
 > ⚠️ **This is a learning prototype, not a production ticketing system.** Sample data comes from [JSONPlaceholder](https://jsonplaceholder.typicode.com/), a free fake REST API. These are **simulated** tickets, not real IT support requests.
 
 ## Long-term vision
@@ -35,7 +37,10 @@ FlowOps is an IT workflow automation platform. It receives support tickets and o
 | v0.6.1 Offboarding completion ledger | ✅ | Admin-only, claim-before-execute, idempotent replay, stale-claim takeover, ledger-backed offboarding |
 | v1.0 Operations: readiness, metrics, migrations | ✅ | `/ready`, `/metrics`, correlation IDs, Alembic baseline, container migration entrypoint |
 | v1.0 CI + Docker | ✅ | GitHub Actions runs pytest, a Docker Compose API + PostgreSQL smoke test, and PostgreSQL reliability tests |
-| v0.6 Microsoft 365 actions | ⬜ | Real account creation via Power Automate / Microsoft Graph / PowerShell (needs credentials) |
+| v0.6 Microsoft 365 actions | ✅ | Real Microsoft Graph client (OAuth2 client credentials, OData `$filter`, `@odata.nextLink`, 429 `Retry-After`) and Exchange Online PowerShell for steps Graph can't do. Tested offline; live use needs tenant credentials |
+| v1.4 Multi-tenant (GDAP) | ✅ | Tenant registry, per-tenant credentials and licence/usage-location config, cross-tenant config-drift check |
+| v1.4 PSA + AI integrations | ✅ | ConnectWise Manage client (conditions, PATCH, notes, time entries) with idempotent ticket sync; Claude provider; MCP server for AI agents |
+| v1.4 n8n + SQL reporting + runbooks | ✅ | Exported n8n workflows, SQL KPI views + PostgreSQL function, plain-English runbooks for non-technical staff |
 | v0.7 AI support agent | ✅ | Simulated AI triage, KB search, suggest-only recommendations, human-approved apply gate |
 
 ## Technology stack
@@ -65,18 +70,30 @@ flowops/
 │   ├── outbox_worker.py      # automatic notification dispatcher
 │   ├── auth.py               # bearer/Entra auth and role helpers
 │   ├── ui_session.py         # signed UI sessions, cookie flags, and CSRF helpers
-│   ├── ai_agent.py           # simulated AI agent, KB search, optional LLM boundary
+│   ├── ai_agent.py           # simulated AI agent, KB search, OpenAI-compatible + Claude providers
+│   ├── schemas.py / deps.py  # Pydantic models and shared auth/rate-limit dependencies
+│   ├── routes/               # routers: operator UI, tenants/drift/PSA sync, reports
+│   ├── graph.py              # Microsoft Graph client: client credentials, OData, paging, throttling
+│   ├── graph_simulator.py    # in-memory Graph (httpx MockTransport) for demos and tests
+│   ├── tenants.py            # multi-tenant settings, per-tenant Graph clients, drift check
+│   ├── connectwise.py        # ConnectWise Manage client + idempotent ticket sync
+│   ├── reports.py            # SQL reporting views and KPI queries
+│   ├── mcp_server.py         # MCP server exposing FlowOps tools to Claude/AI agents
 │   ├── web.py                # Jinja2 rendering helpers
 │   ├── templates/            # shared layout, landing, dashboard, operator pages
 │   └── static/               # local CSS and vanilla JavaScript
-├── migrations/               # Alembic baseline and environment
+├── migrations/               # Alembic migrations (0009: tenants + reporting views)
+├── flows/n8n/                # exported n8n workflows calling FlowOps webhooks
+├── scripts/powershell/       # Exchange Online action script (JSON in/out, dry-run)
+├── sql/reporting_queries.sql # hand-written KPI queries
+├── docs/runbooks/            # plain-English runbooks for non-technical staff
+├── docs/integrations.md      # Graph, PowerShell, ConnectWise, Claude, MCP, multi-tenant
 ├── tests/                    # offline test suite (test_*.py); PostgreSQL reliability tests opt in via env
 ├── data/                     # runtime artifacts (git-ignored): flowops.db, ticket.json
 ├── .github/workflows/ci.yml  # GitHub Actions: SQLite matrix, migrations, PostgreSQL smoke + reliability tests
 ├── Dockerfile                # Non-root API/worker image with migration entrypoint
 ├── docker-compose.yml        # API + worker + PostgreSQL demo stack
 ├── alembic.ini               # Migration configuration
-├── src/ai_agent.py           # simulated AI agent, KB, optional LLM boundary
 ├── docs/portfolio-demo.md    # Guided interview/portfolio walkthrough
 ├── docs/architecture.md      # Data flow and reliability boundaries
 ├── scripts/demo_smoke.sh     # Local end-to-end smoke test
@@ -458,7 +475,7 @@ No real secrets or Microsoft tenant are included.
 ## Running the tests
 
 ```bash
-pytest    # 293 passed, 15 skipped locally; the skips are PostgreSQL-only tests
+pytest    # 322 passed, 15 skipped locally; the skips are PostgreSQL-only tests
 python -m compileall -q src tests
 ```
 
@@ -481,7 +498,8 @@ a live local API (not a benchmark).
 ## Roadmap status
 
 - ✅ v0.1–v0.5 and the monitoring dashboard (see table above)
-- ⬜ v0.6 — Power Automate / Microsoft Graph / PowerShell behind the onboarding checklists (needs real credentials)
+- ✅ v0.6 — Microsoft Graph + Exchange Online PowerShell behind the onboarding checklists (offline-tested; live demo needs tenant credentials)
+- ✅ v1.4 — Multi-tenant/GDAP, ConnectWise Manage, Claude, MCP server, n8n workflows, SQL views, runbooks
 - ✅ v0.7 — Simulated AI triage, KB search, and human-approved recommendations (optional pluggable LLM boundary)
 - ✅ v1.0 foundation — Offline CI workflow and Docker Compose PostgreSQL demo
 - ✅ v1.0 reliability — Fenced idempotency ownership with stale-takeover protection on SQLite and PostgreSQL

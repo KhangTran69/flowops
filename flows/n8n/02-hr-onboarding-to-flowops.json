@@ -1,0 +1,81 @@
+{
+  "name": "FlowOps - HR new starter form to onboarding workflow",
+  "nodes": [
+    {
+      "parameters": {"httpMethod": "POST", "path": "hr-new-starter", "responseMode": "responseNode", "options": {}},
+      "id": "b1b2c3d4-0002-4000-8000-000000000001",
+      "name": "HR form webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 0],
+      "webhookId": "hr-new-starter"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate and reshape the HR payload. Fail loudly on missing fields\n// instead of creating a half-filled request.\nconst b = $input.first().json.body || {};\nconst missing = ['first_name','last_name','work_email','department','start_date','client'].filter(k => !b[k]);\nif (missing.length) { throw new Error(`HR payload missing: ${missing.join(', ')}`); }\nreturn [{ json: {\n  request: {\n    request_type: b.leaving ? 'offboarding' : 'onboarding',\n    employee_name: `${b.first_name} ${b.last_name}`.trim(),\n    employee_email: String(b.work_email).toLowerCase(),\n    department: b.department,\n    requester_id: Number(b.manager_id || 1),\n    start_date: b.start_date,\n    tenant_key: String(b.client).toLowerCase()\n  },\n  // Same HR submission => same key => FlowOps replays instead of duplicating.\n  idempotencyKey: `hr-${b.submission_id || b.work_email}-${b.start_date}`\n}}];"
+      },
+      "id": "b1b2c3d4-0002-4000-8000-000000000002",
+      "name": "Validate + reshape",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.FLOWOPS_URL }}/onboarding-requests",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "Idempotency-Key", "value": "={{ $json.idempotencyKey }}"}]},
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.request) }}",
+        "options": {"retry": {"maxTries": 3, "waitBetweenTries": 5000}}
+      },
+      "id": "b1b2c3d4-0002-4000-8000-000000000003",
+      "name": "POST /onboarding-requests",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 0],
+      "retryOnFail": true,
+      "credentials": {"httpHeaderAuth": {"id": "REPLACE_ME", "name": "FlowOps bearer token"}}
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.FLOWOPS_URL }}/onboarding-requests/{{ $json.id }}/run",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "id": "b1b2c3d4-0002-4000-8000-000000000004",
+      "name": "Start workflow run",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, 0],
+      "credentials": {"httpHeaderAuth": {"id": "REPLACE_ME", "name": "FlowOps bearer token"}}
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ accepted: true, flowops_request_id: $('POST /onboarding-requests').first().json.id, approvals_needed: $('POST /onboarding-requests').first().json.checklist.filter(i => i.requires_approval).length }) }}",
+        "options": {"responseCode": 202}
+      },
+      "id": "b1b2c3d4-0002-4000-8000-000000000005",
+      "name": "Reply to HR system",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [960, 0]
+    }
+  ],
+  "connections": {
+    "HR form webhook": {"main": [[{"node": "Validate + reshape", "type": "main", "index": 0}]]},
+    "Validate + reshape": {"main": [[{"node": "POST /onboarding-requests", "type": "main", "index": 0}]]},
+    "POST /onboarding-requests": {"main": [[{"node": "Start workflow run", "type": "main", "index": 0}]]},
+    "Start workflow run": {"main": [[{"node": "Reply to HR system", "type": "main", "index": 0}]]}
+  },
+  "settings": {"executionOrder": "v1", "errorWorkflow": "REPLACE_WITH_03_ERROR_WORKFLOW_ID"},
+  "pinData": {},
+  "meta": {"templateCredsSetupCompleted": false}
+}

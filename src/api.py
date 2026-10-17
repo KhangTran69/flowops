@@ -259,10 +259,23 @@ def auth_me(actor: Actor = Depends(_actor_from_header)) -> dict:
 IDEMPOTENCY_PROCESSING_TIMEOUT = timedelta(minutes=5)
 
 
+def _fingerprint_payload(request: BaseModel) -> dict:
+    """Payload used for Idempotency-Key binding.
+
+    Optional tenant fields are left out when unset so keys stored before
+    multi-tenancy keep matching the same request.
+    """
+    payload = request.model_dump()
+    for field in ("tenant", "tenant_key"):
+        if payload.get(field) is None:
+            payload.pop(field, None)
+    return payload
+
+
 def _request_fingerprint(request: BaseModel) -> str:
     """Return a stable SHA-256 of a validated request body."""
     return hashlib.sha256(
-        json.dumps(request.model_dump(), sort_keys=True, separators=(",", ":")).encode()
+        json.dumps(_fingerprint_payload(request), sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
 
 
