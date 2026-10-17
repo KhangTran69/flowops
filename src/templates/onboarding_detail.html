@@ -35,7 +35,7 @@
             {% endif %}
             {% if request_record.request_type == 'offboarding' %}
               {% if item.step_key and ((item.requires_approval and item.status == 'approved') or (not item.requires_approval and item.status == 'pending')) %}
-              <button class="button small" type="button" data-action-url="/offboarding-requests/{{ request_record.id }}/steps/{{ item.step_key }}/complete" data-method="POST" data-reload="true" data-confirm="Run this destructive offboarding step?">Complete</button>
+              {% if actor and 'automation.admin' in actor.roles %}<button class="button small" type="button" data-action-url="/offboarding-requests/{{ request_record.id }}/steps/{{ item.step_key }}/complete" data-method="POST" data-reload="true" data-confirm="Run this destructive offboarding step?">Complete</button>{% else %}<span class="muted small">admin only</span>{% endif %}
               {% endif %}
             {% else %}
               {% if (item.requires_approval and item.status == 'approved') or (not item.requires_approval and item.status == 'pending') %}

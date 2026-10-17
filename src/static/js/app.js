@@ -28,6 +28,11 @@
     });
   }
 
+  function csrfToken() {
+    var meta = document.querySelector('meta[name="csrf-token"]');
+    return meta ? meta.getAttribute("content") : "";
+  }
+
   function toast(message, kind) {
     var node = document.getElementById("toast");
     if (!node) {
@@ -71,6 +76,8 @@
       button.textContent = "Working…";
 
       var options = { method: method, headers: { "Accept": "application/json" } };
+      var csrf = csrfToken();
+      if (csrf) options.headers["X-CSRF-Token"] = csrf;
       var body = button.getAttribute("data-body");
       if (body) {
         options.headers["Content-Type"] = "application/json";
@@ -147,9 +154,12 @@
       }
       button.disabled = true;
       button.setAttribute("aria-busy", "true");
+      var headers = { "Content-Type": "application/json", "Accept": "application/json" };
+      var csrf = csrfToken();
+      if (csrf) headers["X-CSRF-Token"] = csrf;
       fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "Accept": "application/json" },
+        headers: headers,
         body: JSON.stringify({ recommendation_ids: ids })
       }).then(function (response) {
         return response.text().then(function (text) {

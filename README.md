@@ -28,6 +28,7 @@ FlowOps is an IT workflow automation platform. It receives support tickets and o
 | v1.0 UI: operator console | ✅ | Jinja2 templates, responsive dashboard, onboarding/outbox pages, theme toggle, inline actions |
 | v1.0 Reliability: durable workflow jobs | ✅ | Leased worker queue with retries, dead-letter, operator retry/cancel |
 | v1.0 Security: auth, roles, audit | ✅ | Optional bearer/Entra auth, role checks, webhook API key, actor attribution |
+| v1.1 Secure operator console | ✅ | Signed session login, CSRF-protected UI actions, role-aware controls, login/logout audit |
 | v0.6.1 Offboarding completion ledger | ✅ | Admin-only, claim-before-execute, idempotent replay, stale-claim takeover, ledger-backed offboarding |
 | v1.0 Operations: readiness, metrics, migrations | ✅ | `/ready`, `/metrics`, correlation IDs, Alembic baseline, container migration entrypoint |
 | v1.0 CI + Docker | ✅ | GitHub Actions runs pytest, a Docker Compose API + PostgreSQL smoke test, and PostgreSQL reliability tests |
@@ -60,6 +61,7 @@ flowops/
 │   ├── outbox.py             # leased outbox claim/finalize helpers
 │   ├── outbox_worker.py      # automatic notification dispatcher
 │   ├── auth.py               # bearer/Entra auth and role helpers
+│   ├── ui_session.py         # signed UI sessions, cookie flags, and CSRF helpers
 │   ├── ai_agent.py           # simulated AI agent, KB search, optional LLM boundary
 │   ├── web.py                # Jinja2 rendering helpers
 │   ├── templates/            # shared layout, landing, dashboard, operator pages
@@ -351,7 +353,19 @@ retry/requeue endpoints remain available.
 
 `src/auth.py` supports optional Entra JWT or a local development bearer token.
 Set `FLOWOPS_AUTH_REQUIRED=true` to protect mutating routes; the default local
-mode is unauthenticated for beginner-friendly development. Operator routes
+mode is unauthenticated for beginner-friendly development.
+
+The browser console adds a separate session layer. Set
+`FLOWOPS_UI_AUTH_REQUIRED=true`, `FLOWOPS_AUTH_REQUIRED=true`, and a random
+`FLOWOPS_SESSION_SECRET`; then
+`/dashboard` and `/ui/*` redirect to `/login`, where an operator pastes a dev
+bearer token or Entra access token. The signed, HttpOnly, SameSite=Lax cookie
+carries subject/roles and a per-session CSRF token. UI fetch actions send
+`X-CSRF-Token`; cookie-authenticated mutations without it return `403`. Bearer
+API clients remain CSRF-exempt. Set `FLOWOPS_SESSION_COOKIE_SECURE=true` behind
+HTTPS. This is a prototype token-paste login, not full SSO or user management.
+
+Operator routes
 require `automation.operator` or `automation.admin`. `POST /webhooks/intake`
 can additionally require `X-API-Key` via `FLOWOPS_WEBHOOK_API_KEY`.
 Authenticated actions write `actor_subject` to execution logs; `GET /audit` and
@@ -377,7 +391,7 @@ No real secrets or Microsoft tenant are included.
 ## Running the tests
 
 ```bash
-pytest    # 209 passed, 13 skipped locally; the skips are PostgreSQL-only tests
+pytest    # 218 passed, 13 skipped locally; the skips are PostgreSQL-only tests
 python -m compileall -q src tests
 ```
 

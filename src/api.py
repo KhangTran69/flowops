@@ -10,16 +10,19 @@ import hashlib
 import html
 import json
 import os
+import secrets
 import threading
 import time
 import uuid
 from collections import Counter
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal, Optional
+from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request, Response
 from fastapi import status as http_status
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, field_validator
 from sqlalchemy import and_, delete, or_, select, text, update
@@ -28,7 +31,7 @@ from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
-from src import ai_agent, db, jobs, web
+from src import ai_agent, db, jobs, ui_session, web
 from src.actions import (
     ACTION_BY_STEP,
     ActionAdapter,
@@ -126,26 +129,69 @@ app.mount(
 )
 
 
+def _local_ui_actor() -> Actor:
+    return Actor(
+        subject="local-development",
+        roles=("automation.operator", "automation.admin"),
+        source="local",
+    )
+
+
 def _actor_from_header(
+    request: Request,
     authorization: Optional[str] = Header(default=None),
 ) -> Actor:
-    """Resolve the authenticated actor, or raise a clean 401."""
+    """Resolve a bearer actor or an authenticated browser session."""
+    if authorization:
+        try:
+            actor = authenticate_bearer(authorization)
+        except AuthenticationError as error:
+            raise HTTPException(status_code=401, detail=str(error)) from error
+        return replace(actor, source="bearer")
+    session = ui_session.read_session(request)
+    if session is not None:
+        return ui_session.actor_from_session(session)
     try:
-        return authenticate_bearer(authorization)
+        actor = authenticate_bearer(None)
     except AuthenticationError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
+    if ui_session.ui_auth_required() and actor.source == "local":
+        raise HTTPException(status_code=401, detail="Authentication required.")
+    return actor
 
 
-def _operator_actor(actor: Actor = Depends(_actor_from_header)) -> Actor:
+def _enforce_csrf(request: Optional[Request], actor: Actor) -> None:
+    """CSRF applies only to cookie-authenticated browser mutations."""
+    if request is None or actor.source != "session":
+        return
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return
+    session = ui_session.read_session(request)
+    if session is None or not ui_session.csrf_matches(request, session):
+        raise HTTPException(
+            status_code=403,
+            detail="CSRF token missing or invalid; refresh and retry.",
+        )
+
+
+def _operator_actor(
+    request: Request,
+    actor: Actor = Depends(_actor_from_header),
+) -> Actor:
     if not {"automation.operator", "automation.admin"} & set(actor.roles):
         raise HTTPException(status_code=403, detail="Operator role is required.")
+    _enforce_csrf(request, actor)
     _enforce_rate_limit(f"actor:{actor.subject}")
     return actor
 
 
-def _admin_actor(actor: Actor = Depends(_actor_from_header)) -> Actor:
+def _admin_actor(
+    request: Request,
+    actor: Actor = Depends(_actor_from_header),
+) -> Actor:
     if "automation.admin" not in actor.roles:
         raise HTTPException(status_code=403, detail="Admin role is required.")
+    _enforce_csrf(request, actor)
     _enforce_rate_limit(f"actor:{actor.subject}")
     return actor
 
@@ -197,9 +243,24 @@ def _record_request(method: str, route: str, status_code: int, duration: float) 
 
 @app.middleware("http")
 async def correlation_and_metrics(request: Request, call_next):
-    """Attach a correlation id and count every HTTP request."""
+    """Attach a correlation id, resolve UI sessions, and count requests."""
     correlation_id = request.headers.get("X-Correlation-ID") or uuid.uuid4().hex
     request.state.correlation_id = correlation_id
+    session = ui_session.read_session(request)
+    request.state.ui_session = session
+    request.state.actor = (
+        ui_session.actor_from_session(session) if session else _local_ui_actor()
+    )
+    request.state.csrf_token = session.csrf_token if session else ""
+    protected_ui_path = request.url.path == "/dashboard" or request.url.path.startswith(
+        "/ui/"
+    )
+    if ui_session.ui_auth_required() and protected_ui_path and session is None:
+        redirect = RedirectResponse(
+            f"/login?next={quote(request.url.path)}", status_code=303
+        )
+        redirect.headers["X-Correlation-ID"] = correlation_id
+        return redirect
     started = time.perf_counter()
     response = await call_next(request)
     duration = time.perf_counter() - started
@@ -239,12 +300,17 @@ def _enforce_rate_limit(actor_key: str) -> None:
 @app.on_event("startup")
 def _validate_auth_on_startup() -> None:
     validate_auth_configuration()
+    ui_session.validate_ui_auth_configuration()
 
 
 @app.get("/auth/me")
 def auth_me(actor: Actor = Depends(_actor_from_header)) -> dict:
-    """Return the resolved local or token actor."""
-    return {"subject": actor.subject, "roles": list(actor.roles)}
+    """Return the resolved local, bearer, or session actor."""
+    return {
+        "subject": actor.subject,
+        "roles": list(actor.roles),
+        "source": actor.source,
+    }
 
 
 def _new_run_id() -> str:
@@ -834,6 +900,98 @@ def _site_stats(session: Session) -> dict[str, int]:
         "pending_notifications": sum(1 for item in outbox if item.status == "pending"),
         "failed_notifications": sum(1 for item in outbox if item.status == "failed"),
     }
+
+
+@app.get("/login", response_class=HTMLResponse, include_in_schema=False)
+def login_page(
+    request: Request,
+    next: str = Query(default=""),
+    error: str = Query(default=""),
+) -> Response:
+    """Render the local token login page."""
+    if not ui_session.ui_auth_required():
+        return RedirectResponse("/dashboard", status_code=303)
+    if ui_session.read_session(request) is not None:
+        return RedirectResponse(ui_session.safe_next(next), status_code=303)
+    return web.render(
+        request,
+        "login.html",
+        {
+            "active": "login",
+            "next": ui_session.safe_next(next),
+            "error": error,
+        },
+    )
+
+
+@app.post("/login", response_class=HTMLResponse, include_in_schema=False)
+def login_submit(
+    request: Request,
+    token: str = Form(default=""),
+    next: str = Form(default=""),
+    db_session: Session = Depends(db.get_session),
+) -> Response:
+    """Validate a bearer token and create a signed browser session."""
+    if not ui_session.ui_auth_required():
+        return RedirectResponse("/dashboard", status_code=303)
+    try:
+        actor = authenticate_bearer(f"Bearer {token.strip()}")
+    except AuthenticationError:
+        return web.render(
+            request,
+            "login.html",
+            {
+                "active": "login",
+                "next": ui_session.safe_next(next),
+                "error": "Invalid access token.",
+            },
+            status_code=401,
+        )
+    ui_data = ui_session.create_session(actor)
+    response = RedirectResponse(ui_session.safe_next(next), status_code=303)
+    ui_session.set_session_cookie(response, ui_data)
+    db.log_execution(
+        db_session,
+        run_id=_new_run_id(),
+        action="ui.login",
+        status="success",
+        duration_ms=0,
+        detail=f"source=session; roles={','.join(actor.roles)}",
+        actor_subject=actor.subject,
+        correlation_id=getattr(request.state, "correlation_id", None),
+    )
+    db_session.commit()
+    return response
+
+
+@app.post("/logout", response_class=HTMLResponse, include_in_schema=False)
+def logout(
+    request: Request,
+    csrf_token: str = Form(default=""),
+    session_db: Session = Depends(db.get_session),
+) -> Response:
+    """Clear the browser session after a CSRF check."""
+    session = ui_session.read_session(request)
+    if session is None:
+        response = RedirectResponse("/login", status_code=303)
+        ui_session.clear_session_cookie(response)
+        return response
+    if not csrf_token or not secrets.compare_digest(csrf_token, session.csrf_token):
+        raise HTTPException(status_code=403, detail="CSRF token missing or invalid.")
+    db.log_execution(
+        session_db,
+        run_id=_new_run_id(),
+        action="ui.logout",
+        status="success",
+        duration_ms=0,
+        detail="source=session",
+        actor_subject=session.subject,
+        correlation_id=getattr(request.state, "correlation_id", None),
+    )
+    session_db.commit()
+    response = RedirectResponse("/login", status_code=303)
+    ui_session.clear_session_cookie(response)
+    return response
 
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)

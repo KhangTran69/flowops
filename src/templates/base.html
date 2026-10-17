@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
   <title>{% block title %}FlowOps{% endblock %}</title>
   <link rel="stylesheet" href="/static/css/app.css">
   <script src="/static/js/app.js" defer></script>
@@ -26,9 +27,20 @@
         <a href="/ui/audit" {% if active == "audit" %}aria-current="page"{% endif %}>Audit</a>
         <a href="/docs">API docs</a>
       </nav>
-      <button class="button ghost theme-toggle" id="theme-toggle" type="button" aria-label="Toggle color theme">
-        Theme
-      </button>
+      <div class="header-actions">
+        {% if actor and actor.source == "session" %}
+        <span class="nav-user" title="Signed in">{{ actor.subject }}</span>
+        <form method="post" action="/logout" class="inline-form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="button ghost small" type="submit">Log out</button>
+        </form>
+        {% elif ui_auth_required %}
+        <a class="button ghost small" href="/login">Sign in</a>
+        {% endif %}
+        <button class="button ghost theme-toggle" id="theme-toggle" type="button" aria-label="Toggle color theme">
+          Theme
+        </button>
+      </div>
     </div>
   </header>
 
