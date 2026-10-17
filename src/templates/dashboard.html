@@ -24,8 +24,9 @@
   <div class="kpi"><span class="kpi-value">{{ stats.avg_duration }} ms</span><span class="kpi-label">Avg duration</span></div>
   <div class="kpi"><span class="kpi-value">{{ stats.hours_saved }} h</span><span class="kpi-label">Est. time saved</span></div>
   <div class="kpi"><span class="kpi-value">{{ stats.pending_notifications }}</span><span class="kpi-label">Pending notifications</span></div>
+  <div class="kpi"><span class="kpi-value">{{ stats.pending_notifications }}</span><span class="kpi-label">Pending webhook retries</span></div>
   <div class="kpi"><span class="kpi-value">{{ stats.delivered_notifications }}</span><span class="kpi-label">Delivered notifications</span></div>
-  <div class="kpi"><span class="kpi-value {% if stats.failed_notifications %}fail{% endif %}">{{ stats.failed_notifications }}</span><span class="kpi-label">Dead letters</span></div>
+  <div class="kpi"><span class="kpi-value {% if stats.failed_notifications %}fail{% endif %}">{{ stats.failed_notifications }}</span><span class="kpi-label">Failed notifications</span></div>
   <div class="kpi"><span class="kpi-value">{{ stats.notification_retries }}</span><span class="kpi-label">Notification retries</span></div>
 </section>
 

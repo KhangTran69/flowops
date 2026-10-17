@@ -903,6 +903,114 @@ def get_onboarding_request_status(
     )
 
 
+
+@app.get(
+    "/ui/onboarding-requests",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+)
+def ui_onboarding_requests(
+    request: Request, session: Session = Depends(db.get_session)
+) -> HTMLResponse:
+    """Operator list of onboarding/offboarding requests."""
+    records = session.execute(select(db.OnboardingRequestRecord)).scalars().all()
+    rows = []
+    for record in records:
+        _, items = _load_request(session, record.id)
+        total = len(items)
+        completed = sum(1 for item in items if item.status == "completed")
+        rows.append(
+            {
+                "id": record.id,
+                "request_type": record.request_type,
+                "employee_name": record.employee_name,
+                "department": record.department,
+                "status": record.status,
+                "completed": completed,
+                "total": total,
+                "percent": round((completed / total) * 100) if total else 0,
+            }
+        )
+    return web.render(
+        request,
+        "onboarding_list.html",
+        {"active": "onboarding", "requests": rows},
+    )
+
+
+@app.get(
+    "/ui/onboarding-requests/{request_id}",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+)
+def ui_onboarding_request(
+    request: Request,
+    request_id: int,
+    session: Session = Depends(db.get_session),
+) -> HTMLResponse:
+    """Operator detail page for one checklist."""
+    try:
+        record, items = _load_request(session, request_id)
+    except HTTPException as error:
+        if error.status_code == 404:
+            return web.render(
+                request,
+                "404.html",
+                {"active": "onboarding"},
+                status_code=404,
+            )
+        raise
+    completed = sum(1 for item in items if item.status == "completed")
+    return web.render(
+        request,
+        "onboarding_detail.html",
+        {
+            "active": "onboarding",
+            "request_record": record,
+            "items": sorted(items, key=lambda item: item.id),
+            "completed": completed,
+            "total": len(items),
+        },
+    )
+
+
+@app.get("/ui/notifications", response_class=HTMLResponse, include_in_schema=False)
+def ui_notifications(
+    request: Request, session: Session = Depends(db.get_session)
+) -> HTMLResponse:
+    """Operator page for pending and dead-letter webhook deliveries."""
+    records = session.execute(
+        select(db.NotificationOutboxRecord).order_by(db.NotificationOutboxRecord.id)
+    ).scalars().all()
+    return web.render(
+        request,
+        "notifications.html",
+        {
+            "active": "notifications",
+            "pending": [item for item in records if item.status == "pending"],
+            "failed": [item for item in records if item.status == "failed"],
+        },
+    )
+
+
+@app.get("/ui/workflow-jobs", response_class=HTMLResponse, include_in_schema=False)
+def ui_workflow_jobs(
+    request: Request, session: Session = Depends(db.get_session)
+) -> HTMLResponse:
+    """Operator page for the durable workflow queue."""
+    return web.render(
+        request,
+        "jobs.html",
+        {"active": "jobs", "jobs": []},
+    )
+
+
+@app.get("/ui/{rest:path}", response_class=HTMLResponse, include_in_schema=False)
+def ui_not_found(request: Request, rest: str) -> HTMLResponse:
+    """Friendly HTML 404 for unknown operator pages."""
+    return web.render(request, "404.html", {"active": ""}, status_code=404)
+
+
 def _get_item(
     session: Session, record: db.OnboardingRequestRecord, item_id: int
 ) -> db.ChecklistItemRecord:
@@ -1310,12 +1418,20 @@ def list_execution_logs(
 
 
 @app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
-def dashboard(session: Session = Depends(db.get_session)) -> str:
+def dashboard(
+    request: Request,
+    session: Session = Depends(db.get_session),
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    auto_refresh: bool = Query(default=False),
+) -> HTMLResponse:
     """Server-rendered monitoring dashboard over tickets and execution logs."""
     tickets = session.execute(select(db.TicketRecord)).scalars().all()
-    logs = session.execute(
-        select(db.ExecutionLogRecord).order_by(db.ExecutionLogRecord.id.desc()).limit(200)
-    ).scalars().all()
+    log_query = select(db.ExecutionLogRecord).order_by(
+        db.ExecutionLogRecord.id.desc()
+    ).limit(200)
+    if status_filter in ("success", "failure"):
+        log_query = log_query.where(db.ExecutionLogRecord.status == status_filter)
+    logs = session.execute(log_query).scalars().all()
     outbox_records = session.execute(
         select(db.NotificationOutboxRecord)
     ).scalars().all()
@@ -1329,135 +1445,67 @@ def dashboard(session: Session = Depends(db.get_session)) -> str:
     total = len(tickets)
     open_count = sum(1 for t in tickets if t.status == "open")
     closed_count = total - open_count
-    by_queue = Counter(t.queue or "unrouted" for t in tickets)
-    by_priority = Counter(t.priority for t in tickets)
+    auto_routed = sum(
+        1 for t in tickets if t.queue and t.queue != "it-service-desk"
+    )
     success_count = sum(1 for log in logs if log.status == "success")
     failure_count = len(logs) - success_count
     avg_duration = (
         round(sum(log.duration_ms for log in logs) / len(logs)) if logs else 0
     )
-    auto_routed = sum(1 for t in tickets if t.queue and t.queue != "it-service-desk")
-    hours_saved = round(auto_routed * 15 / 60, 1)
     outbox_counts = Counter(item.status for item in outbox_records)
-    outbox_pending = outbox_counts.get("pending", 0)
-    outbox_delivered = outbox_counts.get("delivered", 0)
-    outbox_failed = outbox_counts.get("failed", 0)
-    outbox_attempts = sum(item.attempts for item in outbox_records)
-    outbox_retries = sum(max(item.attempts - 1, 0) for item in outbox_records)
 
-    def counter_rows(counter: Counter) -> str:
-        return "".join(
-            f"<tr><td>{html.escape(str(key))}</td><td>{count}</td></tr>"
-            for key, count in counter.most_common()
-        )
+    def bars(counter: Counter) -> list[dict[str, object]]:
+        maximum = max(counter.values(), default=0)
+        return [
+            {
+                "label": str(label),
+                "count": count,
+                "percent": round((count / maximum) * 100) if maximum else 0,
+            }
+            for label, count in counter.most_common()
+        ]
 
-    recent_rows = "".join(
-        "<tr>"
-        f"<td>#{log.id}</td><td>{log.created_at.strftime('%Y-%m-%d %H:%M:%S')}</td>"
-        f"<td>{html.escape(log.action)}</td>"
-        f"<td class=\"{'ok' if log.status == 'success' else 'fail'}\">{log.status}</td>"
-        f"<td>{html.escape(log.ticket_id or '')}</td><td>{log.duration_ms} ms</td>"
-        "</tr>"
-        for log in logs[:15]
+    stats = {
+        "total": total,
+        "open": open_count,
+        "closed": closed_count,
+        "auto_routed": auto_routed,
+        "success_count": success_count,
+        "failure_count": failure_count,
+        "avg_duration": avg_duration,
+        "hours_saved": round(auto_routed * 15 / 60, 1),
+        "pending_notifications": outbox_counts.get("pending", 0),
+        "delivered_notifications": outbox_counts.get("delivered", 0),
+        "failed_notifications": outbox_counts.get("failed", 0),
+        "notification_retries": sum(
+            max(item.attempts - 1, 0) for item in outbox_records
+        ),
+    }
+    log_rows = [
+        {
+            "id": log.id,
+            "created_at": log.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "action": log.action,
+            "status": log.status,
+            "ticket_id": log.ticket_id,
+            "duration_ms": log.duration_ms,
+        }
+        for log in logs[:50]
+    ]
+    return web.render(
+        request,
+        "dashboard.html",
+        {
+            "active": "dashboard",
+            "stats": stats,
+            "queues": bars(Counter(t.queue or "unrouted" for t in tickets)),
+            "priorities": bars(Counter(t.priority for t in tickets)),
+            "logs": log_rows,
+            "status_filter": status_filter,
+            "pending": pending_deliveries,
+            "failed": failed_deliveries,
+            "auto_refresh": auto_refresh,
+            "last_updated": db.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        },
     )
-
-    outbox_card = (
-        f'<div class="card"><div class="value fail">{outbox_pending}'
-        '</div><div class="label">pending webhook retries</div></div>'
-        if outbox_pending
-        else ""
-    )
-    outbox_section = ""
-    if pending_deliveries:
-        outbox_rows = "".join(
-            "<tr>"
-            f"<td>#{item.id}</td>"
-            f"<td>{html.escape(item.ticket_id or '')}</td>"
-            f"<td>{html.escape(item.url)}</td>"
-            f"<td>{item.attempts}</td>"
-            f"<td class=\"fail\">{html.escape(item.last_error or '')}</td>"
-            "</tr>"
-            for item in pending_deliveries[:15]
-        )
-        outbox_section = f"""<section>
-<h2>Pending webhook deliveries ({outbox_pending})</h2>
-<p>Retry them with <code>POST /notifications/retry</code> &middot;
-list with <code>GET /notifications/pending</code>.</p>
-<table><tr><th>#</th><th>ticket</th><th>url</th><th>attempts</th><th>last error</th></tr>{outbox_rows}</table>
-</section>
-"""
-
-    failed_section = ""
-    if failed_deliveries:
-        failed_rows = "".join(
-            "<tr>"
-            f"<td>#{item.id}</td>"
-            f"<td>{html.escape(item.ticket_id or '')}</td>"
-            f"<td>{html.escape(item.url)}</td>"
-            f"<td>{item.attempts}</td>"
-            f"<td class=\"fail\">{html.escape(item.last_error or '')}</td>"
-            f"<td><code>POST /notifications/{item.id}/requeue</code></td>"
-            "</tr>"
-            for item in failed_deliveries[:15]
-        )
-        failed_section = f"""<section>
-<h2>Dead-letter notifications ({outbox_failed})</h2>
-<p>Return one to the pending queue with
-<code>POST /notifications/{{id}}/requeue</code> &middot;
-list with <code>GET /notifications/failed</code>.</p>
-<table><tr><th>#</th><th>ticket</th><th>url</th><th>attempts</th><th>last error</th><th>action</th></tr>{failed_rows}</table>
-</section>
-"""
-
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FlowOps dashboard</title>
-<style>
-  body {{ font-family: -apple-system, system-ui, sans-serif; margin: 2rem; background: #f5f6f8; color: #1f2933; }}
-  h1 {{ font-size: 1.5rem; }}
-  .cards {{ display: flex; flex-wrap: wrap; gap: 1rem; margin: 1rem 0 2rem; }}
-  .card {{ background: #fff; border-radius: 10px; padding: 1rem 1.5rem; box-shadow: 0 1px 4px rgba(0,0,0,.08); min-width: 9rem; }}
-  .card .value {{ font-size: 1.8rem; font-weight: 600; }}
-  .card .label {{ color: #5f6b7a; font-size: .8rem; }}
-  section {{ background: #fff; border-radius: 10px; padding: 1rem 1.5rem; box-shadow: 0 1px 4px rgba(0,0,0,.08); margin-bottom: 1.5rem; overflow-x: auto; }}
-  table {{ border-collapse: collapse; width: 100%; font-size: .85rem; }}
-  th, td {{ text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #eef0f3; }}
-  th {{ color: #5f6b7a; font-weight: 600; }}
-  td.ok {{ color: #137333; }} td.fail {{ color: #c5221f; font-weight: 600; }}
-  .card .value.fail {{ color: #c5221f; }}
-  .cols {{ display: flex; gap: 1.5rem; flex-wrap: wrap; }}
-  .cols section {{ flex: 1; min-width: 16rem; }}
-  a {{ color: #2563eb; }}
-</style>
-</head>
-<body>
-<h1>FlowOps monitoring dashboard</h1>
-<p><a href="/">&larr; back</a> &middot; learning prototype, simulated data</p>
-<div class="cards">
-  <div class="card"><div class="value">{total}</div><div class="label">tickets</div></div>
-  <div class="card"><div class="value">{open_count}</div><div class="label">open</div></div>
-  <div class="card"><div class="value">{closed_count}</div><div class="label">closed</div></div>
-  <div class="card"><div class="value">{auto_routed}</div><div class="label">auto-routed</div></div>
-  <div class="card"><div class="value">{success_count}</div><div class="label">successful runs</div></div>
-  <div class="card"><div class="value">{failure_count}</div><div class="label">failed runs</div></div>
-  <div class="card"><div class="value">{avg_duration} ms</div><div class="label">avg run duration</div></div>
-  <div class="card"><div class="value">{hours_saved} h</div><div class="label">est. staff time saved</div></div>
-  <div class="card"><div class="value">{outbox_pending}</div><div class="label">pending notifications</div></div>
-  <div class="card"><div class="value">{outbox_pending}</div><div class="label">pending webhook retries</div></div>
-  <div class="card"><div class="value">{outbox_delivered}</div><div class="label">delivered notifications</div></div>
-  <div class="card"><div class="value">{outbox_failed}</div><div class="label">failed notifications</div></div>
-  <div class="card"><div class="value">{outbox_retries}</div><div class="label">notification retries</div></div>
-</div>
-<div class="cols">
-  <section><h2>Tickets by queue</h2><table>{counter_rows(by_queue)}</table></section>
-  <section><h2>Tickets by priority</h2><table>{counter_rows(by_priority)}</table></section>
-</div>
-{outbox_section}{failed_section}<section>
-  <h2>Recent workflow runs</h2>
-  <table><tr><th>run</th><th>time</th><th>action</th><th>status</th><th>ticket</th><th>duration</th></tr>{recent_rows}</table>
-</section>
-</body>
-</html>"""
