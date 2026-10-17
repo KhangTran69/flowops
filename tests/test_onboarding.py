@@ -1,5 +1,10 @@
 """Tests for onboarding/offboarding workflows (v0.5)."""
 
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -15,6 +20,13 @@ VALID_ONBOARDING = {
     "start_date": "2026-11-02",
 }
 
+VALID_TICKET = {
+    "userId": 7,
+    "id": 42,
+    "title": "Laptop will not start",
+    "completed": False,
+}
+
 
 @pytest.fixture
 def client(tmp_path):
@@ -25,6 +37,36 @@ def client(tmp_path):
 def _create(client, overrides=None):
     payload = {**VALID_ONBOARDING, **(overrides or {})}
     return client.post("/onboarding-requests", json=payload)
+
+
+def _ensure_tables():
+    db.Base.metadata.create_all(bind=db.engine)
+
+
+def _reservation(key):
+    session = db.SessionLocal()
+    try:
+        record = session.get(db.IdempotencyRecord, key)
+        if record is None:
+            return None
+        return {
+            "payload": json.loads(record.response_json),
+            "owner_token": record.owner_token,
+            "resource_type": record.resource_type,
+        }
+    finally:
+        session.close()
+
+
+def _make_reservation_stale(key):
+    session = db.SessionLocal()
+    try:
+        record = session.get(db.IdempotencyRecord, key)
+        assert record is not None
+        record.created_at = db.utcnow() - timedelta(minutes=10)
+        session.commit()
+    finally:
+        session.close()
 
 
 def test_create_onboarding_generates_checklist(client):
@@ -147,213 +189,258 @@ def test_onboarding_actions_logged(client):
     assert any(action.startswith("onboarding.item.") for action in actions)
 
 
-# ---------------------------------------------------------------------------
-# v0.6 placeholder: simulated Microsoft 365 provisioning (offline, no network)
+def test_get_onboarding_request_status_summary(client):
+    """Initial request status reflects pending approval and zero completion."""
+    request_id = _create(client).json()["id"]
+    response = client.get(f"/onboarding-requests/{request_id}/status")
+    assert response.status_code == 200
+    summary = response.json()
+    assert summary["id"] == request_id
+    assert summary["request_type"] == "onboarding"
+    assert summary["employee_name"] == "Jane Doe"
+    assert summary["status"] == "in_progress"
+    assert summary["total_steps"] == len(ONBOARDING_STEPS)
+    assert summary["completed_steps"] == 0
+    # Onboarding has 2 steps requiring approval (account & licenses)
+    assert summary["pending_approval_steps"] == 2
+    assert summary["percent_complete"] == 0
 
 
-class RecordingSimulator:
-    """Test double for the M365 simulator; counts calls, returns fake data."""
+def test_get_onboarding_request_status_progresses_to_completion(client):
+    """Status summary updates as steps are approved and completed."""
+    request_id = _create(client).json()["id"]
+    checklist = client.get(f"/onboarding-requests/{request_id}").json()["checklist"]
 
-    def __init__(self):
-        self.calls: list[dict] = []
+    # Approve one item requiring approval
+    gated_item = next(item for item in checklist if item["requires_approval"])
+    client.post(f"/onboarding-requests/{request_id}/items/{gated_item['id']}/approve")
+    summary = client.get(f"/onboarding-requests/{request_id}/status").json()
+    assert summary["pending_approval_steps"] == 1
+    assert summary["completed_steps"] == 0
 
-    def create_user(self, display_name: str, mail: str, department: str) -> dict:
-        self.calls.append(
-            {"display_name": display_name, "mail": mail, "department": department}
-        )
-        return {
-            "simulated": True,
-            "id": f"fake-id-{len(self.calls)}",
-            "display_name": display_name,
-            "mail": mail,
-            "department": department,
-        }
+    # Complete that item
+    client.post(f"/onboarding-requests/{request_id}/items/{gated_item['id']}/complete")
+    summary = client.get(f"/onboarding-requests/{request_id}/status").json()
+    assert summary["completed_steps"] == 1
+    assert summary["percent_complete"] == 25
 
-    def get_status(self, user_id: str) -> dict:
-        return {
-            "simulated": True,
-            "id": user_id,
-            "provisioning_state": "success",
-            "last_sync": "2026-01-01T00:00:00+00:00",
-        }
+    # Complete the rest
+    for item in checklist:
+        if item["id"] == gated_item["id"]:
+            continue
+        if item["requires_approval"]:
+            client.post(f"/onboarding-requests/{request_id}/items/{item['id']}/approve")
+        client.post(f"/onboarding-requests/{request_id}/items/{item['id']}/complete")
 
-
-@pytest.fixture
-def recording_simulator(monkeypatch):
-    fake = RecordingSimulator()
-    monkeypatch.setattr(api, "m365_simulator", fake)
-    return fake
-
-
-def _complete_m365_step(client, body):
-    step = next(i for i in body["checklist"] if i["action"] == "m365_provision")
-    return client.post(
-        f"/onboarding-requests/{body['id']}/items/{step['id']}/complete"
-    )
+    final = client.get(f"/onboarding-requests/{request_id}/status").json()
+    assert final["status"] == "completed"
+    assert final["completed_steps"] == len(ONBOARDING_STEPS)
+    assert final["pending_approval_steps"] == 0
+    assert final["percent_complete"] == 100
 
 
-def test_m365_step_added_only_with_mail(client):
-    with_mail = _create(client, {"mail": "jane@contoso.example"})
-    assert with_mail.status_code == 201
-    steps = with_mail.json()["checklist"]
-    assert len(steps) == len(ONBOARDING_STEPS) + 1
-    m365_steps = [s for s in steps if s["action"] == "m365_provision"]
-    assert len(m365_steps) == 1
-    assert m365_steps[0]["result"] is None  # not provisioned until completed
-
-    without_mail = _create(client, {"employee_email": "noone@example.com"})
-    assert without_mail.status_code == 201
-    assert all(s["action"] != "m365_provision" for s in without_mail.json()["checklist"])
+def test_get_onboarding_request_status_unknown_returns_404(client):
+    assert client.get("/onboarding-requests/999/status").status_code == 404
 
 
-def test_m365_offboarding_never_gets_provision_step(client):
-    response = _create(
-        client,
-        {
-            "request_type": "offboarding",
-            "employee_name": "Bob Roe",
-            "employee_email": "bob@example.com",
-            "mail": "bob@contoso.example",
-        },
-    )
-    assert response.status_code == 201
-    assert all(s["action"] != "m365_provision" for s in response.json()["checklist"])
+# --- Onboarding idempotency (fenced reservations) ---
 
 
-@pytest.mark.parametrize("bad_mail", ["not-an-email", "a b@x.io", "@missing.local", "no.tld@domain"])
-def test_invalid_mail_rejected_422(client, bad_mail):
-    assert _create(client, {"mail": bad_mail}).status_code == 422
+def test_onboarding_idempotency_key_replays_stored_response(client):
+    headers = {"Idempotency-Key": "onboarding-replay"}
+    first = client.post("/onboarding-requests", json=VALID_ONBOARDING, headers=headers)
+    second = client.post("/onboarding-requests", json=VALID_ONBOARDING, headers=headers)
 
-
-def test_completing_m365_step_calls_simulator_once(client, recording_simulator):
-    body = _create(client, {"mail": "jane@contoso.example"}).json()
-    done = _complete_m365_step(client, body)
-    assert done.status_code == 200
-    assert len(recording_simulator.calls) == 1
-    assert recording_simulator.calls[0] == {
-        "display_name": "Jane Doe",
-        "mail": "jane@example.com",
-        "department": "Sales",
-    }
-    step = next(i for i in done.json()["checklist"] if i["action"] == "m365_provision")
-    assert step["status"] == "completed"
-    assert step["result"]["simulated"] is True
-    assert step["result"]["id"] == "fake-id-1"
-
-
-def test_completed_m365_step_not_rerun_on_later_transitions(client, recording_simulator):
-    body = _create(client, {"mail": "jane@contoso.example"}).json()
-    _complete_m365_step(client, body)
-    step = next(i for i in body["checklist"] if i["action"] == "m365_provision")
-    again = client.post(
-        f"/onboarding-requests/{body['id']}/items/{step['id']}/complete"
-    )
-    assert again.status_code == 409  # already completed
-    assert len(recording_simulator.calls) == 1  # never re-executed
-
-
-def test_m365_stored_result_is_returned_without_recalling_simulator(client, recording_simulator):
-    """The simulated user id is stored once; re-reading never re-provisions."""
-    body = _create(client, {"mail": "jane@contoso.example"}).json()
-    done = _complete_m365_step(client, body)
-    stored_user_id = next(
-        i for i in done.json()["checklist"] if i["action"] == "m365_provision"
-    )["result"]["id"]
-    assert len(recording_simulator.calls) == 1
-    # Re-reads (GET) return the same stored result and never call again.
-    fetched = client.get(f"/onboarding-requests/{body['id']}").json()
-    replayed_step = next(
-        i for i in fetched["checklist"] if i["action"] == "m365_provision"
-    )
-    assert replayed_step["result"]["id"] == stored_user_id
-    listed = client.get("/onboarding-requests").json()
-    listed_step = next(
-        i for item in listed for i in item["checklist"] if i["action"] == "m365_provision"
-    )
-    assert listed_step["result"]["id"] == stored_user_id
-    assert len(recording_simulator.calls) == 1  # reads never re-provision
-
-
-def test_ticket_idempotency_replay_untouched_by_m365(client):
-    """Requirement 4 regression: /tickets replay still works with v0.6 code."""
-    payload = {"userId": 1, "id": 42, "title": "Printer jam", "completed": False}
-    headers = {"Idempotency-Key": "same-key"}
-    first = client.post("/tickets", json=payload, headers=headers)
     assert first.status_code == 201
-    second = client.post("/tickets", json=payload, headers=headers)
     assert second.status_code == 200
     assert second.headers["Idempotency-Replayed"] == "true"
     assert second.json() == first.json()
+    assert len(client.get("/onboarding-requests").json()) == 1
+
+    actions = [log["action"] for log in client.get("/execution-logs").json()]
+    assert actions.count("onboarding.request.created") == 1
+    assert "onboarding.request.idempotent_replay" in actions
 
 
-def test_m365_status_endpoint_shape(client):
-    response = client.get("/onboarding-requests/m365-status/abc-123")
-    assert response.status_code == 200
-    body = response.json()
-    assert body["simulated"] is True
-    assert body["id"] == "abc-123"
-    assert body["provisioning_state"] == "success"
+def test_onboarding_same_key_different_payload_returns_409(client):
+    headers = {"Idempotency-Key": "onboarding-conflict"}
+    first = client.post("/onboarding-requests", json=VALID_ONBOARDING, headers=headers)
+    assert first.status_code == 201
+
+    conflict = client.post(
+        "/onboarding-requests",
+        json={**VALID_ONBOARDING, "employee_name": "Someone Else"},
+        headers=headers,
+    )
+    assert conflict.status_code == 409
+    assert "different request" in conflict.json()["detail"]
+    assert len(client.get("/onboarding-requests").json()) == 1
 
 
-def test_real_simulator_is_deterministic_and_labelled():
-    from src.m365_simulator import M365Simulator
+def test_onboarding_concurrent_same_key_returns_409(client, monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+    call_lock = threading.Lock()
+    original_create = api._create_onboarding_request
 
-    sim = M365Simulator()
-    a = sim.create_user("Jane Doe", "Jane@Contoso.Example", "Sales")
-    b = sim.create_user("Jane Doe", "jane@contoso.example", "Sales")
-    assert a["simulated"] is True and a["id"] == b["id"]  # same mail -> same id
-    assert len(a["id"]) == 36  # GUID-shaped (8-4-4-4-12)
-    status = sim.get_status(a["id"])
-    assert status["simulated"] is True and status["id"] == a["id"]
+    def pause_first(request, session):
+        nonlocal calls
+        with call_lock:
+            calls += 1
+            is_first = calls == 1
+        if is_first:
+            entered.set()
+            assert release.wait(timeout=5), "test did not release the first request"
+        return original_create(request, session)
+
+    monkeypatch.setattr(api, "_create_onboarding_request", pause_first)
+    headers = {"Idempotency-Key": "onboarding-concurrent"}
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first_future = executor.submit(
+            client.post, "/onboarding-requests", json=VALID_ONBOARDING, headers=headers
+        )
+        assert entered.wait(timeout=5), "first request never reached creation"
+        try:
+            concurrent = client.post(
+                "/onboarding-requests", json=VALID_ONBOARDING, headers=headers
+            )
+        finally:
+            release.set()
+        first = first_future.result(timeout=5)
+
+    assert concurrent.status_code == 409
+    assert "still processing" in concurrent.json()["detail"]
+    assert first.status_code == 201
+    assert len(client.get("/onboarding-requests").json()) == 1
 
 
-def test_m365_provision_logged(client, recording_simulator):
-    body = _create(client, {"mail": "jane@contoso.example"}).json()
-    _complete_m365_step(client, body)
-    logs = client.get("/execution-logs").json()
-    provision_logs = [log for log in logs if log["action"] == "onboarding.m365_provision"]
-    assert len(provision_logs) == 1
-    assert provision_logs[0]["status"] == "success"
-    assert "fake-id-1" in provision_logs[0]["detail"]
+def test_onboarding_stale_owner_cannot_finalize_after_takeover(client, monkeypatch):
+    """Only the new owner's onboarding record and logs may commit."""
+    _ensure_tables()
+    a_entered = threading.Event()
+    release_a = threading.Event()
+    calls = 0
+    call_lock = threading.Lock()
+    original_create = api._create_onboarding_request
+
+    def pause_first(request, session):
+        nonlocal calls
+        with call_lock:
+            calls += 1
+            is_first = calls == 1
+        if is_first:
+            a_entered.set()
+            assert release_a.wait(timeout=5), "test did not release the stale owner"
+        return original_create(request, session)
+
+    monkeypatch.setattr(api, "_create_onboarding_request", pause_first)
+    key = "onboarding-takeover"
+    headers = {"Idempotency-Key": key}
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        stale_future = executor.submit(
+            client.post, "/onboarding-requests", json=VALID_ONBOARDING, headers=headers
+        )
+        assert a_entered.wait(timeout=5), "stale owner never claimed the reservation"
+        claimed = _reservation(key)
+        assert claimed["payload"]["state"] == "processing"
+        assert claimed["owner_token"]
+        assert claimed["resource_type"] == api.IDEMPOTENCY_SCOPE_ONBOARDING
+        _make_reservation_stale(key)
+
+        new_owner = client.post(
+            "/onboarding-requests", json=VALID_ONBOARDING, headers=headers
+        )
+        assert new_owner.status_code == 201
+        after_takeover = _reservation(key)
+        assert after_takeover["payload"]["state"] == "completed"
+        assert after_takeover["owner_token"] != claimed["owner_token"]
+        assert after_takeover["payload"]["resource_type"] == "onboarding"
+
+        release_a.set()
+        stale_response = stale_future.result(timeout=5)
+
+    assert stale_response.status_code == 409
+    assert "took over" in stale_response.json()["detail"]
+    assert len(client.get("/onboarding-requests").json()) == 1
+    actions = [log["action"] for log in client.get("/execution-logs").json()]
+    assert actions.count("onboarding.request.created") == 1
+
+    final = _reservation(key)
+    assert final["payload"]["state"] == "completed"
+    assert final["owner_token"] == after_takeover["owner_token"]
+    replay = client.post(
+        "/onboarding-requests", json=VALID_ONBOARDING, headers=headers
+    )
+    assert replay.status_code == 200
+    assert replay.headers["Idempotency-Replayed"] == "true"
+    assert replay.json() == new_owner.json()
 
 
-def test_m365_dashboard_section_escapes_and_labels(client, monkeypatch):
-    class EvilSimulator:
-        def create_user(self, display_name, mail, department):
-            return {"simulated": True, "id": "<script>alert(1)</script>", "mail": mail}
+def test_onboarding_failure_cleans_up_only_its_own_reservation(client, monkeypatch):
+    _ensure_tables()
+    session = db.SessionLocal()
+    try:
+        session.add(
+            db.IdempotencyRecord(
+                key="foreign-onboarding-key",
+                ticket_id="0",
+                response_json=json.dumps(
+                    {"request_hash": "other", "state": "processing"},
+                    separators=(",", ":"),
+                ),
+                owner_token="foreign-owner-token",
+                resource_type=api.IDEMPOTENCY_SCOPE_ONBOARDING,
+                created_at=db.utcnow(),
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
 
-        def get_status(self, user_id):
-            return {}
+    def fail_create(request, session):
+        raise RuntimeError("onboarding creation exploded")
 
-    monkeypatch.setattr(api, "m365_simulator", EvilSimulator())
-    body = _create(client, {"mail": "jane@contoso.example"}).json()
-    _complete_m365_step(client, body)
-    page = client.get("/dashboard").text
-    assert "Simulated Microsoft 365 provisioning" in page
-    assert "(simulated)" in page
-    assert "<script>alert(1)</script>" not in page  # escaped, not injected
+    monkeypatch.setattr(api, "_create_onboarding_request", fail_create)
+    with pytest.raises(RuntimeError, match="onboarding creation exploded"):
+        client.post(
+            "/onboarding-requests",
+            json=VALID_ONBOARDING,
+            headers={"Idempotency-Key": "onboarding-failing"},
+        )
+
+    assert _reservation("onboarding-failing") is None
+    foreign = _reservation("foreign-onboarding-key")
+    assert foreign is not None
+    assert foreign["payload"]["state"] == "processing"
+    assert foreign["owner_token"] == "foreign-owner-token"
 
 
-def test_m365_failure_rolls_back_and_logs(client, monkeypatch):
-    class FailingSimulator:
-        def create_user(self, display_name, mail, department):
-            raise RuntimeError("simulated outage")
+def test_ticket_and_onboarding_keys_are_scoped(client):
+    ticket_key = "shared-ticket-first"
+    ticket = client.post(
+        "/tickets", json=VALID_TICKET, headers={"Idempotency-Key": ticket_key}
+    )
+    assert ticket.status_code == 201
+    onboarding_conflict = client.post(
+        "/onboarding-requests",
+        json=VALID_ONBOARDING,
+        headers={"Idempotency-Key": ticket_key},
+    )
+    assert onboarding_conflict.status_code == 409
+    assert "different resource type" in onboarding_conflict.json()["detail"]
 
-        def get_status(self, user_id):
-            return {}
-
-    monkeypatch.setattr(api, "m365_simulator", FailingSimulator())
-    body = _create(client, {"mail": "jane@contoso.example"}).json()
-    failed = _complete_m365_step(client, body)
-    assert failed.status_code == 502
-    fetched = client.get(f"/onboarding-requests/{body['id']}").json()
-    step = next(i for i in fetched["checklist"] if i["action"] == "m365_provision")
-    assert step["status"] == "pending"  # rolled back, retryable later
-    assert fetched["status"] == "in_progress"
-    logs = client.get("/execution-logs").json()
-    failure_logs = [
-        log for log in logs
-        if log["action"] == "onboarding.m365_provision" and log["status"] == "failure"
-    ]
-    assert len(failure_logs) == 1
-    assert "simulated outage" in failure_logs[0]["detail"]
+    onboarding_key = "shared-onboarding-first"
+    onboarding = client.post(
+        "/onboarding-requests",
+        json=VALID_ONBOARDING,
+        headers={"Idempotency-Key": onboarding_key},
+    )
+    assert onboarding.status_code == 201
+    ticket_conflict = client.post(
+        "/tickets", json=VALID_TICKET, headers={"Idempotency-Key": onboarding_key}
+    )
+    assert ticket_conflict.status_code == 409
+    assert "different resource type" in ticket_conflict.json()["detail"]

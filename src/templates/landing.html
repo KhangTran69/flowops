@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% block title %}FlowOps — IT workflow automation{% endblock %}
+{% block content %}
+<section class="hero">
+  <div class="hero-copy">
+    <span class="eyebrow">IT workflow automation · v1.0 preview</span>
+    <h1>Tickets, routing, and onboarding in one reliable workflow.</h1>
+    <p class="lede">
+      FlowOps validates incoming tickets, routes them to the right queue, tracks
+      onboarding checklists, and keeps every execution visible. Built as a
+      learning prototype with simulated data and credential-free actions.
+    </p>
+    <div class="hero-actions">
+      <a class="button primary" href="/dashboard">Open dashboard</a>
+      <a class="button" href="/ui/onboarding-requests">Onboarding requests</a>
+      <a class="button ghost" href="/docs">Explore the API</a>
+    </div>
+    <p class="status-line">
+      <span class="status-dot ok" aria-hidden="true"></span>
+      <span id="api-status">API healthy</span>
+      <span class="muted">· local prototype, no real support data</span>
+    </p>
+  </div>
+  <div class="hero-panel" aria-label="Live counts">
+    <div class="mini-grid">
+      <div class="mini-card"><span class="mini-value">{{ stats.tickets }}</span><span class="mini-label">Tickets</span></div>
+      <div class="mini-card"><span class="mini-value">{{ stats.open_tickets }}</span><span class="mini-label">Open</span></div>
+      <div class="mini-card"><span class="mini-value">{{ stats.auto_routed }}</span><span class="mini-label">Auto-routed</span></div>
+      <div class="mini-card"><span class="mini-value">{{ stats.onboarding_requests }}</span><span class="mini-label">Onboarding</span></div>
+      <div class="mini-card"><span class="mini-value">{{ stats.pending_notifications }}</span><span class="mini-label">Pending notifications</span></div>
+      <div class="mini-card"><span class="mini-value {% if stats.failed_notifications %}fail{% endif %}">{{ stats.failed_notifications }}</span><span class="mini-label">Failed notifications</span></div>
+    </div>
+  </div>
+</section>
+
+<section class="section" aria-labelledby="features-heading">
+  <div class="section-heading">
+    <h2 id="features-heading">What the prototype demonstrates</h2>
+    <p>Small, inspectable pieces of an automation platform.</p>
+  </div>
+  <div class="feature-grid">
+    <article class="feature-card">
+      <h3>Strict intake</h3>
+      <p>Pydantic validation rejects malformed data before anything is stored.</p>
+      <a href="/docs">POST /tickets →</a>
+    </article>
+    <article class="feature-card">
+      <h3>Rule-based routing</h3>
+      <p>Pure functions assign category, priority, and queue from the ticket title.</p>
+      <a href="/dashboard">See routing breakdown →</a>
+    </article>
+    <article class="feature-card">
+      <h3>Fenced idempotency</h3>
+      <p>Retries replay safely; stale owners cannot finalize a takeover reservation.</p>
+      <a href="/docs">Idempotency-Key →</a>
+    </article>
+    <article class="feature-card">
+      <h3>Onboarding checklists</h3>
+      <p>Approval gates, item execution, and progress tracking per employee.</p>
+      <a href="/ui/onboarding-requests">Open onboarding →</a>
+    </article>
+    <article class="feature-card">
+      <h3>Notification outbox</h3>
+      <p>Failed webhooks stay visible, dead-letter cleanly, and can be requeued.</p>
+      <a href="/ui/notifications">Inspect outbox →</a>
+    </article>
+    <article class="feature-card">
+      <h3>Execution logs</h3>
+      <p>Every workflow action is recorded for the dashboard and operators.</p>
+      <a href="/dashboard">Recent runs →</a>
+    </article>
+  </div>
+</section>
+
+<section class="section" aria-labelledby="quickstart-heading">
+  <div class="section-heading">
+    <h2 id="quickstart-heading">Quick start</h2>
+    <p>Copy a request and run it against this local API.</p>
+  </div>
+  <div class="quickstart-grid">
+    <div class="code-card">
+      <div class="code-head"><span>Create a ticket</span><button class="button small ghost" type="button" data-copy-target="curl-ticket">Copy</button></div>
+      <pre id="curl-ticket"><code>curl -X POST http://127.0.0.1:8000/tickets \
+  -H 'Content-Type: application/json' \
+  -d '{"userId":7,"id":42,"title":"Laptop will not start","completed":false}'</code></pre>
+    </div>
+    <div class="code-card">
+      <div class="code-head"><span>Replay safely</span><button class="button small ghost" type="button" data-copy-target="curl-replay">Copy</button></div>
+      <pre id="curl-replay"><code>curl -X POST http://127.0.0.1:8000/tickets \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: demo-42' \
+  -d '{"userId":7,"id":42,"title":"Laptop will not start","completed":false}'</code></pre>
+    </div>
+    <div class="code-card">
+      <div class="code-head"><span>Start onboarding</span><button class="button small ghost" type="button" data-copy-target="curl-onboarding">Copy</button></div>
+      <pre id="curl-onboarding"><code>curl -X POST http://127.0.0.1:8000/onboarding-requests \
+  -H 'Content-Type: application/json' \
+  -d '{"request_type":"onboarding","employee_name":"Jane Doe","employee_email":"jane@example.com","department":"Sales","requester_id":3}'</code></pre>
+    </div>
+  </div>
+</section>
+
+<section class="section" aria-labelledby="endpoints-heading">
+  <div class="section-heading">
+    <h2 id="endpoints-heading">Operator pages</h2>
+    <p>Read-only views plus inline actions, backed by the JSON API.</p>
+  </div>
+  <div class="link-grid">
+    <a class="link-card" href="/dashboard"><strong>Monitoring dashboard</strong><span>Runs, routing, notifications</span></a>
+    <a class="link-card" href="/ui/onboarding-requests"><strong>Onboarding</strong><span>Requests, checklists, actions</span></a>
+    <a class="link-card" href="/ui/notifications"><strong>Notification outbox</strong><span>Pending and dead-letter deliveries</span></a>
+    <a class="link-card" href="/ui/workflow-jobs"><strong>Workflow jobs</strong><span>Durable execution queue</span></a>
+  </div>
+</section>
+{% endblock %}

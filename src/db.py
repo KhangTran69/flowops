@@ -86,13 +86,7 @@ class ExecutionLogRecord(Base):
 
 
 class IdempotencyRecord(Base):
-    """Reservation and stored response for an Idempotency-Key (v0.5, fenced).
-
-    ``owner_token`` is the fencing token of the request that currently owns the
-    reservation. A stale takeover replaces it atomically, so the previous owner
-    can no longer finalize or delete the row. ``created_at`` is the start of the
-    current five-minute recovery lease and is refreshed on every takeover.
-    """
+    """Reservation and stored response for an Idempotency-Key."""
 
     __tablename__ = "idempotency_keys"
 
@@ -100,8 +94,74 @@ class IdempotencyRecord(Base):
     ticket_id: Mapped[str] = mapped_column(String(64), nullable=False)
     response_json: Mapped[str] = mapped_column(Text, nullable=False)
     owner_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    resource_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ActionExecutionRecord(Base):
+    """Durable audit record for one onboarding action attempt."""
+
+    __tablename__ = "action_executions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    request_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    checklist_item_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor_subject: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    adapter: Mapped[str] = mapped_column(String(64), nullable=False)
+    correlation_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    error_category: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    error_detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    external_reference: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+
+class WorkflowJobRecord(Base):
+    """A durable, leased unit of workflow work.
+
+    ``lease_owner_token`` and ``lease_expires_at`` fence completion: a worker
+    that lost its lease cannot mark the job succeeded or schedule a retry.
+    """
+
+    __tablename__ = "workflow_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    idempotency_key: Mapped[Optional[str]] = mapped_column(
+        String(200), nullable=True, unique=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="queued"
+    )  # queued|running|succeeded|retry_scheduled|failed|cancelled
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+    lease_owner_token: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    result_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    resource_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    resource_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    label: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
 
@@ -288,6 +348,22 @@ def _ensure_idempotency_owner_token() -> None:
         )
 
 
+def _ensure_idempotency_resource_type() -> None:
+    """Add the ticket/onboarding scope to databases created before it existed."""
+    inspector = inspect(engine)
+    if "idempotency_keys" not in inspector.get_table_names():
+        return
+    column_names = {
+        column["name"] for column in inspector.get_columns("idempotency_keys")
+    }
+    if "resource_type" in column_names:
+        return
+    with engine.begin() as connection:
+        connection.execute(
+            text("ALTER TABLE idempotency_keys ADD COLUMN resource_type VARCHAR(32)")
+        )
+
+
 def _ensure_tables() -> None:
     """Create missing tables once and apply additive compatibility migrations."""
     global _tables_ready
@@ -300,6 +376,7 @@ def _ensure_tables() -> None:
         Base.metadata.create_all(engine)
         _add_missing_columns()
         _ensure_idempotency_owner_token()
+        _ensure_idempotency_resource_type()
         _tables_ready = True
 
 
