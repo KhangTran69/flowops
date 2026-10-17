@@ -13,6 +13,29 @@
   </div>
 </section>
 
+{% if run %}
+<section class="panel">
+  <div class="panel-head">
+    <h2>Workflow run</h2>
+    <span class="badge {{ 'ok' if run.status == 'completed' else ('fail' if run.status in ('failed','cancelled') else 'info') }}">{{ run.status }}</span>
+  </div>
+  <p class="muted small">Automatic DAG scheduler · max parallel {{ run.max_parallel }} · run #{{ run.id }}</p>
+  <div class="toolbar">
+    {% if run.status == 'running' %}<button class="button small ghost" type="button" data-action-url="/workflow-runs/{{ run.id }}/pause" data-method="POST" data-reload="true">Pause</button>{% endif %}
+    {% if run.status in ('paused','failed') %}<button class="button small" type="button" data-action-url="/workflow-runs/{{ run.id }}/resume" data-method="POST" data-reload="true">Resume</button>{% endif %}
+    {% if run.status not in ('completed','cancelled') %}<button class="button small ghost" type="button" data-action-url="/workflow-runs/{{ run.id }}/cancel" data-method="POST" data-reload="true" data-confirm="Cancel this run and its queued jobs?">Cancel</button>{% endif %}
+    <a class="button small ghost" href="/ui/workflow-runs">All runs</a>
+  </div>
+  {% if run.steps %}
+  <div class="table-wrap"><table><thead><tr><th>Step item</th><th>Attempt</th><th>Status</th><th>Output / error</th></tr></thead><tbody>
+    {% for step in run.steps %}<tr><td>#{{ step.checklist_item_id }}</td><td>{{ step.attempt }}</td><td><span class="badge {{ 'ok' if step.status == 'succeeded' else ('fail' if step.status == 'failed' else 'info') }}">{{ step.status }}</span></td><td>{% if step.output %}<code>{{ step.output }}</code>{% elif step.error %}<span class="fail">{{ step.error }}</span>{% else %}—{% endif %}</td></tr>{% endfor %}
+  </tbody></table></div>
+  {% endif %}
+</section>
+{% else %}
+<section class="panel"><div class="panel-head"><h2>Workflow run</h2><button class="button small" type="button" data-action-url="/onboarding-requests/{{ request_record.id }}/run" data-method="POST" data-reload="true">Start automatic run</button></div><p class="muted small">Run the DAG automatically, respecting approval gates.</p></section>
+{% endif %}
+
 <section class="panel">
   <div class="panel-head">
     <h2>Checklist</h2>

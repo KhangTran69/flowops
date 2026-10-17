@@ -31,7 +31,7 @@ from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
-from src import ai_agent, chatops, db, jobs, ui_session, web, workflow, workflow_control
+from src import ai_agent, chatops, db, jobs, scheduler, ui_session, web, workflow, workflow_control
 from src.actions import (
     ACTION_BY_STEP,
     ActionAdapter,
@@ -795,6 +795,40 @@ class OnboardingRequestOut(BaseModel):
     checklist: list[ChecklistItemOut]
 
 
+class WorkflowStepRunOut(BaseModel):
+    id: int
+    checklist_item_id: int
+    attempt: int
+    status: str
+    job_id: Optional[int] = None
+    scheduled_at: datetime
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    output: Optional[dict] = None
+    error: Optional[str] = None
+
+
+class WorkflowEventOut(BaseModel):
+    id: int
+    event_type: str
+    step_run_id: Optional[int] = None
+    payload: Optional[dict] = None
+    created_at: datetime
+
+
+class WorkflowRunOut(BaseModel):
+    id: int
+    request_id: int
+    status: str
+    max_parallel: int
+    error: Optional[str] = None
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    steps: list[WorkflowStepRunOut] = []
+    events: list[WorkflowEventOut] = []
+
+
 class OnboardingStatusSummaryOut(BaseModel):
     id: int
     request_type: str
@@ -1104,6 +1138,34 @@ def metrics(session: Session = Depends(db.get_session)) -> Response:
         lines.append(
             f'flowops_ai_provider_errors_total{{provider="{provider}"}} {provider_errors[provider]}'
         )
+    runs = session.execute(select(db.WorkflowRunRecord)).scalars().all()
+    run_counts = Counter(run.status for run in runs)
+    lines.extend(
+        [
+            "# HELP flowops_dag_runs Workflow runs by status",
+            "# TYPE flowops_dag_runs gauge",
+        ]
+    )
+    for state in scheduler.RUN_STATUSES:
+        lines.append(f'flowops_dag_runs{{status="{state}"}} {run_counts.get(state, 0)}')
+    steps = session.execute(select(db.WorkflowStepRunRecord)).scalars().all()
+    step_counts = Counter(step.status for step in steps)
+    lines.extend(
+        [
+            "# HELP flowops_dag_steps Workflow step attempts by status",
+            "# TYPE flowops_dag_steps gauge",
+        ]
+    )
+    for state in ("scheduled", "running", "succeeded", "failed", "skipped", "cancelled"):
+        lines.append(f'flowops_dag_steps{{status="{state}"}} {step_counts.get(state, 0)}')
+    lines.extend(
+        [
+            "# HELP flowops_dag_scheduler_ticks_total Scheduler ticks by outcome",
+            "# TYPE flowops_dag_scheduler_ticks_total counter",
+        ]
+    )
+    for outcome, count in sorted(scheduler.TICK_COUNTS.items()):
+        lines.append(f'flowops_dag_scheduler_ticks_total{{outcome="{outcome}"}} {count}')
     lines.append(f"flowops_uptime_seconds {time.time() - _METRICS_STARTED:.1f}")
     return Response("\n".join(lines) + "\n", media_type="text/plain")
 
@@ -1550,6 +1612,9 @@ def _chatops_action(
         actor_subject=actor,
         correlation_id=getattr(request.state, "correlation_id", None),
     )
+    run = scheduler.get_run_for_request(session, record.id)
+    if run is not None:
+        scheduler.tick(session, run.id, worker_id="chatops", commit=False)
     session.commit()
     return {
         "request_id": record.id,
@@ -1778,6 +1843,142 @@ def get_onboarding_request_status(
 
 
 
+def _workflow_run_out(
+    session: Session, run: db.WorkflowRunRecord
+) -> WorkflowRunOut:
+    steps = session.execute(
+        select(db.WorkflowStepRunRecord)
+        .where(db.WorkflowStepRunRecord.run_id == run.id)
+        .order_by(db.WorkflowStepRunRecord.id)
+    ).scalars().all()
+    events = session.execute(
+        select(db.WorkflowEventRecord)
+        .where(db.WorkflowEventRecord.run_id == run.id)
+        .order_by(db.WorkflowEventRecord.id)
+    ).scalars().all()
+    return WorkflowRunOut(
+        id=run.id,
+        request_id=run.request_id,
+        status=run.status,
+        max_parallel=run.max_parallel,
+        error=run.error,
+        created_at=run.created_at,
+        started_at=run.started_at,
+        completed_at=run.completed_at,
+        steps=[
+            WorkflowStepRunOut(
+                id=row.id,
+                checklist_item_id=row.checklist_item_id,
+                attempt=row.attempt,
+                status=row.status,
+                job_id=row.job_id,
+                scheduled_at=row.scheduled_at,
+                started_at=row.started_at,
+                completed_at=row.completed_at,
+                output=json.loads(row.output_json) if row.output_json else None,
+                error=row.error,
+            )
+            for row in steps
+        ],
+        events=[
+            WorkflowEventOut(
+                id=event.id,
+                event_type=event.event_type,
+                step_run_id=event.step_run_id,
+                payload=json.loads(event.payload_json) if event.payload_json else None,
+                created_at=event.created_at,
+            )
+            for event in events
+        ],
+    )
+
+
+@app.post("/onboarding-requests/{request_id}/run", response_model=WorkflowRunOut)
+def start_workflow_run(
+    request_id: int,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowRunOut:
+    """Start the DAG orchestrator for a request (idempotent per request)."""
+    _load_request(session, request_id)
+    try:
+        run = scheduler.start_run(session, request_id, actor_subject=actor.subject)
+    except LookupError as error:
+        raise HTTPException(404, str(error)) from error
+    session.commit()
+    session.refresh(run)
+    return _workflow_run_out(session, run)
+
+
+@app.get("/onboarding-requests/{request_id}/run", response_model=WorkflowRunOut)
+def get_workflow_run(
+    request_id: int,
+    session: Session = Depends(db.get_session),
+) -> WorkflowRunOut:
+    run = scheduler.get_run_for_request(session, request_id)
+    if run is None:
+        raise HTTPException(404, "Workflow run not found.")
+    return _workflow_run_out(session, run)
+
+
+@app.get("/workflow-runs", response_model=list[WorkflowRunOut])
+def list_workflow_runs(
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    session: Session = Depends(db.get_session),
+) -> list[WorkflowRunOut]:
+    query = select(db.WorkflowRunRecord).order_by(db.WorkflowRunRecord.id.desc())
+    if status_filter:
+        query = query.where(db.WorkflowRunRecord.status == status_filter)
+    runs = session.execute(query.offset(offset).limit(limit)).scalars().all()
+    return [_workflow_run_out(session, run) for run in runs]
+
+
+def _run_action(
+    session: Session, run_id: int, actor: Actor, action: str
+) -> WorkflowRunOut:
+    try:
+        if action == "pause":
+            run = scheduler.pause_run(session, run_id, actor.subject)
+        elif action == "resume":
+            run = scheduler.resume_run(session, run_id, actor.subject)
+        else:
+            run = scheduler.cancel_run(session, run_id, actor.subject)
+    except LookupError as error:
+        raise HTTPException(404, str(error)) from error
+    session.commit()
+    session.refresh(run)
+    return _workflow_run_out(session, run)
+
+
+@app.post("/workflow-runs/{run_id}/pause", response_model=WorkflowRunOut)
+def pause_workflow_run(
+    run_id: int,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowRunOut:
+    return _run_action(session, run_id, actor, "pause")
+
+
+@app.post("/workflow-runs/{run_id}/resume", response_model=WorkflowRunOut)
+def resume_workflow_run(
+    run_id: int,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowRunOut:
+    return _run_action(session, run_id, actor, "resume")
+
+
+@app.post("/workflow-runs/{run_id}/cancel", response_model=WorkflowRunOut)
+def cancel_workflow_run(
+    run_id: int,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowRunOut:
+    return _run_action(session, run_id, actor, "cancel")
+
+
 @app.get("/ui/tickets", response_class=HTMLResponse, include_in_schema=False)
 def ui_tickets(
     request: Request, session: Session = Depends(db.get_session)
@@ -1902,6 +2103,8 @@ def ui_onboarding_request(
             )
         raise
     completed = sum(1 for item in items if item.status == "completed")
+    run = scheduler.get_run_for_request(session, record.id)
+    run_view = _workflow_run_out(session, run) if run is not None else None
     by_key = {workflow.state_key(item): item for item in items}
     item_views = []
     for item in sorted(items, key=lambda entry: entry.id):
@@ -1932,7 +2135,35 @@ def ui_onboarding_request(
             "items": sorted(items, key=lambda item: item.id),
             "completed": completed,
             "total": len(items),
+            "run": run_view,
         },
+    )
+
+
+@app.get("/ui/workflow-runs", response_class=HTMLResponse, include_in_schema=False)
+def ui_workflow_runs(
+    request: Request,
+    status: Optional[str] = Query(default=None),
+    session: Session = Depends(db.get_session),
+) -> HTMLResponse:
+    """Operator view of DAG runs and their step attempts."""
+    query = select(db.WorkflowRunRecord).order_by(db.WorkflowRunRecord.id.desc())
+    if status:
+        query = query.where(db.WorkflowRunRecord.status == status)
+    runs = session.execute(query.limit(100)).scalars().all()
+    rows = []
+    for run in runs:
+        record = session.get(db.OnboardingRequestRecord, run.request_id)
+        rows.append(
+            {
+                "run": _workflow_run_out(session, run),
+                "employee_name": record.employee_name if record else "—",
+            }
+        )
+    return web.render(
+        request,
+        "workflow_runs.html",
+        {"active": "workflow_runs", "runs": rows, "status_filter": status or ""},
     )
 
 
@@ -2133,6 +2364,9 @@ def _transition_item(
             actor_subject=actor_subject,
         )
     _, items = _load_request(session, record.id)
+    run = scheduler.get_run_for_request(session, record.id)
+    if run is not None:
+        scheduler.tick(session, run.id, worker_id="manual-transition", commit=False)
     return _request_out(record, items)
 
 

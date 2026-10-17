@@ -21,7 +21,7 @@ from typing import Any, Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from src import db, jobs, workflow
+from src import db, jobs, scheduler, workflow
 from src.actions import (
     ActionAdapter,
     ActionResult,
@@ -216,6 +216,9 @@ def _complete_onboarding_job(
     if not finished:
         session.rollback()
         return {"fenced": True, "item_id": item.id}
+    scheduler.advance_from_job(
+        session, job, success=True, output=adapter_result.output
+    )
     session.commit()
     return {"action": action, "item_id": item.id}
 
@@ -337,6 +340,9 @@ def _execute_job(
         )
         if status == "failed":
             _cascade_terminal_failure(session, payload)
+            scheduler.advance_from_job(
+                session, reloaded, success=False, error=str(error)
+            )
             _notify_worker_failure(session, reloaded, payload, str(error))
         session.commit()
         return status or "fenced"

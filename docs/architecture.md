@@ -112,6 +112,15 @@ run stores `{}` outputs. The piping contract is exercised with adapter doubles
 in `tests/test_workflow_dag.py` and by the Graph / Power Automate adapters,
 which can return real payloads once credentials are configured.
 
+## Workflow orchestrator (v1.2)
+
+`src/scheduler.py` leases a `workflow_runs` row, resolves readiness from the
+DAG, and enqueues steps via the existing `workflow_jobs` table. Every attempt
+is recorded in `workflow_step_runs`; `workflow_events` is append-only. Run
+leases fence concurrent schedulers and can be taken over after expiry. The
+scheduler never auto-approves gated steps. Worker completion/failure triggers
+immediate advancement, with polling as recovery.
+
 ## Secure operator console
 
 The JSON API keeps bearer auth. When `FLOWOPS_UI_AUTH_REQUIRED=true`, the HTML

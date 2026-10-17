@@ -30,6 +30,7 @@ FlowOps is an IT workflow automation platform. It receives support tickets and o
 | v1.0 Security: auth, roles, audit | ✅ | Optional bearer/Entra auth, role checks, webhook API key, actor attribution |
 | v1.1 Secure operator console | ✅ | Signed session login, CSRF-protected UI actions, role-aware controls, login/logout audit |
 | v1.1 Workflow DAG engine | ✅ | Step dependencies, blocked/cascade states, output piping, signed single-use ChatOps approvals |
+| v1.2 Workflow orchestrator | ✅ | DB-backed run/step/event ledger, leased scheduler, parallel ready steps, pause/resume/cancel, DAG metrics |
 | v0.6.1 Offboarding completion ledger | ✅ | Admin-only, claim-before-execute, idempotent replay, stale-claim takeover, ledger-backed offboarding |
 | v1.0 Operations: readiness, metrics, migrations | ✅ | `/ready`, `/metrics`, correlation IDs, Alembic baseline, container migration entrypoint |
 | v1.0 CI + Docker | ✅ | GitHub Actions runs pytest, a Docker Compose API + PostgreSQL smoke test, and PostgreSQL reliability tests |
@@ -337,6 +338,28 @@ compatibility; opt into `onboarding-dag` or `offboarding-dag` with
   dependency badges, blocker state, step outputs, and ChatOps buttons.
 - Tests: `tests/test_workflow_dag.py` (offline).
 
+## Workflow orchestrator (v1.2)
+
+`src/scheduler.py` adds a DB-backed orchestrator on top of the v1.1 DAG:
+
+- `workflow_runs`, `workflow_step_runs`, and `workflow_events` are migration
+  `0007_workflow_orchestrator`.
+- Starting a run enqueues every ready non-gated step in parallel, bounded by
+  `FLOWOPS_DAG_MAX_PARALLEL`.
+- Gated steps are never auto-approved; operator/ChatOps approval makes them
+  schedulable.
+- Worker completion/failure advances the run immediately; polling is only a
+  recovery path.
+- Run leases (`FLOWOPS_DAG_LEASE_SECONDS`) fence scheduler ticks; stale leases
+  can be taken over.
+- `POST /onboarding-requests/{id}/run`, `GET .../run`,
+  `POST /workflow-runs/{id}/pause|resume|cancel`, `GET /workflow-runs`.
+- `python -m src.scheduler --once` or `--poll --interval 2`.
+- `/ui/workflow-runs` and the onboarding detail page show run/step state,
+  attempts, outputs, and pause/resume/cancel controls.
+- `/metrics` exposes `flowops_dag_runs`, `flowops_dag_steps`, and
+  `flowops_dag_scheduler_ticks_total`.
+
 ## Operator UI
 
 The HTML UI is server-rendered with Jinja2 templates and local CSS/vanilla JS
@@ -415,7 +438,7 @@ No real secrets or Microsoft tenant are included.
 ## Running the tests
 
 ```bash
-pytest    # 250 passed, 13 skipped locally; the skips are PostgreSQL-only tests
+pytest    # 259 passed, 14 skipped locally; the skips are PostgreSQL-only tests
 python -m compileall -q src tests
 ```
 

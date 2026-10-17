@@ -504,3 +504,75 @@ class ChatOpsTokenUseRecord(Base):
     action: Mapped[str] = mapped_column(String(16), nullable=False)
     actor_subject: Mapped[str] = mapped_column(String(120), nullable=False)
     used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class WorkflowRunRecord(Base):
+    """One DAG execution for an onboarding/offboarding request (v1.2)."""
+
+    __tablename__ = "workflow_runs"
+    __table_args__ = (
+        UniqueConstraint("request_id", name="uq_workflow_run_request"),
+        Index("ix_workflow_runs_status_lease", "status", "lease_expires_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    request_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    max_parallel: Mapped[int] = mapped_column(Integer, nullable=False, default=4)
+    lease_owner_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_tick_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class WorkflowStepRunRecord(Base):
+    """Execution attempt for one DAG step inside a run (v1.2)."""
+
+    __tablename__ = "workflow_step_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id", "checklist_item_id", "attempt", name="uq_workflow_step_attempt"
+        ),
+        Index("ix_workflow_step_runs_run_status", "run_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    checklist_item_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="scheduled")
+    job_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    output_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+class WorkflowEventRecord(Base):
+    """Append-only orchestration event stream for a run (v1.2)."""
+
+    __tablename__ = "workflow_events"
+    __table_args__ = (Index("ix_workflow_events_run_created", "run_id", "created_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    step_run_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
