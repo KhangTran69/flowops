@@ -1,0 +1,51 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 210 25% 98%;
+  --foreground: 215 28% 17%;
+  --surface: 0 0% 100%;
+  --border: 214 20% 88%;
+  --muted: 215 14% 46%;
+  --ok: #15803d;
+  --warn: #b45309;
+  --danger: #b91c1c;
+  --primary: hsl(192 82% 34%);
+}
+.dark {
+  --background: 215 28% 10%;
+  --foreground: 210 20% 92%;
+  --surface: 215 25% 14%;
+  --border: 215 18% 24%;
+  --muted: 215 12% 65%;
+  --ok: #4ade80;
+  --warn: #fbbf24;
+  --danger: #f87171;
+  --primary: hsl(192 72% 46%);
+}
+html, body, #root { height: 100%; }
+body {
+  margin: 0;
+  font-family: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
+  font-size: 14px;
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+}
+code, pre, .mono { font-family: 'IBM Plex Mono', ui-monospace, monospace; }
+* { box-sizing: border-box; }
+a { color: inherit; text-decoration: none; }
+button, input, select, textarea { font: inherit; }
+@layer components {
+  .card { @apply rounded border border-[hsl(var(--border))] bg-[hsl(var(--surface))] shadow-sm; }
+  .btn { @apply inline-flex items-center justify-center gap-2 rounded border border-[hsl(var(--border))] px-3 py-1.5 font-medium transition hover:bg-black/5 disabled:cursor-not-allowed disabled:opacity-50 dark:hover:bg-white/10; }
+  .btn-primary { @apply border-transparent bg-[var(--primary)] text-white hover:brightness-110; }
+  .btn-danger { @apply border-transparent bg-[var(--danger)] text-white hover:brightness-110; }
+  .input { @apply w-full rounded border border-[hsl(var(--border))] bg-transparent px-3 py-1.5 outline-none focus:ring-2 focus:ring-[color:var(--primary)]; }
+  .label { @apply mb-1 block text-xs font-medium uppercase tracking-wide text-[hsl(var(--muted))]; }
+  .muted { @apply text-[hsl(var(--muted))]; }
+  .table-wrap { @apply overflow-x-auto; }
+  table { @apply w-full border-collapse text-left; }
+  th { @apply border-b border-[hsl(var(--border))] px-3 py-2 text-xs uppercase tracking-wide text-[hsl(var(--muted))]; }
+  td { @apply border-b border-[hsl(var(--border))] px-3 py-2 align-top; }
+}
