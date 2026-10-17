@@ -10,7 +10,7 @@ Act as a senior Python backend engineer and automation engineer. Continue develo
 
 ## Current state (verified complete as of 2026-10-17 — do not rebuild, extend it)
 
-Milestones v0.1–v0.5 plus the monitoring dashboard, fenced idempotency, and the notification dead-letter workflow are implemented and tested (130 offline pytest tests passing, plus 8 PostgreSQL-only tests that skip unless `FLOWOPS_TEST_POSTGRES_URL` is set):
+Milestones v0.1–v0.5 plus the monitoring dashboard, fenced idempotency, and the notification dead-letter workflow are implemented and tested (145 offline pytest tests passing, plus 8 PostgreSQL-only tests that skip unless `FLOWOPS_TEST_POSTGRES_URL` is set):
 
 - **v0.1 CLI** — `src/ticket_processor.py`: fetches a JSONPlaceholder todo (`https://jsonplaceholder.typicode.com/todos/1`), strict validation (`TicketValidationError`, rejects bool-as-int, empty titles, non-object payloads), normalizes to the internal format (`ticket_id`, `requester_id`, `title`, `status` open/closed, `priority`), saves `data/ticket.json`. Run: `python -m src.ticket_processor`.
 - **v0.2+ API** — `src/api.py` (FastAPI): `POST /tickets` (strict Pydantic: `StrictInt`/`StrictStr`/`StrictBool`, ge=1, non-blank title), `GET /tickets`, `GET /tickets/{id}` (404 for non-numeric IDs — path-traversal safe), `GET /health`, HTML landing page at `/`, Swagger at `/docs`.

@@ -21,14 +21,21 @@ from fastapi import status as http_status
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, StrictBool, StrictInt, StrictStr, field_validator
-from sqlalchemy import and_, delete, select, update
+from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
-from src import db
-from src.actions import ACTION_BY_STEP, ActionResult, action_for_step, adapter_from_environment
+from src import db, web
+from src.actions import (
+    ACTION_BY_STEP,
+    ActionAdapter,
+    ActionResult,
+    action_for_step,
+    adapter_from_environment,
+)
+from src.auth import Actor, AuthenticationError, authenticate_bearer
 from src.m365_simulator import M365Simulator
 from src.notify import deliver_webhook
 from src.onboarding import checklist_for
@@ -119,6 +126,26 @@ def _new_run_id() -> str:
 # requests can be reclaimed after five minutes). Used by the claim/takeover
 # logic below and by _reservation_is_stale().
 IDEMPOTENCY_PROCESSING_TIMEOUT = timedelta(minutes=5)
+
+
+def _request_fingerprint(request: BaseModel) -> str:
+    """Return a stable SHA-256 of a validated request body."""
+    return hashlib.sha256(
+        json.dumps(request.model_dump(), sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _validate_idempotency_key(key: Optional[str]) -> None:
+    """Reject over-long Idempotency-Key headers before any DB work happens."""
+    if key is not None and len(key) > 128:
+        raise HTTPException(
+            status_code=422, detail="Idempotency-Key must be at most 128 characters."
+        )
+
+
+def _stored_resource_type(payload: dict[str, Any]) -> str:
+    """Legacy records predate resource scoping and are ticket reservations."""
+    return payload.get("resource_type", IDEMPOTENCY_SCOPE_TICKET)
 
 
 def _claim_idempotency_key(

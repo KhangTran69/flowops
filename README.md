@@ -212,7 +212,7 @@ curl -X POST http://127.0.0.1:8000/onboarding-requests -H 'Content-Type: applica
 ## Running the tests
 
 ```bash
-pytest    # 130 passed, 8 skipped locally; the skips are PostgreSQL-only tests
+pytest    # 145 passed, 8 skipped locally; the skips are PostgreSQL-only tests
 python -m compileall -q src tests
 ```
 
