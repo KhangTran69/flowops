@@ -68,6 +68,29 @@ def _authenticate_jwt(token: str, values: dict[str, str]) -> Actor:
     return Actor(subject=claims["sub"], roles=roles)
 
 
+def validate_auth_configuration(
+    environ: Optional[dict[str, str]] = None,
+) -> None:
+    """Fail fast when protected mode lacks a usable credential source."""
+    values = environ if environ is not None else os.environ
+    if values.get("FLOWOPS_AUTH_REQUIRED", "false").lower() != "true":
+        return
+    if values.get("FLOWOPS_ENTRA_ISSUER"):
+        if not values.get("FLOWOPS_ENTRA_AUDIENCE") or not values.get(
+            "FLOWOPS_ENTRA_JWKS_URL"
+        ):
+            raise AuthenticationError(
+                "Entra issuer, audience, and JWKS URL must all be configured."
+            )
+        return
+    environment = values.get("FLOWOPS_ENVIRONMENT", "development").lower()
+    if environment == "development" and values.get("FLOWOPS_DEV_BEARER_TOKEN"):
+        return
+    raise AuthenticationError(
+        "Protected mode requires Entra configuration or a development bearer token."
+    )
+
+
 def authenticate_bearer(
     authorization: Optional[str], *, environ: Optional[dict[str, str]] = None
 ) -> Actor:
@@ -75,7 +98,10 @@ def authenticate_bearer(
     values = environ if environ is not None else os.environ
     environment = values.get("FLOWOPS_ENVIRONMENT", "development").lower()
     if values.get("FLOWOPS_AUTH_REQUIRED", "false").lower() != "true":
-        return Actor(subject="local-development", roles=("automation.operator",))
+        return Actor(
+            subject="local-development",
+            roles=("automation.operator", "automation.admin"),
+        )
     if not authorization or not authorization.startswith("Bearer "):
         raise AuthenticationError("Bearer authentication is required.")
     token = authorization.removeprefix("Bearer ")

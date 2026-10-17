@@ -56,4 +56,11 @@
   <p class="empty">No dead letters.</p>
   {% endif %}
 </section>
+{% if has_previous or has_next %}
+<div class="toolbar" style="margin-top: 0.8rem;">
+  {% if has_previous %}<a class="button small" href="/ui/notifications?page={{ page - 1 }}">Previous</a>{% endif %}
+  <span class="muted small">Page {{ page }}</span>
+  {% if has_next %}<a class="button small" href="/ui/notifications?page={{ page + 1 }}">Next</a>{% endif %}
+</div>
+{% endif %}
 {% endblock %}

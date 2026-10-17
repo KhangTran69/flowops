@@ -10,6 +10,7 @@ import hashlib
 import html
 import json
 import os
+import threading
 import time
 import uuid
 from collections import Counter
@@ -116,6 +117,103 @@ app.mount(
     StaticFiles(directory=str(web.BASE_DIR / "static")),
     name="static",
 )
+
+
+def _actor_from_header(
+    authorization: Optional[str] = Header(default=None),
+) -> Actor:
+    """Resolve the authenticated actor, or raise a clean 401."""
+    try:
+        return authenticate_bearer(authorization)
+    except AuthenticationError as error:
+        raise HTTPException(status_code=401, detail=str(error)) from error
+
+
+def _operator_actor(actor: Actor = Depends(_actor_from_header)) -> Actor:
+    if not {"automation.operator", "automation.admin"} & set(actor.roles):
+        raise HTTPException(status_code=403, detail="Operator role is required.")
+    _enforce_rate_limit(f"actor:{actor.subject}")
+    return actor
+
+
+def _admin_actor(actor: Actor = Depends(_actor_from_header)) -> Actor:
+    if "automation.admin" not in actor.roles:
+        raise HTTPException(status_code=403, detail="Admin role is required.")
+    _enforce_rate_limit(f"actor:{actor.subject}")
+    return actor
+
+
+def _webhook_actor(
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+) -> str:
+    expected = os.environ.get("FLOWOPS_WEBHOOK_API_KEY")
+    if expected and x_api_key != expected:
+        raise HTTPException(status_code=401, detail="Invalid webhook API key.")
+    _enforce_rate_limit("webhook:intake")
+    return "webhook-api-key" if expected else "local-development"
+
+
+_METRICS_LOCK = threading.Lock()
+_METRICS: dict[tuple[str, str, int], int] = {}
+_METRICS_STARTED = time.time()
+
+
+def _record_request(method: str, route: str, status_code: int, duration: float) -> None:
+    key = (method, route, status_code)
+    with _METRICS_LOCK:
+        _METRICS[key] = _METRICS.get(key, 0) + 1
+
+
+@app.middleware("http")
+async def correlation_and_metrics(request: Request, call_next):
+    """Attach a correlation id and count every HTTP request."""
+    correlation_id = request.headers.get("X-Correlation-ID") or uuid.uuid4().hex
+    request.state.correlation_id = correlation_id
+    started = time.perf_counter()
+    response = await call_next(request)
+    duration = time.perf_counter() - started
+    route = request.scope.get("route")
+    route_path = getattr(route, "path", request.url.path)
+    _record_request(request.method, route_path, response.status_code, duration)
+    response.headers["X-Correlation-ID"] = correlation_id
+    return response
+
+
+_RATE_LIMIT_LOCK = threading.Lock()
+_RATE_LIMIT_BUCKETS: dict[str, tuple[float, int]] = {}
+
+
+def _enforce_rate_limit(actor_key: str) -> None:
+    """Simple in-process token bucket for the prototype (disabled by default)."""
+    try:
+        limit = int(os.environ.get("FLOWOPS_RATE_LIMIT_PER_MINUTE", "0") or 0)
+    except ValueError:
+        limit = 0
+    if limit <= 0:
+        return
+    now = time.monotonic()
+    with _RATE_LIMIT_LOCK:
+        window_start, count = _RATE_LIMIT_BUCKETS.get(actor_key, (now, 0))
+        if now - window_start >= 60:
+            window_start, count = now, 0
+        if count >= limit:
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limit exceeded; retry later.",
+                headers={"Retry-After": "60"},
+            )
+        _RATE_LIMIT_BUCKETS[actor_key] = (window_start, count + 1)
+
+
+@app.on_event("startup")
+def _validate_auth_on_startup() -> None:
+    validate_auth_configuration()
+
+
+@app.get("/auth/me")
+def auth_me(actor: Actor = Depends(_actor_from_header)) -> dict:
+    """Return the resolved local or token actor."""
+    return {"subject": actor.subject, "roles": list(actor.roles)}
 
 
 def _new_run_id() -> str:
@@ -423,6 +521,26 @@ class Ticket(BaseModel):
     queue: Optional[str] = None
 
 
+class WorkflowJobOut(BaseModel):
+    """Durable workflow queue entry exposed to operators."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    job_type: str
+    status: str
+    attempts: int
+    max_attempts: int
+    available_at: datetime
+    last_error: Optional[str] = None
+    resource_type: Optional[str] = None
+    resource_id: Optional[str] = None
+    label: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    completed_at: Optional[datetime] = None
+
+
 class ExecutionLogOut(BaseModel):
     id: int
     run_id: str
@@ -431,6 +549,7 @@ class ExecutionLogOut(BaseModel):
     ticket_id: Optional[str] = None
     duration_ms: int
     detail: Optional[str] = None
+    actor_subject: Optional[str] = None
     created_at: datetime
 
 
@@ -570,49 +689,11 @@ def _notify(event: str, ticket: Ticket, run_id: str, session: Session) -> None:
         )
 
 
-def _action_attempts(action: str) -> int:
-    """Retry budget for one action: env override JSON, else 3 attempts."""
-    overrides = os.environ.get("FLOWOPS_ACTION_RETRIES")
-    if overrides:
-        try:
-            limit = int(json.loads(overrides).get(action, 3))
-        except (ValueError, TypeError):
-            limit = 3
-        return max(1, limit)
-    return 3
-
-
-def _notify_action_failure(
-    action: str,
-    context: dict,
-    attempts: int,
-    last_error: str,
+def _process_intake(
+    request: TicketIntakeRequest,
     session: Session,
-) -> None:
-    """Alert operators (never raising) when an action exhausts its retries."""
-    webhook_url = os.environ.get("FLOWOPS_ACTION_FAILURE_WEBHOOK_URL")
-    if not webhook_url:
-        return
-    payload = {
-        "event": "action.failure",
-        "action": action,
-        "attempts": attempts,
-        "error": last_error,
-        "request_id": context.get("request_id"),
-        "employee_email": context.get("employee_email"),
-    }
-    delivery = deliver_webhook(webhook_url, payload)
-    db.log_execution(
-        session,
-        run_id=_new_run_id(),
-        action="notification.action_failure",
-        status="success" if delivery.success else "failure",
-        duration_ms=0,
-        detail=f"action '{action}' alert delivered={delivery.success}",
-    )
-
-
-def _process_intake(request: TicketIntakeRequest, session: Session) -> Ticket:
+    actor_subject: Optional[str] = None,
+) -> Ticket:
     """Normalize, route, persist, and log one incoming ticket."""
     run_id = _new_run_id()
     started = time.perf_counter()
@@ -641,6 +722,7 @@ def _process_intake(request: TicketIntakeRequest, session: Session) -> Ticket:
         ticket_id=ticket["ticket_id"],
         duration_ms=int((time.perf_counter() - started) * 1000),
         detail=f"routed to {decision.queue} ({decision.category}/{decision.priority})",
+        actor_subject=actor_subject,
     )
     result = Ticket(**ticket)
     _notify(action, result, run_id, session)
@@ -686,6 +768,59 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+@app.get("/ready")
+def ready() -> dict:
+    """Readiness probe: verifies the configured database is reachable."""
+    try:
+        with db.engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except Exception as error:  # pragma: no cover - exercised by deployment
+        raise HTTPException(status_code=503, detail="Database is not ready.") from error
+    return {"status": "ready", "database": "ok"}
+
+
+@app.get("/metrics", include_in_schema=False)
+def metrics(session: Session = Depends(db.get_session)) -> Response:
+    """Minimal Prometheus-style metrics for jobs, outbox, and HTTP requests."""
+    lines = [
+        "# HELP flowops_http_requests_total HTTP requests by method, route, and status",
+        "# TYPE flowops_http_requests_total counter",
+    ]
+    with _METRICS_LOCK:
+        counters = dict(_METRICS)
+    for (method, route, status_code), count in sorted(counters.items()):
+        lines.append(
+            "flowops_http_requests_total"
+            f'{{method="{method}",route="{route}",status="{status_code}"}} {count}'
+        )
+
+    job_records = session.execute(select(db.WorkflowJobRecord)).scalars().all()
+    job_counts = Counter(job.status for job in job_records)
+    lines.extend(
+        [
+            "# HELP flowops_workflow_jobs Workflow jobs by state",
+            "# TYPE flowops_workflow_jobs gauge",
+        ]
+    )
+    for state in jobs.JOB_STATUSES:
+        lines.append(f'flowops_workflow_jobs{{status="{state}"}} {job_counts.get(state, 0)}')
+
+    outbox = session.execute(select(db.NotificationOutboxRecord)).scalars().all()
+    outbox_counts = Counter(item.status for item in outbox)
+    lines.extend(
+        [
+            "# HELP flowops_notification_outbox Notification deliveries by state",
+            "# TYPE flowops_notification_outbox gauge",
+        ]
+    )
+    for state in ("pending", "delivered", "failed"):
+        lines.append(
+            f'flowops_notification_outbox{{status="{state}"}} {outbox_counts.get(state, 0)}'
+        )
+    lines.append(f"flowops_uptime_seconds {time.time() - _METRICS_STARTED:.1f}")
+    return Response("\n".join(lines) + "\n", media_type="text/plain")
+
+
 # ---------------------------------------------------------------------------
 # Routes: tickets
 
@@ -694,6 +829,7 @@ def health() -> dict:
 def create_ticket(
     request: TicketIntakeRequest,
     response: Response,
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> Ticket:
@@ -720,7 +856,7 @@ def create_ticket(
     try:
         if session.get(db.TicketRecord, str(request.id)) is not None:
             response.status_code = http_status.HTTP_200_OK
-        result = _process_intake(request, session)
+        result = _process_intake(request, session, actor.subject)
         if idempotency_key and owner_token is not None:
             if not _complete_idempotency_key(
                 session,
@@ -751,11 +887,16 @@ def create_ticket(
 
 
 @app.get("/tickets", response_model=list[Ticket])
-def list_tickets(session: Session = Depends(db.get_session)) -> list[Ticket]:
-    """List all stored tickets, ordered by numeric ticket ID."""
+def list_tickets(
+    session: Session = Depends(db.get_session),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> list[Ticket]:
+    """List stored tickets, ordered by numeric ticket ID."""
     records = session.execute(select(db.TicketRecord)).scalars().all()
     tickets = [Ticket.model_validate(record, from_attributes=True) for record in records]
-    return sorted(tickets, key=lambda ticket: int(ticket.ticket_id))
+    ordered = sorted(tickets, key=lambda ticket: int(ticket.ticket_id))
+    return ordered[offset:offset + limit]
 
 
 @app.get("/tickets/{ticket_id}", response_model=Ticket)
@@ -774,6 +915,7 @@ def get_ticket(
 @app.post("/webhooks/intake")
 def webhook_intake(
     payload: TicketIntakeRequest | list[TicketIntakeRequest],
+    actor_subject: str = Depends(_webhook_actor),
     session: Session = Depends(db.get_session),
 ) -> Any:
     """n8n-friendly intake: accepts one ticket or a list, always 200.
@@ -783,8 +925,8 @@ def webhook_intake(
     item is processed.
     """
     if isinstance(payload, list):
-        return [_process_intake(item, session) for item in payload]
-    return _process_intake(payload, session)
+        return [_process_intake(item, session, actor_subject) for item in payload]
+    return _process_intake(payload, session, actor_subject)
 
 
 # ---------------------------------------------------------------------------
@@ -825,7 +967,9 @@ def _load_request(
 
 
 def _create_onboarding_request(
-    request: OnboardingRequestIn, session: Session
+    request: OnboardingRequestIn,
+    session: Session,
+    actor_subject: Optional[str] = None,
 ) -> OnboardingRequestOut:
     """Create the record and checklist, returning the API response shape."""
     started = time.perf_counter()
@@ -857,6 +1001,7 @@ def _create_onboarding_request(
         duration_ms=int((time.perf_counter() - started) * 1000),
         detail=f"{request.request_type} for {request.employee_name}: "
                f"{len(steps)} checklist steps generated",
+        actor_subject=actor_subject,
     )
     _, items = _load_request(session, record.id)
     return _request_out(record, items)
@@ -870,6 +1015,7 @@ def _create_onboarding_request(
 def create_onboarding_request(
     request: OnboardingRequestIn,
     response: Response,
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> OnboardingRequestOut:
@@ -894,7 +1040,7 @@ def create_onboarding_request(
 
     ownership_lost = False
     try:
-        result = _create_onboarding_request(request, session)
+        result = _create_onboarding_request(request, session, actor.subject)
         if idempotency_key and owner_token is not None:
             if not _complete_idempotency_key(
                 session,
@@ -1043,11 +1189,17 @@ def ui_onboarding_request(
 
 @app.get("/ui/notifications", response_class=HTMLResponse, include_in_schema=False)
 def ui_notifications(
-    request: Request, session: Session = Depends(db.get_session)
+    request: Request,
+    session: Session = Depends(db.get_session),
+    page: int = Query(default=1, ge=1),
 ) -> HTMLResponse:
     """Operator page for pending and dead-letter webhook deliveries."""
+    page_size = 25
     records = session.execute(
-        select(db.NotificationOutboxRecord).order_by(db.NotificationOutboxRecord.id)
+        select(db.NotificationOutboxRecord)
+        .order_by(db.NotificationOutboxRecord.id)
+        .offset((page - 1) * page_size)
+        .limit(page_size)
     ).scalars().all()
     return web.render(
         request,
@@ -1056,19 +1208,103 @@ def ui_notifications(
             "active": "notifications",
             "pending": [item for item in records if item.status == "pending"],
             "failed": [item for item in records if item.status == "failed"],
+            "page": page,
+            "has_previous": page > 1,
+            "has_next": len(records) == page_size,
         },
     )
 
 
 @app.get("/ui/workflow-jobs", response_class=HTMLResponse, include_in_schema=False)
 def ui_workflow_jobs(
-    request: Request, session: Session = Depends(db.get_session)
+    request: Request,
+    session: Session = Depends(db.get_session),
+    page: int = Query(default=1, ge=1),
 ) -> HTMLResponse:
     """Operator page for the durable workflow queue."""
+    page_size = 25
+    records = jobs.list_jobs(
+        session, limit=page_size, offset=(page - 1) * page_size
+    )
     return web.render(
         request,
         "jobs.html",
-        {"active": "jobs", "jobs": []},
+        {
+            "active": "jobs",
+            "jobs": records,
+            "page": page,
+            "has_previous": page > 1,
+            "has_next": len(records) == page_size,
+        },
+    )
+
+
+@app.get("/ui/audit", response_class=HTMLResponse, include_in_schema=False)
+def ui_audit(
+    request: Request,
+    session: Session = Depends(db.get_session),
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    actor_filter: Optional[str] = Query(default=None, alias="actor"),
+    page: int = Query(default=1, ge=1),
+) -> HTMLResponse:
+    """Operator audit page for actor-attributed execution rows."""
+    query = select(db.ExecutionLogRecord).where(
+        db.ExecutionLogRecord.actor_subject.is_not(None)
+    )
+    if status_filter in ("success", "failure"):
+        query = query.where(db.ExecutionLogRecord.status == status_filter)
+    if actor_filter:
+        query = query.where(db.ExecutionLogRecord.actor_subject == actor_filter)
+    page_size = 25
+    records = session.execute(
+        query.order_by(db.ExecutionLogRecord.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    ).scalars().all()
+    return web.render(
+        request,
+        "audit.html",
+        {
+            "active": "audit",
+            "logs": records,
+            "status_filter": status_filter,
+            "actor_filter": actor_filter or "",
+            "page": page,
+            "has_previous": page > 1,
+            "has_next": len(records) == page_size,
+        },
+    )
+
+
+@app.get(
+    "/ui/workflow-jobs/{job_id}",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+)
+def ui_workflow_job_detail(
+    request: Request, job_id: int, session: Session = Depends(db.get_session)
+) -> HTMLResponse:
+    """Operator detail page for one durable workflow job."""
+    job = session.get(db.WorkflowJobRecord, job_id)
+    if job is None:
+        return web.render(request, "404.html", {"active": "jobs"}, status_code=404)
+    try:
+        payload = json.loads(job.payload_json)
+    except json.JSONDecodeError:
+        payload = {}
+    try:
+        result = json.loads(job.result_json) if job.result_json else {}
+    except json.JSONDecodeError:
+        result = {}
+    return web.render(
+        request,
+        "job_detail.html",
+        {
+            "active": "jobs",
+            "job": job,
+            "payload": json.dumps(payload, indent=2, sort_keys=True),
+            "result": json.dumps(result, indent=2, sort_keys=True),
+        },
     )
 
 
@@ -1092,6 +1328,7 @@ def _transition_item(
     request_id: int,
     item_id: int,
     action: Literal["approve", "complete"],
+    actor_subject: Optional[str] = None,
 ) -> OnboardingRequestOut:
     record, _ = _load_request(session, request_id)
     item = _get_item(session, record, item_id)
@@ -1120,6 +1357,7 @@ def _transition_item(
         status="success",
         duration_ms=0,
         detail=f"step '{item.step}' of request #{record.id} is now '{item.status}'",
+        actor_subject=actor_subject,
     )
 
     _, items = _load_request(session, record.id)
@@ -1132,6 +1370,7 @@ def _transition_item(
             status="success",
             duration_ms=0,
             detail=f"all checklist steps done for request #{record.id}",
+            actor_subject=actor_subject,
         )
     _, items = _load_request(session, record.id)
     return _request_out(record, items)
@@ -1195,6 +1434,7 @@ def _execute_item(
                 status="success",
                 duration_ms=int((time.perf_counter() - started) * 1000),
                 detail=f"attempts={attempt}; {result.detail}",
+                actor_subject=actor.subject,
             )
             _, items = _load_request(session, record.id)
             if all(i.status == "completed" for i in items):
@@ -1235,6 +1475,7 @@ def _execute_item(
         status="failure",
         duration_ms=int((time.perf_counter() - started) * 1000),
         detail=f"attempts={attempts_limit}; {last_error}",
+        actor_subject=actor.subject,
     )
     session.flush()
     session.commit()
@@ -1248,14 +1489,10 @@ def _execute_item(
 def execute_item(
     request_id: int,
     item_id: int,
-    authorization: Optional[str] = Header(default=None),
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
 ) -> OnboardingRequestOut:
     """Execute a checklist action through the configured Microsoft adapter."""
-    try:
-        actor = authenticate_bearer(authorization)
-    except AuthenticationError as error:
-        raise HTTPException(status_code=401, detail=str(error)) from error
     return _execute_item(session, request_id, item_id, actor)
 
 @app.get("/onboarding-requests/{request_id}/action-executions", response_model=list[ActionExecutionOut])
@@ -1274,15 +1511,21 @@ def list_action_executions(
 
 @app.post("/onboarding-requests/{request_id}/items/{item_id}/approve")
 def approve_item(
-    request_id: int, item_id: int, session: Session = Depends(db.get_session)
+    request_id: int,
+    item_id: int,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
 ) -> OnboardingRequestOut:
     """Approve a checklist step that requires human sign-off."""
-    return _transition_item(session, request_id, item_id, "approve")
+    return _transition_item(session, request_id, item_id, "approve", actor.subject)
 
 
 @app.post("/onboarding-requests/{request_id}/items/{item_id}/complete")
 def complete_item(
-    request_id: int, item_id: int, session: Session = Depends(db.get_session)
+    request_id: int,
+    item_id: int,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
 ) -> OnboardingRequestOut:
     """Mark a checklist step completed (after approval if required).
 
@@ -1302,7 +1545,10 @@ def complete_item(
             "POST /offboarding-requests/{checklist_id}/steps/{step_key}/complete "
             "(idempotent completion ledger).",
         )
-    return _transition_item(session, request_id, item_id, "complete")
+    return _transition_item(
+        session, request_id, item_id, "complete", actor.subject
+    )
+
 
 
 class OffboardingStepResultOut(BaseModel):
@@ -1347,35 +1593,23 @@ def complete_offboarding_step(
     checklist_id: int,
     step_key: str,
     response: Response,
+    actor: Actor = Depends(_admin_actor),
     session: Session = Depends(db.get_session),
 ) -> OffboardingCompletionOut:
     """Idempotently complete one offboarding step (v0.6.1 hardening).
 
-    Side effects (account disable, mailbox archive, ...) must never run
-    twice for the same step, even when callers retry with different
-    request bodies or headers. The ``offboarding_completions`` table is
-    the ledger: a stored ``(checklist_id, step_key)`` row short-circuits
-    re-execution and its ``result_json`` is replayed with HTTP 200 and
-    the header ``X-Offboarding-Replayed: true``. A first execution runs
-    the module-level ``offboarding_executor`` (simulated), stores the
-    result, and returns HTTP 201.
+    The ledger row is claimed *before* the simulated side effect runs, so two
+    concurrent callers cannot both execute it. A completed row replays its
+    stored result; a fresh ``running`` row returns 409; a stale claim older
+    than the five-minute recovery window can be taken over with a new owner
+    token. On executor failure the claim is removed so a caller can retry.
 
-    Design note — why onboarding differs: onboarding steps keep their own
-    per-item state machine (pending/approved/completed plus a ``result``
-    column) because provisioning is additive and safe to re-inspect.
-    Offboarding destroys access, so it needs a separate append-only ledger
-    keyed by ``(checklist_id, step_key)`` that survives checklist edits.
-    Unifying both into one mechanism is deliberately left out of this
-    small change; see README limitations.
-
-    Validation: ``step_key`` must belong to this checklist (unknown keys
-    give 422); the checklist must be an offboarding request (otherwise
-    409); closed or abandoned checklists reject completion with 409.
-    Every path — first run, replay, rejection — writes an execution log.
+    Offboarding is destructive and therefore admin-only. Unknown step keys
+    return 422, onboarding checklists 409, missing checklists 404, and closed
+    or abandoned checklists 409. Every path writes an execution log with the
+    authenticated actor.
     """
     started = time.perf_counter()
-    # Load directly (not via _load_request) so a missing id gives 404 while
-    # an onboarding id can produce a more helpful 409 below.
     record = session.get(db.OnboardingRequestRecord, checklist_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Offboarding checklist not found.")
@@ -1393,11 +1627,19 @@ def complete_offboarding_step(
             status=status,
             duration_ms=int((time.perf_counter() - started) * 1000),
             detail=f"checklist #{checklist_id} step '{step_key}': {detail}",
+            actor_subject=actor.subject,
         )
+
+    def replay(existing: db.OffboardingCompletionRecord, reason: str) -> OffboardingCompletionOut:
+        stored = json.loads(existing.result_json)
+        log("replayed", "success", reason)
+        response.headers["X-Offboarding-Replayed"] = "true"
+        response.status_code = http_status.HTTP_200_OK
+        return OffboardingCompletionOut.model_validate(stored)
 
     if record.request_type != "offboarding":
         log("rejected", "failure", "request is not an offboarding checklist")
-        session.commit()  # persist the rejection log before raising
+        session.commit()
         raise HTTPException(
             409,
             "This checklist is an onboarding request; offboarding "
@@ -1422,22 +1664,93 @@ def complete_offboarding_step(
             f"Cannot complete steps on a '{record.status}' checklist.",
         )
 
+    table = db.OffboardingCompletionRecord
+    now = db.utcnow()
     existing = session.execute(
-        select(db.OffboardingCompletionRecord).where(
-            db.OffboardingCompletionRecord.checklist_id == checklist_id,
-            db.OffboardingCompletionRecord.step_key == step_key,
+        select(table).where(
+            table.checklist_id == checklist_id,
+            table.step_key == step_key,
         )
     ).scalar_one_or_none()
+
     if existing is not None:
-        stored = json.loads(existing.result_json)
-        log("replayed", "success", f"returning stored result from ledger #{existing.id}")
-        response.headers["X-Offboarding-Replayed"] = "true"
-        response.status_code = http_status.HTTP_200_OK
-        return OffboardingCompletionOut.model_validate(stored)
+        state = existing.status or "completed"  # NULL = legacy completed row
+        if state == "completed":
+            return replay(existing, f"returning stored result from ledger #{existing.id}")
+        if state != "running":
+            log("rejected", "failure", f"ledger row is in state '{state}'")
+            session.commit()
+            raise HTTPException(409, "Offboarding ledger is in an unexpected state.")
+        stale_before = now - IDEMPOTENCY_PROCESSING_TIMEOUT
+        claimed_at = existing.claimed_at
+        stale = claimed_at is None
+        if claimed_at is not None:
+            if claimed_at.tzinfo is None:
+                claimed_at = claimed_at.replace(tzinfo=timezone.utc)
+            stale = claimed_at < stale_before
+        if not stale:
+            log("rejected", "failure", "step is already running")
+            session.commit()
+            raise HTTPException(
+                409, "Offboarding step is already running; retry later."
+            )
+        owner_token = uuid.uuid4().hex
+        takeover = session.execute(
+            update(table)
+            .execution_options(synchronize_session=False)
+            .where(
+                table.id == existing.id,
+                table.status == "running",
+                or_(table.claimed_at.is_(None), table.claimed_at < stale_before),
+            )
+            .values(owner_token=owner_token, claimed_at=now)
+        )
+        if takeover.rowcount != 1:
+            session.rollback()
+            raise HTTPException(
+                409, "Offboarding claim changed hands; refresh and retry."
+            )
+        session.commit()
+        claim = existing
+    else:
+        owner_token = uuid.uuid4().hex
+        claim = table(
+            checklist_id=checklist_id,
+            step_key=step_key,
+            status="running",
+            owner_token=owner_token,
+            claimed_at=now,
+            result_json="{}",
+        )
+        session.add(claim)
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            winner = session.execute(
+                select(table).where(
+                    table.checklist_id == checklist_id,
+                    table.step_key == step_key,
+                )
+            ).scalar_one_or_none()
+            if winner is not None and (winner.status or "completed") == "completed":
+                return replay(winner, f"lost the claim race; replayed ledger #{winner.id}")
+            log("rejected", "failure", "lost the claim race to an in-flight request")
+            session.commit()
+            raise HTTPException(
+                409, "Offboarding step is already running; retry later."
+            )
 
     item = next(i for i in items if i.step_key == step_key)
     if item.requires_approval and item.status != "approved":
         log("rejected", "failure", f"step requires approval (status '{item.status}')")
+        session.execute(
+            delete(table).where(
+                table.id == claim.id,
+                table.status == "running",
+                table.owner_token == owner_token,
+            )
+        )
         session.commit()
         raise HTTPException(
             409,
@@ -1446,77 +1759,75 @@ def complete_offboarding_step(
             "POST /onboarding-requests/{request_id}/items/{item_id}/approve.",
         )
 
-    # First execution: run the (simulated) side effect, then claim the
-    # ledger row. If another concurrent request already claimed it, the
-    # unique constraint raises IntegrityError — we roll back (discarding
-    # this attempt's partial work) and replay the winner's stored result
-    # instead of crashing or double-executing anything durable.
-    result_payload = offboarding_executor(step_key, record.employee_email)
-    body = OffboardingCompletionOut(
-        checklist_id=checklist_id,
-        employee_name=record.employee_name,
-        step=OffboardingStepResultOut(
-            step_key=step_key,
-            status="completed",
-            executor_called=True,
-            executed_at=db.utcnow(),
-        ),
-    )
-    stored_json = json.dumps(
-        {
-            **body.model_dump(mode="json"),
-            "simulated_result": result_payload,
-        },
-        separators=(",", ":"),
-    )
-    session.add(
-        db.OffboardingCompletionRecord(
-            checklist_id=checklist_id,
-            step_key=step_key,
-            result_json=stored_json,
-        )
-    )
-    item.status = "completed"
     try:
-        session.flush()
-    except IntegrityError:
-        session.rollback()
-        competing = session.execute(
-            select(db.OffboardingCompletionRecord).where(
-                db.OffboardingCompletionRecord.checklist_id == checklist_id,
-                db.OffboardingCompletionRecord.step_key == step_key,
+        result_payload = offboarding_executor(step_key, record.employee_email)
+        body = OffboardingCompletionOut(
+            checklist_id=checklist_id,
+            employee_name=record.employee_name,
+            step=OffboardingStepResultOut(
+                step_key=step_key,
+                status="completed",
+                executor_called=True,
+                executed_at=db.utcnow(),
+            ),
+        )
+        stored_json = json.dumps(
+            {**body.model_dump(mode="json"), "simulated_result": result_payload},
+            separators=(",", ":"),
+        )
+        completed = session.execute(
+            update(table)
+            .execution_options(synchronize_session=False)
+            .where(
+                table.id == claim.id,
+                table.status == "running",
+                table.owner_token == owner_token,
             )
-        ).scalar_one()
-        log(
-            "replayed",
-            "success",
-            f"lost a race for the ledger row; replayed result #{competing.id}",
+            .values(
+                status="completed",
+                result_json=stored_json,
+                completed_at=db.utcnow(),
+                owner_token=None,
+                claimed_at=None,
+            )
         )
-        response.headers["X-Offboarding-Replayed"] = "true"
-        response.status_code = http_status.HTTP_200_OK
-        return OffboardingCompletionOut.model_validate(
-            json.loads(competing.result_json)
+        if completed.rowcount != 1:
+            session.rollback()
+            raise HTTPException(
+                409, "Offboarding claim was taken over; refresh and retry."
+            )
+        item.status = "completed"
+        log("executed", "success", f"simulated executor result: {result_payload['action']}")
+        all_items = session.execute(
+            select(db.ChecklistItemRecord).where(
+                db.ChecklistItemRecord.request_id == checklist_id
+            )
+        ).scalars().all()
+        if all(i.status == "completed" for i in all_items) and record.status != "completed":
+            record.status = "completed"
+            db.log_execution(
+                session,
+                run_id=_new_run_id(),
+                action="onboarding.request.completed",
+                status="success",
+                duration_ms=0,
+                detail=f"all checklist steps done for request #{record.id}",
+                actor_subject=actor.subject,
+            )
+        session.commit()
+        response.status_code = http_status.HTTP_201_CREATED
+        return body
+    except Exception:
+        session.rollback()
+        session.execute(
+            delete(table).where(
+                table.id == claim.id,
+                table.status == "running",
+                table.owner_token == owner_token,
+            )
         )
-
-    log("executed", "success", f"simulated executor result: {result_payload['action']}")
-    all_items = session.execute(
-        select(db.ChecklistItemRecord).where(
-            db.ChecklistItemRecord.request_id == checklist_id
-        )
-    ).scalars().all()
-    if all(i.status == "completed" for i in all_items) and record.status != "completed":
-        record.status = "completed"
-        db.log_execution(
-            session,
-            run_id=_new_run_id(),
-            action="onboarding.request.completed",
-            status="success",
-            duration_ms=0,
-            detail=f"all checklist steps done for request #{record.id}",
-        )
-    response.status_code = http_status.HTTP_201_CREATED
-    return body
-
+        session.commit()
+        raise
 
 class M365StatusOut(BaseModel):
     """Shape of the *simulated* M365 status response (v0.6 placeholder)."""
@@ -1534,6 +1845,146 @@ def get_m365_status(user_id: str) -> M365StatusOut:
     This never contacts real Microsoft services; see src/m365_simulator.py.
     """
     return M365StatusOut.model_validate(m365_simulator.get_status(user_id))
+
+
+# ---------------------------------------------------------------------------
+# Routes: durable workflow jobs
+
+
+@app.post(
+    "/onboarding-requests/{request_id}/items/{item_id}/jobs",
+    response_model=WorkflowJobOut,
+    status_code=http_status.HTTP_202_ACCEPTED,
+)
+def enqueue_onboarding_item_job(
+    request_id: int,
+    item_id: int,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowJobOut:
+    """Queue one onboarding checklist action for a durable worker."""
+    record, _ = _load_request(session, request_id)
+    item = _get_item(session, record, item_id)
+    if item.status == "completed":
+        raise HTTPException(409, "Checklist item is already completed.")
+    required_status = "approved" if item.requires_approval else "pending"
+    if item.status != required_status:
+        raise HTTPException(
+            409,
+            f"Item must be '{required_status}' before execution "
+            f"(current status: '{item.status}').",
+        )
+    action = action_for_step(item.step)
+    job = jobs.enqueue_job(
+        session,
+        job_type=jobs.JOB_ONBOARDING_ITEM,
+        payload={"request_id": record.id, "item_id": item.id, "action": action},
+        idempotency_key=f"onboarding:{record.id}:{item.id}",
+        resource_type="onboarding",
+        resource_id=str(record.id),
+        label=f"{record.employee_name}: {item.step}",
+    )
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="workflow.job.enqueued",
+        status="success",
+        ticket_id=str(record.id),
+        duration_ms=0,
+        detail=f"job #{job.id} ({action}) queued for item #{item.id}",
+        actor_subject=actor.subject,
+    )
+    session.commit()
+    return WorkflowJobOut.model_validate(job)
+
+
+@app.get("/workflow-jobs", response_model=list[WorkflowJobOut])
+def list_workflow_jobs(
+    session: Session = Depends(db.get_session),
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> list[WorkflowJobOut]:
+    """List durable workflow jobs, newest first."""
+    return [
+        WorkflowJobOut.model_validate(job)
+        for job in jobs.list_jobs(
+            session, status=status_filter, limit=limit, offset=offset
+        )
+    ]
+
+
+@app.get("/workflow-jobs/{job_id}", response_model=WorkflowJobOut)
+def get_workflow_job(
+    job_id: int, session: Session = Depends(db.get_session)
+) -> WorkflowJobOut:
+    """Return one durable workflow job."""
+    job = session.get(db.WorkflowJobRecord, job_id)
+    if job is None:
+        raise HTTPException(404, "Workflow job not found.")
+    return WorkflowJobOut.model_validate(job)
+
+
+@app.post("/workflow-jobs/{job_id}/retry", response_model=WorkflowJobOut)
+def retry_workflow_job(
+    job_id: int,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowJobOut:
+    """Return a failed workflow job to the queue with a fresh attempt budget."""
+    job = session.get(db.WorkflowJobRecord, job_id)
+    if job is None:
+        raise HTTPException(404, "Workflow job not found.")
+    if job.status != "failed":
+        raise HTTPException(
+            409, f"Only failed jobs can be retried (current status: '{job.status}')."
+        )
+    if not jobs.retry_failed_job(session, job_id):
+        raise HTTPException(409, "Workflow job changed state; refresh and retry.")
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="workflow.job.retried",
+        status="success",
+        ticket_id=job.resource_id,
+        duration_ms=0,
+        detail=f"job #{job_id} returned to the queue",
+        actor_subject=actor.subject,
+    )
+    session.commit()
+    session.expire_all()
+    job = session.get(db.WorkflowJobRecord, job_id)
+    return WorkflowJobOut.model_validate(job)
+
+
+@app.post("/workflow-jobs/{job_id}/cancel", response_model=WorkflowJobOut)
+def cancel_workflow_job(
+    job_id: int,
+    actor: Actor = Depends(_admin_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowJobOut:
+    """Cancel a queued or retry-scheduled workflow job."""
+    job = session.get(db.WorkflowJobRecord, job_id)
+    if job is None:
+        raise HTTPException(404, "Workflow job not found.")
+    if not jobs.cancel_job(session, job_id):
+        raise HTTPException(
+            409, "Only queued or retry-scheduled jobs can be cancelled."
+        )
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="workflow.job.cancelled",
+        status="success",
+        ticket_id=job.resource_id,
+        duration_ms=0,
+        detail=f"job #{job_id} cancelled",
+        actor_subject=actor.subject,
+    )
+    session.commit()
+    session.expire_all()
+    job = session.get(db.WorkflowJobRecord, job_id)
+    return WorkflowJobOut.model_validate(job)
 
 
 # ---------------------------------------------------------------------------
@@ -1564,12 +2015,16 @@ def _outbox_out(record: db.NotificationOutboxRecord) -> NotificationOutboxOut:
 @app.get("/notifications/pending", response_model=list[NotificationOutboxOut])
 def list_pending_notifications(
     session: Session = Depends(db.get_session),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
 ) -> list[NotificationOutboxOut]:
     """List webhook deliveries that await a manual retry."""
     records = session.execute(
         select(db.NotificationOutboxRecord)
         .where(db.NotificationOutboxRecord.status == "pending")
         .order_by(db.NotificationOutboxRecord.id)
+        .offset(offset)
+        .limit(limit)
     ).scalars().all()
     return [_outbox_out(record) for record in records]
 
@@ -1577,6 +2032,8 @@ def list_pending_notifications(
 @app.get("/notifications/failed", response_model=list[NotificationOutboxOut])
 def list_failed_notifications(
     session: Session = Depends(db.get_session),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
 ) -> list[NotificationOutboxOut]:
     """List dead-letter deliveries that exhausted their retry budget.
 
@@ -1587,12 +2044,15 @@ def list_failed_notifications(
         select(db.NotificationOutboxRecord)
         .where(db.NotificationOutboxRecord.status == "failed")
         .order_by(db.NotificationOutboxRecord.id)
+        .offset(offset)
+        .limit(limit)
     ).scalars().all()
     return [_outbox_out(record) for record in records]
 
 
 @app.post("/notifications/retry", response_model=list[NotificationOutboxOut])
 def retry_failed_notifications(
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
     limit: int = Query(default=20, ge=1, le=100),
 ) -> list[NotificationOutboxOut]:
@@ -1636,6 +2096,7 @@ def retry_failed_notifications(
                         f"outbox #{record.id} exhausted after "
                         f"{record.attempts} attempts"
                     ),
+                    actor_subject=actor.subject,
                 )
         db.log_execution(
             session,
@@ -1645,6 +2106,7 @@ def retry_failed_notifications(
             ticket_id=record.ticket_id,
             duration_ms=duration_ms,
             detail=f"outbox #{record.id}: now '{record.status}'",
+            actor_subject=actor.subject,
         )
         results.append(_outbox_out(record))
     return results
@@ -1655,7 +2117,9 @@ def retry_failed_notifications(
     response_model=NotificationOutboxOut,
 )
 def requeue_failed_notification(
-    notification_id: int, session: Session = Depends(db.get_session)
+    notification_id: int,
+    actor: Actor = Depends(_admin_actor),
+    session: Session = Depends(db.get_session),
 ) -> NotificationOutboxOut:
     """Return one dead-letter delivery to the pending queue.
 
@@ -1704,6 +2168,7 @@ def requeue_failed_notification(
             f"outbox #{record.id} returned to pending; "
             f"attempts={record.attempts} preserved"
         ),
+        actor_subject=actor.subject,
     )
     return _outbox_out(record)
 
@@ -1712,20 +2177,56 @@ def requeue_failed_notification(
 def list_execution_logs(
     session: Session = Depends(db.get_session),
     status_filter: Optional[str] = Query(default=None, alias="status"),
+    actor_filter: Optional[str] = Query(default=None, alias="actor"),
     limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
 ) -> list[ExecutionLogOut]:
     """Recent workflow execution log entries, newest first."""
     statement = select(db.ExecutionLogRecord).order_by(
         db.ExecutionLogRecord.id.desc()
-    ).limit(limit)
+    ).offset(offset).limit(limit)
     if status_filter in ("success", "failure"):
         statement = statement.where(db.ExecutionLogRecord.status == status_filter)
+    if actor_filter:
+        statement = statement.where(
+            db.ExecutionLogRecord.actor_subject == actor_filter
+        )
     records = session.execute(statement).scalars().all()
     return [
         ExecutionLogOut(
             **{c: getattr(record, c) for c in (
                 "id", "run_id", "action", "status", "ticket_id",
-                "duration_ms", "detail", "created_at",
+                "duration_ms", "detail", "actor_subject", "created_at",
+            )}
+        )
+        for record in records
+    ]
+
+
+@app.get("/audit", response_model=list[ExecutionLogOut])
+def list_audit_trail(
+    session: Session = Depends(db.get_session),
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    actor_filter: Optional[str] = Query(default=None, alias="actor"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> list[ExecutionLogOut]:
+    """Recent execution rows that carry an authenticated actor."""
+    query = select(db.ExecutionLogRecord).where(
+        db.ExecutionLogRecord.actor_subject.is_not(None)
+    )
+    if status_filter in ("success", "failure"):
+        query = query.where(db.ExecutionLogRecord.status == status_filter)
+    if actor_filter:
+        query = query.where(db.ExecutionLogRecord.actor_subject == actor_filter)
+    records = session.execute(
+        query.order_by(db.ExecutionLogRecord.id.desc()).offset(offset).limit(limit)
+    ).scalars().all()
+    return [
+        ExecutionLogOut(
+            **{c: getattr(record, c) for c in (
+                "id", "run_id", "action", "status", "ticket_id",
+                "duration_ms", "detail", "actor_subject", "created_at",
             )}
         )
         for record in records
@@ -1804,10 +2305,34 @@ def dashboard(
             "action": log.action,
             "status": log.status,
             "ticket_id": log.ticket_id,
+            "actor_subject": log.actor_subject,
             "duration_ms": log.duration_ms,
         }
         for log in logs[:50]
     ]
+    offboarding_rows = []
+    for onboarding_record in session.execute(
+        select(db.OnboardingRequestRecord)
+    ).scalars().all():
+        if onboarding_record.request_type != "offboarding":
+            continue
+        checklist = session.execute(
+            select(db.ChecklistItemRecord).where(
+                db.ChecklistItemRecord.request_id == onboarding_record.id
+            )
+        ).scalars().all()
+        total = len(checklist)
+        completed = sum(1 for item in checklist if item.status == "completed")
+        offboarding_rows.append(
+            {
+                "id": onboarding_record.id,
+                "employee_name": onboarding_record.employee_name,
+                "status": onboarding_record.status,
+                "completed": completed,
+                "total": total,
+                "percent": round((completed / total) * 100) if total else 0,
+            }
+        )
     return web.render(
         request,
         "dashboard.html",
@@ -1822,139 +2347,6 @@ def dashboard(
             "failed": failed_deliveries,
             "auto_refresh": auto_refresh,
             "last_updated": db.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "offboarding_rows": offboarding_rows,
         },
     )
-
-    outbox_card = (
-        f'<div class="card"><div class="value fail">{outbox_pending}'
-        '</div><div class="label">pending webhook retries</div></div>'
-        if outbox_pending
-        else ""
-    )
-    outbox_section = ""
-    if pending_deliveries:
-        outbox_rows = "".join(
-            "<tr>"
-            f"<td>#{item.id}</td>"
-            f"<td>{html.escape(item.ticket_id or '')}</td>"
-            f"<td>{html.escape(item.url)}</td>"
-            f"<td>{item.attempts}</td>"
-            f"<td class=\"fail\">{html.escape(item.last_error or '')}</td>"
-            "</tr>"
-            for item in pending_deliveries[:15]
-        )
-        outbox_section = f"""<section>
-        <h2>Failed webhook deliveries ({outbox_pending} pending)</h2>
-<p>Retry them with <code>POST /notifications/retry</code> &middot;
-list with <code>GET /notifications/pending</code>.</p>
-<table><tr><th>#</th><th>ticket</th><th>url</th><th>attempts</th><th>last error</th></tr>{outbox_rows}</table>
-</section>
-"""
-
-    # v0.6 placeholder: simulated M365 user ids recorded by completed
-    # provisioning steps, clearly labelled so nobody mistakes them for real.
-    m365_lines: list[str] = []
-    # v0.6.1: offboarding progress per checklist (completed vs total steps),
-    # read from the same rows the ledger endpoint uses.
-    offboarding_progress_rows: list[str] = []
-    for onb_record in session.execute(
-        select(db.OnboardingRequestRecord)
-    ).scalars().all():
-        onb_items = session.execute(
-            select(db.ChecklistItemRecord).where(
-                db.ChecklistItemRecord.request_id == onb_record.id
-            )
-        ).scalars().all()
-        for onb_item in sorted(onb_items, key=lambda i: i.id):
-            if onb_item.action == "m365_provision" and onb_item.result:
-                try:
-                    sim_user_id = json.loads(onb_item.result).get("id", "?")
-                except (ValueError, TypeError):
-                    sim_user_id = "?"
-                m365_lines.append(
-                    "<li>"
-                    f"request #{onb_record.id} &middot; {html.escape(onb_record.employee_name)} "
-                    f"&middot; simulated M365 id <code>{html.escape(str(sim_user_id))}</code> "
-                    "(simulated)"
-                    "</li>"
-                )
-        if onb_record.request_type == "offboarding":
-            done = sum(1 for i in onb_items if i.status == "completed")
-            offboarding_progress_rows.append(
-                "<tr>"
-                f"<td>#{onb_record.id}</td>"
-                f"<td>{html.escape(onb_record.employee_name)}</td>"
-                f"<td>{html.escape(onb_record.status)}</td>"
-                f"<td>{done} / {len(onb_items)}</td>"
-                "</tr>"
-            )
-    m365_section = (
-        "<section><h2>Simulated Microsoft 365 provisioning</h2>"
-        "<p>v0.6 placeholder &mdash; these accounts are fake; no real "
-        "Microsoft 365 tenant is touched.</p>"
-        f"<ul>{''.join(m365_lines)}</ul></section>\n"
-        if m365_lines
-        else ""
-    )
-    offboarding_section = (
-        "<section><h2>Offboarding progress</h2>"
-        "<p>Completed steps per offboarding checklist (v0.6.1 ledger).</p>"
-        "<table><tr><th>#</th><th>employee</th><th>request status</th>"
-        f"<th>steps</th></tr>{''.join(offboarding_progress_rows)}</table>"
-        "</section>\n"
-        if offboarding_progress_rows
-        else ""
-    )
-
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FlowOps dashboard</title>
-<style>
-  body {{ font-family: -apple-system, system-ui, sans-serif; margin: 2rem; background: #f5f6f8; color: #1f2933; }}
-  h1 {{ font-size: 1.5rem; }}
-  .cards {{ display: flex; flex-wrap: wrap; gap: 1rem; margin: 1rem 0 2rem; }}
-  .card {{ background: #fff; border-radius: 10px; padding: 1rem 1.5rem; box-shadow: 0 1px 4px rgba(0,0,0,.08); min-width: 9rem; }}
-  .card .value {{ font-size: 1.8rem; font-weight: 600; }}
-  .card .label {{ color: #5f6b7a; font-size: .8rem; }}
-  section {{ background: #fff; border-radius: 10px; padding: 1rem 1.5rem; box-shadow: 0 1px 4px rgba(0,0,0,.08); margin-bottom: 1.5rem; overflow-x: auto; }}
-  table {{ border-collapse: collapse; width: 100%; font-size: .85rem; }}
-  th, td {{ text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #eef0f3; }}
-  th {{ color: #5f6b7a; font-weight: 600; }}
-  td.ok {{ color: #137333; }} td.fail {{ color: #c5221f; font-weight: 600; }}
-  .card .value.fail {{ color: #c5221f; }}
-  .cols {{ display: flex; gap: 1.5rem; flex-wrap: wrap; }}
-  .cols section {{ flex: 1; min-width: 16rem; }}
-  a {{ color: #2563eb; }}
-</style>
-</head>
-<body>
-<h1>FlowOps monitoring dashboard</h1>
-<p><a href="/">&larr; back</a> &middot; learning prototype, simulated data</p>
-<div class="cards">
-  <div class="card"><div class="value">{total}</div><div class="label">tickets</div></div>
-  <div class="card"><div class="value">{open_count}</div><div class="label">open</div></div>
-  <div class="card"><div class="value">{closed_count}</div><div class="label">closed</div></div>
-  <div class="card"><div class="value">{auto_routed}</div><div class="label">auto-routed</div></div>
-  <div class="card"><div class="value">{success_count}</div><div class="label">successful runs</div></div>
-  <div class="card"><div class="value">{failure_count}</div><div class="label">failed runs</div></div>
-  <div class="card"><div class="value">{avg_duration} ms</div><div class="label">avg run duration</div></div>
-  <div class="card"><div class="value">{hours_saved} h</div><div class="label">est. staff time saved</div></div>
-  <div class="card"><div class="value">{outbox_pending}</div><div class="label">pending notifications</div></div>
-  <div class="card"><div class="value">{outbox_pending}</div><div class="label">pending webhook retries</div></div>
-  <div class="card"><div class="value">{outbox_delivered}</div><div class="label">delivered notifications</div></div>
-  <div class="card"><div class="value">{outbox_failed}</div><div class="label">failed notifications</div></div>
-  <div class="card"><div class="value">{outbox_retries}</div><div class="label">notification retries</div></div>
-</div>
-<div class="cols">
-  <section><h2>Tickets by queue</h2><table>{counter_rows(by_queue)}</table></section>
-  <section><h2>Tickets by priority</h2><table>{counter_rows(by_priority)}</table></section>
-</div>
-{outbox_section}{m365_section}{offboarding_section}<section>
-  <h2>Recent workflow runs</h2>
-  <table><tr><th>run</th><th>time</th><th>action</th><th>status</th><th>ticket</th><th>duration</th></tr>{recent_rows}</table>
-</section>
-</body>
-</html>"""

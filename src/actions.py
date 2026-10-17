@@ -59,10 +59,13 @@ class MicrosoftGraphAdapter:
         self.timeout = timeout
 
     def execute(self, action: str, context: dict[str, Any]) -> ActionResult:
+        headers = {"Authorization": f"Bearer {self.token}"}
+        if context.get("idempotency_key"):
+            headers["Idempotency-Key"] = str(context["idempotency_key"])
         response = requests.post(
             f"{self.url}/{action}",
             json=context,
-            headers={"Authorization": f"Bearer {self.token}"},
+            headers=headers,
             timeout=self.timeout,
         )
         response.raise_for_status()
@@ -75,9 +78,12 @@ class PowerAutomateAdapter:
         self.timeout = timeout
 
     def execute(self, action: str, context: dict[str, Any]) -> ActionResult:
+        payload: dict[str, Any] = {"action": action, "context": context}
+        if context.get("idempotency_key"):
+            payload["idempotency_key"] = context["idempotency_key"]
         response = requests.post(
             self.url,
-            json={"action": action, "context": context},
+            json=payload,
             timeout=self.timeout,
         )
         response.raise_for_status()

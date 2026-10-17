@@ -57,6 +57,32 @@
   </div>
 </section>
 
+<section class="panel" aria-labelledby="offboarding-heading">
+  <div class="panel-head">
+    <h2 id="offboarding-heading">Offboarding progress</h2>
+    <a class="button small ghost" href="/ui/onboarding-requests">Open checklists</a>
+  </div>
+  {% if offboarding_rows %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>#</th><th>Employee</th><th>Status</th><th>Progress</th></tr></thead>
+      <tbody>
+        {% for row in offboarding_rows %}
+        <tr>
+          <td>#{{ row.id }}</td>
+          <td><a href="/ui/onboarding-requests/{{ row.id }}">{{ row.employee_name }}</a></td>
+          <td><span class="badge {{ 'ok' if row.status == 'completed' else 'info' }}">{{ row.status }}</span></td>
+          <td><span class="progress"><span class="progress-fill" style="width: {{ row.percent }}%"></span></span> <span class="small muted">{{ row.completed }}/{{ row.total }}</span></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">No offboarding checklists yet.</p>
+  {% endif %}
+</section>
+
 <section class="panel" aria-labelledby="runs-heading">
   <div class="panel-head">
     <h2 id="runs-heading">Recent workflow runs</h2>
@@ -69,7 +95,7 @@
   {% if logs %}
   <div class="table-wrap">
     <table>
-      <thead><tr><th>#</th><th>Time</th><th>Action</th><th>Status</th><th>Ticket</th><th>Duration</th></tr></thead>
+      <thead><tr><th>#</th><th>Time</th><th>Action</th><th>Status</th><th>Ticket</th><th>Actor</th><th>Duration</th></tr></thead>
       <tbody>
         {% for log in logs %}
         <tr>
@@ -78,6 +104,7 @@
           <td>{{ log.action }}</td>
           <td><span class="badge {{ 'ok' if log.status == 'success' else 'fail' }}">{{ log.status }}</span></td>
           <td>{{ log.ticket_id or '—' }}</td>
+          <td>{{ log.actor_subject or '—' }}</td>
           <td>{{ log.duration_ms }} ms</td>
         </tr>
         {% endfor %}

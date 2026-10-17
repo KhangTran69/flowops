@@ -175,7 +175,7 @@ def test_postgres_stale_owner_cannot_finalize_after_takeover(client, monkeypatch
     call_lock = threading.Lock()
     original_process = api._process_intake
 
-    def pause_first_request(request, session):
+    def pause_first_request(request, session, actor_subject=None):
         nonlocal calls
         with call_lock:
             calls += 1
@@ -183,7 +183,7 @@ def test_postgres_stale_owner_cannot_finalize_after_takeover(client, monkeypatch
         if is_first:
             a_entered.set()
             assert release_a.wait(timeout=5), "test did not release the stale owner"
-        return original_process(request, session)
+        return original_process(request, session, actor_subject)
 
     monkeypatch.setattr(api, "_process_intake", pause_first_request)
     key = "pg-takeover-key"
@@ -261,7 +261,7 @@ def test_postgres_onboarding_stale_owner_cannot_finalize_after_takeover(
     call_lock = threading.Lock()
     original_create = api._create_onboarding_request
 
-    def pause_first(request, session):
+    def pause_first(request, session, actor_subject=None):
         nonlocal calls
         with call_lock:
             calls += 1
@@ -269,7 +269,7 @@ def test_postgres_onboarding_stale_owner_cannot_finalize_after_takeover(
         if is_first:
             a_entered.set()
             assert release_a.wait(timeout=5), "test did not release the stale owner"
-        return original_create(request, session)
+        return original_create(request, session, actor_subject)
 
     monkeypatch.setattr(api, "_create_onboarding_request", pause_first)
     key = "pg-onboarding-takeover"

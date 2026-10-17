@@ -86,7 +86,7 @@ def test_execute_requires_auth_when_enabled(client, monkeypatch):
     monkeypatch.setenv("FLOWOPS_AUTH_REQUIRED", "true")
     monkeypatch.setenv("FLOWOPS_DEV_BEARER_TOKEN", "dev-secret")
     payload = {"request_type": "onboarding", "employee_name": "Jane Doe", "employee_email": "jane@example.com", "department": "Sales", "requester_id": 3}
-    request = client.post("/onboarding-requests", json=payload).json()
+    request = client.post("/onboarding-requests", json=payload, headers={"Authorization": "Bearer dev-secret"}).json()
     item = request["checklist"][1]
     assert client.post(f"/onboarding-requests/{request['id']}/items/{item['id']}/execute").status_code == 401
     class CapturingAdapter:
@@ -95,3 +95,100 @@ def test_execute_requires_auth_when_enabled(client, monkeypatch):
             return ActionResult(action, "captured")
     monkeypatch.setattr(api, "ACTION_ADAPTER", CapturingAdapter())
     assert client.post(f"/onboarding-requests/{request['id']}/items/{item['id']}/execute", headers={"Authorization": "Bearer dev-secret"}).status_code == 200
+
+
+def test_mutating_ticket_route_requires_bearer_when_enabled(client, monkeypatch):
+    monkeypatch.setenv("FLOWOPS_AUTH_REQUIRED", "true")
+    monkeypatch.setenv("FLOWOPS_DEV_BEARER_TOKEN", "dev-secret")
+    payload = {"userId": 7, "id": 42, "title": "Laptop will not start", "completed": False}
+    assert client.post("/tickets", json=payload).status_code == 401
+    assert client.post("/tickets", json=payload, headers={"Authorization": "Bearer wrong"}).status_code == 401
+    created = client.post(
+        "/tickets", json=payload, headers={"Authorization": "Bearer dev-secret"}
+    )
+    assert created.status_code == 201
+    audit = client.get("/audit").json()
+    assert any(row["actor_subject"] == "configured-bearer" for row in audit)
+    filtered = client.get("/execution-logs", params={"actor": "configured-bearer"}).json()
+    assert any(row["action"] == "ticket.created" for row in filtered)
+
+
+def test_webhook_api_key_is_optional_and_enforced(client, monkeypatch):
+    payload = {"userId": 7, "id": 77, "title": "VPN issue", "completed": False}
+    monkeypatch.delenv("FLOWOPS_WEBHOOK_API_KEY", raising=False)
+    assert client.post("/webhooks/intake", json=payload).status_code == 200
+    monkeypatch.setenv("FLOWOPS_WEBHOOK_API_KEY", "hook-secret")
+    assert client.post("/webhooks/intake", json=payload).status_code == 401
+    assert client.post(
+        "/webhooks/intake", json=payload, headers={"X-API-Key": "hook-secret"}
+    ).status_code == 200
+
+
+def test_operator_dependency_rejects_viewer_role():
+    from fastapi import HTTPException
+    from src.api import _operator_actor
+    from src.auth import Actor
+
+    with pytest.raises(HTTPException) as error:
+        _operator_actor(Actor(subject="viewer", roles=("automation.viewer",)))
+    assert error.value.status_code == 403
+
+
+def test_auth_me_and_startup_validation(client, monkeypatch):
+    from src.auth import validate_auth_configuration
+
+    with pytest.raises(AuthenticationError):
+        validate_auth_configuration({"FLOWOPS_AUTH_REQUIRED": "true"})
+    validate_auth_configuration(
+        {
+            "FLOWOPS_AUTH_REQUIRED": "true",
+            "FLOWOPS_ENVIRONMENT": "development",
+            "FLOWOPS_DEV_BEARER_TOKEN": "dev-secret",
+        }
+    )
+    monkeypatch.setenv("FLOWOPS_AUTH_REQUIRED", "true")
+    monkeypatch.setenv("FLOWOPS_DEV_BEARER_TOKEN", "dev-secret")
+    me = client.get("/auth/me", headers={"Authorization": "Bearer dev-secret"})
+    assert me.status_code == 200
+    assert me.json()["subject"] == "configured-bearer"
+    assert "automation.operator" in me.json()["roles"]
+
+
+def test_admin_only_requeue_rejects_operator(client, monkeypatch):
+    client.get("/dashboard")  # ensure tables
+    session = db.SessionLocal()
+    try:
+        row = db.NotificationOutboxRecord(
+            url="https://hooks.example/auth",
+            payload_json="{}",
+            status="failed",
+            attempts=3,
+            last_error="boom",
+        )
+        session.add(row)
+        session.commit()
+        notification_id = row.id
+    finally:
+        session.close()
+
+    monkeypatch.setenv("FLOWOPS_AUTH_REQUIRED", "true")
+    monkeypatch.setenv("FLOWOPS_DEV_BEARER_TOKEN", "dev-secret")
+    headers = {"Authorization": "Bearer dev-secret"}
+    assert client.post(f"/notifications/{notification_id}/requeue").status_code == 401
+    assert client.post(
+        f"/notifications/{notification_id}/requeue", headers=headers
+    ).status_code == 403
+
+
+def test_rate_limit_returns_429(client, monkeypatch):
+    from src import api
+
+    api._RATE_LIMIT_BUCKETS.clear()
+    monkeypatch.setenv("FLOWOPS_RATE_LIMIT_PER_MINUTE", "2")
+    payload = {"userId": 7, "id": 42, "title": "Laptop will not start", "completed": False}
+    assert client.post("/tickets", json=payload).status_code == 201
+    assert client.post("/tickets", json={**payload, "id": 43}).status_code == 201
+    limited = client.post("/tickets", json={**payload, "id": 44})
+    assert limited.status_code == 429
+    assert limited.headers.get("Retry-After") == "60"
+    api._RATE_LIMIT_BUCKETS.clear()

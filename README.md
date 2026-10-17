@@ -25,6 +25,11 @@ FlowOps is an IT workflow automation platform. It receives support tickets and o
 | v1.0-preview Monitoring dashboard | ✅ | `/dashboard`: run success/failure, durations, queue/priority breakdowns, est. time saved |
 | v1.0 Reliability: fenced idempotency | ✅ | Per-claim owner tokens prevent a stale request from finalizing or deleting a takeover reservation |
 | v1.0 Reliability: dead-letter retries | ✅ | Exhausted outbox deliveries become `failed`; operators can inspect and requeue them |
+| v1.0 UI: operator console | ✅ | Jinja2 templates, responsive dashboard, onboarding/outbox pages, theme toggle, inline actions |
+| v1.0 Reliability: durable workflow jobs | ✅ | Leased worker queue with retries, dead-letter, operator retry/cancel |
+| v1.0 Security: auth, roles, audit | ✅ | Optional bearer/Entra auth, role checks, webhook API key, actor attribution |
+| v0.6.1 Offboarding completion ledger | ✅ | Admin-only, claim-before-execute, idempotent replay, stale-claim takeover, ledger-backed offboarding |
+| v1.0 Operations: readiness, metrics, migrations | ✅ | `/ready`, `/metrics`, correlation IDs, Alembic baseline, container migration entrypoint |
 | v1.0 CI + Docker | ✅ | GitHub Actions runs pytest, a Docker Compose API + PostgreSQL smoke test, and PostgreSQL reliability tests |
 | v0.6 Microsoft 365 actions | ⬜ | Real account creation via Power Automate / Microsoft Graph / PowerShell (needs credentials) |
 | v0.7 AI support agent | ⬜ | MCP/Claude assistance with human approval gates (needs AI credentials) |
@@ -49,15 +54,26 @@ flowops/
 │   ├── db.py                 # SQLAlchemy models, session management, logging helper
 │   ├── routing.py            # pure classification/priority/queue rules
 │   ├── notify.py             # webhook delivery with exponential-backoff retries
-│   └── onboarding.py         # checklist templates
+│   ├── onboarding.py         # checklist templates
+│   ├── jobs.py               # durable workflow queue: enqueue, lease, retry, cancel
+│   ├── worker.py             # leased worker process for onboarding actions
+│   ├── outbox.py             # leased outbox claim/finalize helpers
+│   ├── outbox_worker.py      # automatic notification dispatcher
+│   ├── auth.py               # bearer/Entra auth and role helpers
+│   ├── web.py                # Jinja2 rendering helpers
+│   ├── templates/            # shared layout, landing, dashboard, operator pages
+│   └── static/               # local CSS and vanilla JavaScript
+├── migrations/               # Alembic baseline and environment
 ├── tests/                    # offline test suite (test_*.py); PostgreSQL reliability tests opt in via env
 ├── data/                     # runtime artifacts (git-ignored): flowops.db, ticket.json
-├── .github/workflows/ci.yml  # GitHub Actions: SQLite matrix, PostgreSQL smoke + reliability tests
-├── Dockerfile                # Small API image
-├── docker-compose.yml        # API + PostgreSQL demo stack
+├── .github/workflows/ci.yml  # GitHub Actions: SQLite matrix, migrations, PostgreSQL smoke + reliability tests
+├── Dockerfile                # Non-root API/worker image with migration entrypoint
+├── docker-compose.yml        # API + worker + PostgreSQL demo stack
+├── alembic.ini               # Migration configuration
 ├── docs/portfolio-demo.md    # Guided interview/portfolio walkthrough
 ├── docs/architecture.md      # Data flow and reliability boundaries
 ├── scripts/demo_smoke.sh     # Local end-to-end smoke test
+├── scripts/load_smoke.py     # Small concurrent intake/replay smoke test
 ├── .gitignore  .env.example  requirements.txt  README.md
 ```
 
@@ -100,11 +116,14 @@ Without this variable the app uses `sqlite:///data/flowops.db`. No dotenv depend
 
 ### Docker Compose (optional)
 
-The included compose file runs the API against PostgreSQL and exposes it at
-`http://127.0.0.1:8000`. Docker must be installed locally for this command.
-The same build and smoke test also run in the GitHub Actions
-`docker-postgres` job, and the `postgres-idempotency` job runs the idempotency
-and outbox tests against a PostgreSQL service.
+The included compose file runs the API, a durable workflow worker, an
+automatic outbox dispatcher, and PostgreSQL. The app entrypoint runs
+`alembic upgrade head`; the workers wait for a healthy app. Services use
+restart policies and stop grace periods; the image runs as the non-root
+`flowops` user. The API is exposed at `http://127.0.0.1:8000`. Docker must be
+installed locally for this command. The same build and smoke test also run in
+the GitHub Actions `docker-postgres` job, and the `postgres-idempotency` job
+runs the PostgreSQL reliability tests against a PostgreSQL service.
 
 ```bash
 docker compose up --build
@@ -136,8 +155,20 @@ services without deleting the stored PostgreSQL data. Use
 | `GET /notifications/failed` | List dead-letter deliveries that exhausted their retry budget |
 | `POST /notifications/retry?limit=` | Retry pending deliveries once each; failures become `failed` at the configured attempt limit |
 | `POST /notifications/{id}/requeue` | Return one `failed` delivery to `pending`; `409` unless still failed |
-| `GET /execution-logs?status=&limit=` | Recent workflow runs, newest first |
+| `POST .../items/{item}/execute` | Synchronous onboarding action execution (kept for compatibility; optional auth) |
+| `POST /offboarding-requests/{checklist_id}/steps/{step_key}/complete` | Admin-only, idempotent offboarding completion via the claim ledger |
+| `POST .../items/{item}/jobs` | Enqueue a durable workflow job and return `202` |
+| `GET /workflow-jobs?status=&limit=` | List durable jobs; `GET /workflow-jobs/{id}` for one |
+| `POST /workflow-jobs/{id}/retry` | Return a failed job to the queue with a fresh attempt budget |
+| `POST /workflow-jobs/{id}/cancel` | Cancel a queued or retry-scheduled job |
+| `GET /execution-logs?status=&actor=&limit=` | Recent workflow runs, newest first |
+| `GET /audit?limit=` | Actor-attributed execution rows |
+| `GET /ready` | Readiness probe including database connectivity |
+| `GET /metrics` | Prometheus-style request, job, and outbox metrics |
 | `GET /dashboard` | Server-rendered HTML monitoring dashboard |
+| `GET /ui/onboarding-requests[/{id}]` | Operator onboarding list/detail pages |
+| `GET /ui/notifications` | Operator pending/dead-letter outbox page |
+| `GET /ui/workflow-jobs` | Operator workflow queue page |
 
 ### Idempotency lease and fencing
 
@@ -206,8 +237,89 @@ curl -X POST http://127.0.0.1:8000/onboarding-requests -H 'Content-Type: applica
 
 - No credentials in code; `.env` git-ignored; no dotenv dependency.
 - All input untrusted: strict type validation, ticket IDs must be numeric before any lookup (blocks path traversal), dashboard HTML output escaped (`html.escape`).
-- **No authentication yet** — bind to localhost for development; do not expose publicly.
+- **Authentication is optional** — local development defaults to no auth; set `FLOWOPS_AUTH_REQUIRED=true` and configure a dev bearer token or Entra JWT before exposing the service. Offboarding completion is admin-only. Bind to localhost for demos.
 - Runtime artifacts (`data/*.json`, `data/tickets/`, `data/*.db`) git-ignored.
+
+### Offboarding completion ledger
+
+Offboarding is destructive, so it uses a dedicated admin-only ledger endpoint:
+`POST /offboarding-requests/{checklist_id}/steps/{step_key}/complete`.
+
+- The ledger row is **claimed before the side effect runs**, so concurrent
+  callers cannot execute the same step twice.
+- The first completion returns `201`; a replay returns `200` with
+  `X-Offboarding-Replayed: true`.
+- A fresh in-flight claim returns `409`; a claim older than the five-minute
+  recovery window can be taken over with a new owner token.
+- Unknown step keys return `422`; onboarding checklists, closed/abandoned
+  checklists, and unapproved gated steps return `409`; missing checklists `404`.
+- Executor failure removes the claim so the step can be retried.
+- Every path writes an actor-attributed execution log. The operator UI uses
+  the ledger endpoint for offboarding steps, and the dashboard shows
+  offboarding progress.
+
+## Operator UI
+
+The HTML UI is server-rendered with Jinja2 templates and local CSS/vanilla JS
+(no CDN, no build pipeline). `/` is the landing page; `/dashboard` shows run
+health, routing bars, pending deliveries, and dead letters. Operator pages live
+under `/ui/...`: onboarding list/detail with approve/complete/execute actions,
+the notification outbox with retry/requeue buttons, the durable job queue with
+job detail pages, and the actor audit trail. Lists support pagination/filter
+controls, the theme toggle stores a preference, and layouts respect
+`prefers-color-scheme`.
+
+## Durable workflow jobs
+
+Onboarding actions can run through a durable queue instead of only inside the
+HTTP request:
+
+- `POST /onboarding-requests/{id}/items/{item}/jobs` enqueues a job (202).
+- A worker claims due jobs with a unique owner token and a 60-second lease.
+- The worker heartbeats the lease while a slow action runs; a takeover stops
+  the stale owner from finalizing. Actions receive a stable
+  `idempotency_key` (`onboarding:{request_id}:{item_id}`), forwarded by the
+  Graph/Power Automate adapters where supported.
+- `python -m src.worker --once` processes one job; `python -m src.worker`
+  polls continuously. The Compose stack runs the worker as a separate service.
+- Failures retry with exponential backoff up to `max_attempts` (default 5),
+  then become `failed` (dead-letter). `POST /workflow-jobs/{id}/retry` and
+  `/cancel` are conditional operator transitions.
+- The item update, execution log, audit row, and job completion commit in one
+  transaction guarded by the lease token; a stale worker cannot finalize a
+  takeover. Automatic external side effects remain at-least-once.
+
+Outbox deliveries are also dispatched automatically: `python -m
+src.outbox_worker` claims pending rows with a lease, delivers once, applies
+backoff, and dead-letters at `FLOWOPS_NOTIFICATION_MAX_ATTEMPTS`. Manual
+retry/requeue endpoints remain available.
+
+## Authentication, roles, and audit
+
+`src/auth.py` supports optional Entra JWT or a local development bearer token.
+Set `FLOWOPS_AUTH_REQUIRED=true` to protect mutating routes; the default local
+mode is unauthenticated for beginner-friendly development. Operator routes
+require `automation.operator` or `automation.admin`. `POST /webhooks/intake`
+can additionally require `X-API-Key` via `FLOWOPS_WEBHOOK_API_KEY`.
+Authenticated actions write `actor_subject` to execution logs; `GET /audit` and
+`/execution-logs?actor=...` expose the trail, and `/ui/audit` renders it.
+Local development is admin-equivalent; protected deployments can distinguish
+operator and admin roles (requeue/cancel are admin-only). Missing auth
+configuration fails fast at startup. `FLOWOPS_RATE_LIMIT_PER_MINUTE` enables a
+small in-process limit for mutating requests; it is off by default and is not
+a multi-process production limiter. `GET /auth/me` returns the resolved actor.
+No real secrets or Microsoft tenant are included.
+
+## Readiness, metrics, and migrations
+
+- `GET /health` is liveness; `GET /ready` checks database connectivity.
+- `GET /metrics` exposes request counters plus workflow-job and outbox gauges.
+- Every response carries `X-Correlation-ID` (or echoes the caller's value).
+- Alembic owns the schema: `alembic upgrade head`. The Docker entrypoint runs
+  it before starting the app; the worker waits for a healthy app and skips
+  migrations. The baseline is safe for existing databases: it creates missing
+  tables and adds the additive fencing/scope/actor columns without dropping
+  data. Docker runs as the non-root `flowops` user.
 
 ## Running the tests
 
@@ -220,10 +332,17 @@ The default suite is fully offline: mocked HTTP and temporary SQLite databases. 
 
 ```bash
 FLOWOPS_TEST_POSTGRES_URL="postgresql+psycopg://flowops:flowops@127.0.0.1:5432/flowops" \
-  pytest -q tests/test_idempotency_postgres.py tests/test_outbox_postgres.py
+  pytest -q tests/test_idempotency_postgres.py tests/test_outbox_postgres.py \
+           tests/test_jobs_postgres.py tests/test_outbox_worker_postgres.py \
+           tests/test_offboarding_postgres.py
 ```
 
-The CI `postgres-idempotency` job supplies a `postgres:16` service, so the same idempotency, fencing, dead-letter, and requeue assertions run on every push and pull request.
+The CI `postgres-idempotency` job supplies a `postgres:16` service, runs
+`alembic upgrade head`, and exercises the same idempotency, fencing,
+dead-letter, requeue, and workflow-job assertions on every push and pull
+request. The matrix also checks the SQLite migration path and the full suite.
+`scripts/load_smoke.py` runs a small concurrent create/replay smoke test against
+a live local API (not a benchmark).
 
 ## Roadmap status
 
@@ -233,5 +352,12 @@ The CI `postgres-idempotency` job supplies a `postgres:16` service, so the same 
 - ✅ v1.0 foundation — Offline CI workflow and Docker Compose PostgreSQL demo
 - ✅ v1.0 reliability — Fenced idempotency ownership with stale-takeover protection on SQLite and PostgreSQL
 - ✅ v1.0 reliability — Onboarding idempotency and notification dead-letter/requeue workflow
+- ✅ v1.0 UI — Server-rendered operator console with onboarding, outbox, and job pages
+- ✅ v1.0 reliability — Durable leased workflow jobs with retries, dead-letter, and operator controls
+- ✅ v1.0 security — Optional bearer/Entra auth, roles, webhook API key, and actor audit trail
+- ✅ v1.0 operations — Readiness, metrics, correlation IDs, Alembic migrations, non-root container
+- ✅ v1.0 reliability — Worker heartbeats, adapter idempotency keys, automatic outbox dispatcher
+- ✅ v0.6.1 reliability — Admin-only, claim-first offboarding completion ledger
+- ✅ v1.0 experience — Audit trail, job detail, pagination/filters, admin/rate-limit hardening
 - ✅ v1.0 foundation — Guided portfolio demo and repeatable local smoke test
 - ⬜ v1.0 — Public deployment and screenshots

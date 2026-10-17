@@ -284,7 +284,7 @@ def test_onboarding_concurrent_same_key_returns_409(client, monkeypatch):
     call_lock = threading.Lock()
     original_create = api._create_onboarding_request
 
-    def pause_first(request, session):
+    def pause_first(request, session, actor_subject=None):
         nonlocal calls
         with call_lock:
             calls += 1
@@ -292,7 +292,7 @@ def test_onboarding_concurrent_same_key_returns_409(client, monkeypatch):
         if is_first:
             entered.set()
             assert release.wait(timeout=5), "test did not release the first request"
-        return original_create(request, session)
+        return original_create(request, session, actor_subject)
 
     monkeypatch.setattr(api, "_create_onboarding_request", pause_first)
     headers = {"Idempotency-Key": "onboarding-concurrent"}
@@ -325,7 +325,7 @@ def test_onboarding_stale_owner_cannot_finalize_after_takeover(client, monkeypat
     call_lock = threading.Lock()
     original_create = api._create_onboarding_request
 
-    def pause_first(request, session):
+    def pause_first(request, session, actor_subject=None):
         nonlocal calls
         with call_lock:
             calls += 1
@@ -333,7 +333,7 @@ def test_onboarding_stale_owner_cannot_finalize_after_takeover(client, monkeypat
         if is_first:
             a_entered.set()
             assert release_a.wait(timeout=5), "test did not release the stale owner"
-        return original_create(request, session)
+        return original_create(request, session, actor_subject)
 
     monkeypatch.setattr(api, "_create_onboarding_request", pause_first)
     key = "onboarding-takeover"
@@ -400,7 +400,7 @@ def test_onboarding_failure_cleans_up_only_its_own_reservation(client, monkeypat
     finally:
         session.close()
 
-    def fail_create(request, session):
+    def fail_create(request, session, actor_subject=None):
         raise RuntimeError("onboarding creation exploded")
 
     monkeypatch.setattr(api, "_create_onboarding_request", fail_create)

@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Job #{{ job.id }} — FlowOps{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <span class="eyebrow"><a href="/ui/workflow-jobs">Jobs</a> / #{{ job.id }}</span>
+    <h1>{{ job.label or job.job_type }}</h1>
+    <p class="muted">{{ job.job_type }} · {{ job.status }}</p>
+  </div>
+  <div class="actions">
+    {% if job.status == 'failed' %}
+    <button class="button" type="button" data-action-url="/workflow-jobs/{{ job.id }}/retry" data-method="POST" data-reload="true">Retry</button>
+    {% endif %}
+    {% if job.status in ('queued', 'retry_scheduled') %}
+    <button class="button ghost" type="button" data-action-url="/workflow-jobs/{{ job.id }}/cancel" data-method="POST" data-reload="true" data-confirm="Cancel this job?">Cancel</button>
+    {% endif %}
+  </div>
+</section>
+<section class="panel">
+  <h2>Job state</h2>
+  <dl class="details">
+    <dt>Status</dt><dd><span class="badge">{{ job.status }}</span></dd>
+    <dt>Attempts</dt><dd>{{ job.attempts }}/{{ job.max_attempts }}</dd>
+    <dt>Available</dt><dd>{{ job.available_at }}</dd>
+    <dt>Lease owner</dt><dd>{{ job.lease_owner_token or '—' }}</dd>
+    <dt>Lease expires</dt><dd>{{ job.lease_expires_at or '—' }}</dd>
+    <dt>Last error</dt><dd class="fail">{{ job.last_error or '—' }}</dd>
+    <dt>Created</dt><dd>{{ job.created_at }}</dd>
+    <dt>Completed</dt><dd>{{ job.completed_at or '—' }}</dd>
+  </dl>
+</section>
+<section class="split-grid">
+  <div class="panel"><h2>Payload</h2><pre class="code-block">{{ payload }}</pre></div>
+  <div class="panel"><h2>Result</h2><pre class="code-block">{{ result }}</pre></div>
+</section>
+{% endblock %}

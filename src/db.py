@@ -13,6 +13,7 @@ from typing import Optional
 from sqlalchemy import (
     Boolean,
     DateTime,
+    Index,
     Integer,
     String,
     Text,
@@ -72,6 +73,9 @@ class ExecutionLogRecord(Base):
     """One workflow execution step: what ran, whether it worked, how long."""
 
     __tablename__ = "execution_logs"
+    __table_args__ = (
+        Index("ix_execution_logs_status_created", "status", "created_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     run_id: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -80,6 +84,7 @@ class ExecutionLogRecord(Base):
     ticket_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    actor_subject: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
@@ -128,6 +133,9 @@ class WorkflowJobRecord(Base):
     """
 
     __tablename__ = "workflow_jobs"
+    __table_args__ = (
+        Index("ix_workflow_jobs_status_available", "status", "available_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     job_type: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -174,6 +182,9 @@ class NotificationOutboxRecord(Base):
     """
 
     __tablename__ = "notification_outbox"
+    __table_args__ = (
+        Index("ix_notification_outbox_status_next", "status", "next_attempt_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     url: Mapped[str] = mapped_column(String(500), nullable=False)
@@ -184,6 +195,13 @@ class NotificationOutboxRecord(Base):
     )  # pending | delivered | failed
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    lease_owner_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    next_attempt_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=utcnow
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
@@ -204,7 +222,9 @@ class OnboardingRequestRecord(Base):
     department: Mapped[str] = mapped_column(String(120), nullable=False)
     requester_id: Mapped[int] = mapped_column(Integer, nullable=False)
     start_date: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="in_progress")
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="in_progress", index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
@@ -260,6 +280,12 @@ class OffboardingCompletionRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     checklist_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     step_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    # NULL means a legacy completed row (the table predates status tracking).
+    status: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    owner_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     completed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
@@ -364,6 +390,44 @@ def _ensure_idempotency_resource_type() -> None:
         )
 
 
+def _ensure_execution_log_actor() -> None:
+    """Add actor attribution to execution logs created before it existed."""
+    inspector = inspect(engine)
+    if "execution_logs" not in inspector.get_table_names():
+        return
+    columns = {
+        column["name"] for column in inspector.get_columns("execution_logs")
+    }
+    if "actor_subject" in columns:
+        return
+    with engine.begin() as connection:
+        connection.execute(
+            text("ALTER TABLE execution_logs ADD COLUMN actor_subject VARCHAR(256)")
+        )
+
+
+def _ensure_outbox_lease_columns() -> None:
+    """Add dispatcher lease columns to databases created before they existed."""
+    inspector = inspect(engine)
+    if "notification_outbox" not in inspector.get_table_names():
+        return
+    columns = {
+        column["name"]
+        for column in inspector.get_columns("notification_outbox")
+    }
+    additions = {
+        "lease_owner_token": "VARCHAR(64)",
+        "lease_expires_at": "TIMESTAMP WITH TIME ZONE" if engine.dialect.name == "postgresql" else "DATETIME",
+        "next_attempt_at": "TIMESTAMP WITH TIME ZONE" if engine.dialect.name == "postgresql" else "DATETIME",
+    }
+    with engine.begin() as connection:
+        for name, ddl_type in additions.items():
+            if name not in columns:
+                connection.execute(
+                    text(f"ALTER TABLE notification_outbox ADD COLUMN {name} {ddl_type}")
+                )
+
+
 def _ensure_tables() -> None:
     """Create missing tables once and apply additive compatibility migrations."""
     global _tables_ready
@@ -377,6 +441,8 @@ def _ensure_tables() -> None:
         _add_missing_columns()
         _ensure_idempotency_owner_token()
         _ensure_idempotency_resource_type()
+        _ensure_execution_log_actor()
+        _ensure_outbox_lease_columns()
         _tables_ready = True
 
 
@@ -403,6 +469,7 @@ def log_execution(
     ticket_id: Optional[str] = None,
     duration_ms: int = 0,
     detail: Optional[str] = None,
+    actor_subject: Optional[str] = None,
 ) -> None:
     """Append an execution-log row for the current run."""
     session.add(
@@ -413,5 +480,6 @@ def log_execution(
             ticket_id=ticket_id,
             duration_ms=duration_ms,
             detail=detail,
+            actor_subject=actor_subject,
         )
     )
