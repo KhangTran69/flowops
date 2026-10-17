@@ -48,7 +48,7 @@ flowops/
 │   ├── routing.py            # pure classification/priority/queue rules
 │   ├── notify.py             # webhook delivery with exponential-backoff retries
 │   └── onboarding.py         # checklist templates
-├── tests/                    # 92 offline tests (test_*.py)
+├── tests/                    # 101 offline tests (test_*.py)
 ├── data/                     # runtime artifacts (git-ignored): flowops.db, ticket.json
 ├── .github/workflows/ci.yml  # GitHub Actions: install dependencies and run pytest
 ├── Dockerfile                # Small API image
@@ -121,11 +121,12 @@ services without deleting the stored PostgreSQL data. Use
 | Method & path | Purpose |
 |---|---|
 | `GET /health` | Liveness probe |
-| `POST /tickets` | Validate, route, store a ticket. `201` new / `200` update. Supports `Idempotency-Key`: same-payload replays return the stored response with `Idempotency-Replayed: true`; reusing a key with a different payload returns `409` |
+| `POST /tickets` | Validate, route, store a ticket. `201` new / `200` update. Supports `Idempotency-Key`: same-payload replays return the stored response with `Idempotency-Replayed: true`; changed payloads return `409`; active requests return `409`, while abandoned processing reservations can be reclaimed after a five-minute lease |
 | `GET /tickets`, `GET /tickets/{id}` | Read tickets (sorted by ID; unknown/non-numeric ID → 404) |
 | `POST /webhooks/intake` | n8n-friendly intake: single ticket or bulk list; always `200` on success, `422` rejects the whole batch if any item is invalid |
 | `POST /onboarding-requests` | Create onboarding/offboarding request → generates its checklist |
 | `GET /onboarding-requests[/{id}]` | Read requests with checklists |
+| `GET /onboarding-requests/{id}/status` | Lightweight status summary (total steps, completed, pending approval) for polling |
 | `POST .../items/{item}/approve` | Approve a step that requires sign-off (`409` if not approvable in current state) |
 | `POST .../items/{item}/complete` | Complete a step (`409` unless approved-if-required). When all steps complete, the request flips to `completed` |
 | `GET /execution-logs?status=&limit=` | Recent workflow runs, newest first |
@@ -160,7 +161,7 @@ curl -X POST http://127.0.0.1:8000/onboarding-requests -H 'Content-Type: applica
 - **Intake validation** — strict Pydantic types (`StrictInt`/`StrictStr`/`StrictBool`, positive IDs, non-blank titles) → `422` with field details; wrong top-level structure rejected.
 - **HTTP/network (CLI & webhooks)** — `raise_for_status()`, 10s CLI timeout, webhook deliveries retried 3× with exponential backoff (0.5s → 1s) and reported to the execution log instead of raising, so a flaky webhook never fails intake.
 - **Workflow state** — invalid checklist transitions return `409` with a clear reason (e.g. completing an unapproved gated step).
-- **Idempotency** — same-payload replays return the original response without re-execution; using the key with a different payload returns `409`; keys over 128 chars → `422`.
+- **Idempotency** — keys are atomically reserved before processing. Concurrent duplicates receive `409` while the first request runs; completed same-payload retries replay the original response, while changed payloads return `409`. Processing reservations older than five minutes can be atomically reclaimed after a process crash; keep normal ticket processing comfortably below that lease. Keys over 128 chars → `422`.
 - **Onboarding dates** — `start_date` must be both ISO-formatted and a real calendar date.
 - `main()` (CLI) catches specific exception families only — no blanket `except`, no silent failures.
 
@@ -174,7 +175,7 @@ curl -X POST http://127.0.0.1:8000/onboarding-requests -H 'Content-Type: applica
 ## Running the tests
 
 ```bash
-pytest    # 92 tests, fully offline: mocked HTTP, SQLite in tmp dirs
+pytest    # 101 tests, fully offline: mocked HTTP, SQLite in tmp dirs
 python -m compileall -q src tests
 ```
 

@@ -145,3 +145,57 @@ def test_onboarding_actions_logged(client):
     actions = [log["action"] for log in client.get("/execution-logs").json()]
     assert "onboarding.request.created" in actions
     assert any(action.startswith("onboarding.item.") for action in actions)
+
+
+def test_get_onboarding_request_status_summary(client):
+    """Initial request status reflects pending approval and zero completion."""
+    request_id = _create(client).json()["id"]
+    response = client.get(f"/onboarding-requests/{request_id}/status")
+    assert response.status_code == 200
+    summary = response.json()
+    assert summary["id"] == request_id
+    assert summary["request_type"] == "onboarding"
+    assert summary["employee_name"] == "Jane Doe"
+    assert summary["status"] == "in_progress"
+    assert summary["total_steps"] == len(ONBOARDING_STEPS)
+    assert summary["completed_steps"] == 0
+    # Onboarding has 2 steps requiring approval (account & licenses)
+    assert summary["pending_approval_steps"] == 2
+    assert summary["percent_complete"] == 0
+
+
+def test_get_onboarding_request_status_progresses_to_completion(client):
+    """Status summary updates as steps are approved and completed."""
+    request_id = _create(client).json()["id"]
+    checklist = client.get(f"/onboarding-requests/{request_id}").json()["checklist"]
+
+    # Approve one item requiring approval
+    gated_item = next(item for item in checklist if item["requires_approval"])
+    client.post(f"/onboarding-requests/{request_id}/items/{gated_item['id']}/approve")
+    summary = client.get(f"/onboarding-requests/{request_id}/status").json()
+    assert summary["pending_approval_steps"] == 1
+    assert summary["completed_steps"] == 0
+
+    # Complete that item
+    client.post(f"/onboarding-requests/{request_id}/items/{gated_item['id']}/complete")
+    summary = client.get(f"/onboarding-requests/{request_id}/status").json()
+    assert summary["completed_steps"] == 1
+    assert summary["percent_complete"] == 25
+
+    # Complete the rest
+    for item in checklist:
+        if item["id"] == gated_item["id"]:
+            continue
+        if item["requires_approval"]:
+            client.post(f"/onboarding-requests/{request_id}/items/{item['id']}/approve")
+        client.post(f"/onboarding-requests/{request_id}/items/{item['id']}/complete")
+
+    final = client.get(f"/onboarding-requests/{request_id}/status").json()
+    assert final["status"] == "completed"
+    assert final["completed_steps"] == len(ONBOARDING_STEPS)
+    assert final["pending_approval_steps"] == 0
+    assert final["percent_complete"] == 100
+
+
+def test_get_onboarding_request_status_unknown_returns_404(client):
+    assert client.get("/onboarding-requests/999/status").status_code == 404

@@ -12,21 +12,64 @@ import os
 import time
 import uuid
 from collections import Counter
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi import status as http_status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, StrictBool, StrictInt, StrictStr, field_validator
-from sqlalchemy import select
+from sqlalchemy import and_, select
+from sqlalchemy.dialects.postgresql import insert as postgres_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from src import db
+from src.actions import (
+    ActionAdapter,
+    adapter_from_environment,
+    SimulatedMicrosoftAdapter,
+    action_for_step,
+)
 from src.notify import deliver_webhook
 from src.onboarding import checklist_for
 from src.routing import route_ticket
 from src.ticket_processor import normalize_ticket
+
+ACTION_ADAPTER: ActionAdapter = adapter_from_environment()
+DEFAULT_ACTION_ATTEMPTS = 3
+IDEMPOTENCY_PROCESSING_TIMEOUT = timedelta(minutes=5)
+
+
+def _action_attempts(action: str) -> int:
+    """Read a bounded per-action retry count from JSON configuration."""
+    try:
+        configured = json.loads(os.environ.get("FLOWOPS_ACTION_RETRIES", "{}"))
+        return max(1, min(10, int(configured.get(action, DEFAULT_ACTION_ATTEMPTS))))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return DEFAULT_ACTION_ATTEMPTS
+
+
+def _notify_action_failure(
+    action: str, context: dict[str, Any], attempts: int, error: str, session: Session
+) -> None:
+    """Notify an optional failure webhook without raising."""
+    url = os.environ.get("FLOWOPS_ACTION_FAILURE_WEBHOOK_URL")
+    if not url:
+        return
+    delivery = deliver_webhook(
+        url,
+        {"event": "onboarding.action.failed", "action": action, "context": context, "attempts": attempts, "error": error},
+    )
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="notification.action_failure",
+        status="success" if delivery.success else "failure",
+        duration_ms=0,
+        detail=f"attempts={delivery.attempts}; {delivery.last_error or 'delivered'}",
+    )
+
 
 app = FastAPI(
     title="FlowOps",
@@ -41,6 +84,94 @@ app = FastAPI(
 
 def _new_run_id() -> str:
     return uuid.uuid4().hex[:12]
+
+
+def _claim_idempotency_key(
+    session: Session, key: str, ticket_id: str, request_hash: str
+) -> bool:
+    """Atomically claim a key or take over an expired processing reservation."""
+    table = db.IdempotencyRecord.__table__
+    now = db.utcnow()
+    stale_before = now - IDEMPOTENCY_PROCESSING_TIMEOUT
+    values = {
+        "key": key,
+        "ticket_id": ticket_id,
+        "response_json": json.dumps(
+            {"request_hash": request_hash, "state": "processing"},
+            separators=(",", ":"),
+        ),
+    }
+    dialect = session.get_bind().dialect.name
+    if dialect == "sqlite":
+        statement = sqlite_insert(table).values(**values).on_conflict_do_update(
+            index_elements=[table.c.key],
+            set_={
+                "ticket_id": ticket_id,
+                "response_json": values["response_json"],
+                "created_at": now,
+            },
+            where=and_(
+                table.c.created_at < stale_before,
+                table.c.response_json.like('%"state":"processing"%'),
+            ),
+        )
+    elif dialect == "postgresql":
+        statement = postgres_insert(table).values(**values).on_conflict_do_update(
+            index_elements=[table.c.key],
+            set_={
+                "ticket_id": ticket_id,
+                "response_json": values["response_json"],
+                "created_at": now,
+            },
+            where=and_(
+                table.c.created_at < stale_before,
+                table.c.response_json.like('%"state":"processing"%'),
+            ),
+        )
+    else:
+        raise RuntimeError(f"Idempotency reservations do not support database dialect {dialect!r}.")
+
+    inserted = session.execute(statement).rowcount == 1
+    session.commit()
+    return inserted
+
+
+def _reservation_is_stale(created_at: datetime) -> bool:
+    """Return whether a processing reservation has exceeded its recovery lease."""
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    return created_at < db.utcnow() - IDEMPOTENCY_PROCESSING_TIMEOUT
+
+
+def _replay_or_reject(
+    stored: db.IdempotencyRecord,
+    request_hash: str,
+    response: Response,
+    session: Session,
+) -> "Ticket":
+    """Replay a completed matching key, or return the appropriate 409."""
+    stored_payload = json.loads(stored.response_json)
+    if stored_payload.get("request_hash") != request_hash:
+        raise HTTPException(
+            status_code=409,
+            detail="Idempotency-Key was already used with a different request.",
+        )
+    if stored_payload.get("state") == "processing":
+        raise HTTPException(
+            status_code=409,
+            detail="A request with this Idempotency-Key is still processing.",
+        )
+    response.status_code = http_status.HTTP_200_OK
+    response.headers["Idempotency-Replayed"] = "true"
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="ticket.idempotent_replay",
+        status="success",
+        ticket_id=stored.ticket_id,
+        detail="replayed stored response without re-executing",
+    )
+    return Ticket.model_validate(stored_payload["ticket"])
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +278,17 @@ class OnboardingRequestOut(BaseModel):
     checklist: list[ChecklistItemOut]
 
 
+class OnboardingStatusSummaryOut(BaseModel):
+    id: int
+    request_type: str
+    employee_name: str
+    status: str
+    total_steps: int
+    completed_steps: int
+    pending_approval_steps: int
+    percent_complete: int
+
+
 # ---------------------------------------------------------------------------
 # Ticket pipeline
 
@@ -240,7 +382,7 @@ LANDING_PAGE = """<!doctype html>
     <li>POST /tickets &nbsp;(supports Idempotency-Key)</li>
     <li>GET /tickets &middot; GET /tickets/{ticket_id}</li>
     <li>POST /webhooks/intake &nbsp;(single or bulk, for n8n)</li>
-    <li>POST / GET /onboarding-requests &middot; approve/complete items</li>
+    <li>POST / GET /onboarding-requests[/{id}/status] &middot; approve/complete items</li>
     <li>GET /execution-logs &middot; GET /dashboard</li>
   </ul>
   <p><a href="/docs">Interactive API docs</a> &middot; <a href="/dashboard">Monitoring dashboard</a></p>
@@ -290,38 +432,64 @@ def create_ticket(
         stored = session.get(db.IdempotencyRecord, idempotency_key)
         if stored:
             stored_payload = json.loads(stored.response_json)
-            if stored_payload.get("request_hash") != request_hash:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Idempotency-Key was already used with a different request.",
+            if stored_payload.get("state") == "processing":
+                if stored_payload.get("request_hash") != request_hash:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Idempotency-Key was already used with a different request.",
+                    )
+                if not _reservation_is_stale(stored.created_at):
+                    return _replay_or_reject(stored, request_hash, response, session)
+                claimed = _claim_idempotency_key(
+                    session, idempotency_key, str(request.id), request_hash
                 )
-            response.status_code = http_status.HTTP_200_OK
-            response.headers["Idempotency-Replayed"] = "true"
-            db.log_execution(
-                session,
-                run_id=_new_run_id(),
-                action="ticket.idempotent_replay",
-                status="success",
-                ticket_id=stored.ticket_id,
-                detail="replayed stored response without re-executing",
+            else:
+                return _replay_or_reject(stored, request_hash, response, session)
+        else:
+            claimed = _claim_idempotency_key(
+                session, idempotency_key, str(request.id), request_hash
             )
-            return Ticket.model_validate(stored_payload["ticket"])
+        if not claimed:
+            session.expire_all()
+            stored = session.get(db.IdempotencyRecord, idempotency_key)
+            if stored is None:
+                raise HTTPException(409, "Unable to claim this Idempotency-Key; retry the request.")
+            return _replay_or_reject(stored, request_hash, response, session)
 
-    if session.get(db.TicketRecord, str(request.id)) is not None:
-        response.status_code = http_status.HTTP_200_OK
-    result = _process_intake(request, session)
-    if idempotency_key:
-        session.add(
-            db.IdempotencyRecord(
-                key=idempotency_key,
-                ticket_id=result.ticket_id,
-                response_json=json.dumps(
-                    {"request_hash": request_hash, "ticket": result.model_dump()},
-                    separators=(",", ":"),
-                ),
+    try:
+        if session.get(db.TicketRecord, str(request.id)) is not None:
+            response.status_code = http_status.HTTP_200_OK
+        result = _process_intake(request, session)
+        if idempotency_key:
+            stored = session.get(db.IdempotencyRecord, idempotency_key)
+            if stored is None:
+                raise RuntimeError("Idempotency reservation disappeared during ticket processing.")
+            stored.ticket_id = result.ticket_id
+            stored.response_json = json.dumps(
+                {
+                    "request_hash": request_hash,
+                    "state": "completed",
+                    "ticket": result.model_dump(),
+                },
+                separators=(",", ":"),
             )
-        )
-    return result
+        return result
+    except Exception:
+        if idempotency_key:
+            session.rollback()
+            reservation = session.get(db.IdempotencyRecord, idempotency_key)
+            if reservation is not None:
+                try:
+                    reservation_payload = json.loads(reservation.response_json)
+                except json.JSONDecodeError:
+                    reservation_payload = {}
+                if (
+                    reservation_payload.get("request_hash") == request_hash
+                    and reservation_payload.get("state") == "processing"
+                ):
+                    session.delete(reservation)
+                    session.commit()
+        raise
 
 
 @app.get("/tickets", response_model=list[Ticket])
@@ -454,6 +622,33 @@ def get_onboarding_request(
     return _request_out(record, items)
 
 
+@app.get(
+    "/onboarding-requests/{request_id}/status",
+    response_model=OnboardingStatusSummaryOut,
+)
+def get_onboarding_request_status(
+    request_id: int, session: Session = Depends(db.get_session)
+) -> OnboardingStatusSummaryOut:
+    """Return a lightweight summary of request progress for automation polling."""
+    record, items = _load_request(session, request_id)
+    total = len(items)
+    completed = sum(1 for item in items if item.status == "completed")
+    pending_approval = sum(
+        1 for item in items if item.status == "pending" and item.requires_approval
+    )
+    percent = round((completed / total) * 100) if total else 0
+    return OnboardingStatusSummaryOut(
+        id=record.id,
+        request_type=record.request_type,
+        employee_name=record.employee_name,
+        status=record.status,
+        total_steps=total,
+        completed_steps=completed,
+        pending_approval_steps=pending_approval,
+        percent_complete=percent,
+    )
+
+
 def _get_item(
     session: Session, record: db.OnboardingRequestRecord, item_id: int
 ) -> db.ChecklistItemRecord:
@@ -512,6 +707,86 @@ def _transition_item(
     _, items = _load_request(session, record.id)
     return _request_out(record, items)
 
+
+
+
+def _execute_item(
+    session: Session, request_id: int, item_id: int
+) -> OnboardingRequestOut:
+    """Run one approved checklist action with bounded retries."""
+    record, _ = _load_request(session, request_id)
+    item = _get_item(session, record, item_id)
+    required_status = "approved" if item.requires_approval else "pending"
+    if item.status != required_status:
+        raise HTTPException(
+            409,
+            f"Item must be '{required_status}' before execution "
+            f"(current status: '{item.status}').",
+        )
+
+    action = action_for_step(item.step)
+    context = {
+        "request_id": record.id,
+        "request_type": record.request_type,
+        "employee_name": record.employee_name,
+        "employee_email": record.employee_email,
+        "department": record.department,
+    }
+    started = time.perf_counter()
+    last_error = ""
+    attempts_limit = _action_attempts(action)
+    for attempt in range(1, attempts_limit + 1):
+        try:
+            result = ACTION_ADAPTER.execute(action, context)
+            item.status = "completed"
+            session.flush()
+            db.log_execution(
+                session,
+                run_id=_new_run_id(),
+                action=f"onboarding.action.{action}",
+                status="success",
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                detail=f"attempts={attempt}; {result.detail}",
+            )
+            _, items = _load_request(session, record.id)
+            if all(i.status == "completed" for i in items):
+                record.status = "completed"
+                db.log_execution(
+                    session,
+                    run_id=_new_run_id(),
+                    action="onboarding.request.completed",
+                    status="success",
+                    duration_ms=0,
+                    detail=f"all checklist steps done for request #{record.id}",
+                )
+            _, items = _load_request(session, record.id)
+            return _request_out(record, items)
+        except Exception as error:  # adapter failures must be logged and retried
+            last_error = str(error)
+
+    _notify_action_failure(action, context, attempts_limit, last_error, session)
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action=f"onboarding.action.{action}",
+        status="failure",
+        duration_ms=int((time.perf_counter() - started) * 1000),
+        detail=f"attempts={attempts_limit}; {last_error}",
+    )
+    session.flush()
+    session.commit()
+    raise HTTPException(
+        502,
+        f"Action '{action}' failed after {attempts_limit} attempts.",
+    )
+
+
+@app.post("/onboarding-requests/{request_id}/items/{item_id}/execute")
+def execute_item(
+    request_id: int, item_id: int, session: Session = Depends(db.get_session)
+) -> OnboardingRequestOut:
+    """Execute a checklist action through the configured Microsoft adapter."""
+    return _execute_item(session, request_id, item_id)
 
 @app.post("/onboarding-requests/{request_id}/items/{item_id}/approve")
 def approve_item(
