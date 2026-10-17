@@ -23,7 +23,8 @@ FlowOps is an IT workflow automation platform. It receives support tickets and o
 | v0.4 Routing + notifications + webhooks | ✅ | Rule-based category/priority/queue routing, outbound webhook with retries, n8n-style bulk intake |
 | v0.5 Onboarding workflows + idempotency | ✅ | Onboarding/offboarding checklists with approval gates, `Idempotency-Key` support, delivery retries |
 | v1.0-preview Monitoring dashboard | ✅ | `/dashboard`: run success/failure, durations, queue/priority breakdowns, est. time saved |
-| v1.0 CI + Docker | ✅ | GitHub Actions runs pytest plus a Docker Compose API + PostgreSQL smoke test |
+| v1.0 Reliability: fenced idempotency | ✅ | Per-claim owner tokens prevent a stale request from finalizing or deleting a takeover reservation |
+| v1.0 CI + Docker | ✅ | GitHub Actions runs pytest, a Docker Compose API + PostgreSQL smoke test, and PostgreSQL fencing tests |
 | v0.6 Microsoft 365 actions | ⬜ | Real account creation via Power Automate / Microsoft Graph / PowerShell (needs credentials) |
 | v0.7 AI support agent | ⬜ | MCP/Claude assistance with human approval gates (needs AI credentials) |
 
@@ -48,9 +49,9 @@ flowops/
 │   ├── routing.py            # pure classification/priority/queue rules
 │   ├── notify.py             # webhook delivery with exponential-backoff retries
 │   └── onboarding.py         # checklist templates
-├── tests/                    # 98 offline tests (test_*.py)
+├── tests/                    # offline test suite (test_*.py); PostgreSQL fencing tests opt in via env
 ├── data/                     # runtime artifacts (git-ignored): flowops.db, ticket.json
-├── .github/workflows/ci.yml  # GitHub Actions: install dependencies and run pytest
+├── .github/workflows/ci.yml  # GitHub Actions: SQLite matrix, PostgreSQL smoke + fencing tests
 ├── Dockerfile                # Small API image
 ├── docker-compose.yml        # API + PostgreSQL demo stack
 ├── docs/portfolio-demo.md    # Guided interview/portfolio walkthrough
@@ -101,7 +102,8 @@ Without this variable the app uses `sqlite:///data/flowops.db`. No dotenv depend
 The included compose file runs the API against PostgreSQL and exposes it at
 `http://127.0.0.1:8000`. Docker must be installed locally for this command.
 The same build and smoke test also run in the GitHub Actions
-`docker-postgres` job.
+`docker-postgres` job, and the `postgres-idempotency` job runs the fencing
+tests against a PostgreSQL service.
 
 ```bash
 docker compose up --build
@@ -121,17 +123,33 @@ services without deleting the stored PostgreSQL data. Use
 | Method & path | Purpose |
 |---|---|
 | `GET /health` | Liveness probe |
-| `POST /tickets` | Validate, route, store a ticket. `201` new / `200` update. Supports `Idempotency-Key`: same-payload replays return the stored response with `Idempotency-Replayed: true`; reusing a key with a different payload returns `409` |
+| `POST /tickets` | Validate, route, store a ticket. `201` new / `200` update. Supports `Idempotency-Key`: same-payload replays return the stored response with `Idempotency-Replayed: true`; changed payloads return `409`; active requests return `409`, while abandoned processing reservations can be reclaimed after a five-minute lease. Each claim carries an owner token, so a stale owner that was taken over cannot finalize or delete the new reservation and receives a retryable `409` |
 | `GET /tickets`, `GET /tickets/{id}` | Read tickets (sorted by ID; unknown/non-numeric ID → 404) |
 | `POST /webhooks/intake` | n8n-friendly intake: single ticket or bulk list; always `200` on success, `422` rejects the whole batch if any item is invalid |
 | `POST /onboarding-requests` | Create onboarding/offboarding request → generates its checklist |
 | `GET /onboarding-requests[/{id}]` | Read requests with checklists |
+| `GET /onboarding-requests/{id}/status` | Lightweight status summary (total steps, completed, pending approval) for polling |
 | `POST .../items/{item}/approve` | Approve a step that requires sign-off (`409` if not approvable in current state) |
 | `POST .../items/{item}/complete` | Complete a step (`409` unless approved-if-required). When all steps complete, the request flips to `completed` |
-| `GET /notifications/pending` | Webhook deliveries that failed all retries and await a manual retry |
-| `POST /notifications/retry?limit=` | Retry each pending delivery once (oldest first); successes become `delivered`, failures stay `pending` |
 | `GET /execution-logs?status=&limit=` | Recent workflow runs, newest first |
 | `GET /dashboard` | Server-rendered HTML monitoring dashboard |
+
+### Idempotency lease and fencing
+
+`POST /tickets` with an `Idempotency-Key` follows a small reservation protocol:
+
+1. The key is claimed atomically before any ticket work. The claim stores a unique owner token, a `processing` marker, and the lease start time.
+2. A completed matching call replays its stored response; a changed payload returns `409`; a live processing reservation returns `409`.
+3. If the owner crashes or takes longer than five minutes, a matching retry can take over the row. The takeover atomically rotates the owner token and refreshes the lease timestamp.
+4. Completion is a conditional update (`key = ... AND owner_token = ... AND state = processing`) in the same transaction as the ticket and execution-log writes. If ownership changed, all of those writes roll back and the request gets a retryable `409`; the new owner's reservation and response are untouched.
+5. Error cleanup uses the same conditional delete, so a stale owner can remove only its own reservation.
+6. Completed records are never reclaimed, regardless of age.
+
+A healthy slow request keeps its token and may still finish after five minutes. The lease only enables recovery: once another request rotates the token, the old request is fenced. The lease is not a hard request timeout.
+
+SQLite and PostgreSQL share the conditional update/delete logic. The claim uses each dialect's upsert; because `psycopg` reports `rowcount = -1` for `INSERT ... ON CONFLICT DO UPDATE`, PostgreSQL confirms ownership with `RETURNING owner_token`, while SQLite uses the affected row count.
+
+Durable ticket, execution-log, and notification-outbox writes are fenced. Outbound webhook *delivery* is not transactional: a stale owner could have already sent a notification before losing its lease, even though its database writes are rolled back.
 
 ## How routing works
 
@@ -160,9 +178,9 @@ curl -X POST http://127.0.0.1:8000/onboarding-requests -H 'Content-Type: applica
 ## Error handling
 
 - **Intake validation** — strict Pydantic types (`StrictInt`/`StrictStr`/`StrictBool`, positive IDs, non-blank titles) → `422` with field details; wrong top-level structure rejected.
-- **HTTP/network (CLI & webhooks)** — `raise_for_status()`, 10s CLI timeout, webhook deliveries retried 3× with exponential backoff (0.5s → 1s) and reported to the execution log instead of raising, so a flaky webhook never fails intake. A delivery that still fails is stored in the notification outbox (`GET /notifications/pending`) and can be retried manually (`POST /notifications/retry`); the dashboard shows pending retries.
+- **HTTP/network (CLI & webhooks)** — `raise_for_status()`, 10s CLI timeout, webhook deliveries retried 3× with exponential backoff (0.5s → 1s) and reported to the execution log instead of raising, so a flaky webhook never fails intake.
 - **Workflow state** — invalid checklist transitions return `409` with a clear reason (e.g. completing an unapproved gated step).
-- **Idempotency** — same-payload replays return the original response without re-execution; using the key with a different payload returns `409`; keys over 128 chars → `422`.
+- **Idempotency** — keys are atomically reserved before processing with a unique owner token. Concurrent duplicates receive `409` while the first request runs; completed same-payload retries replay the original response, while changed payloads return `409`. Processing reservations older than five minutes can be taken over atomically, which rotates the token and refreshes the lease. Completion and error cleanup are conditional on still owning that token: a stale owner cannot overwrite or delete the new reservation, its ticket and execution-log writes roll back, and it receives a retryable `409`. Completed records are never reclaimed. Keep normal ticket processing comfortably below the five-minute lease. Keys over 128 chars → `422`.
 - **Onboarding dates** — `start_date` must be both ISO-formatted and a real calendar date.
 - `main()` (CLI) catches specific exception families only — no blanket `except`, no silent failures.
 
@@ -176,9 +194,18 @@ curl -X POST http://127.0.0.1:8000/onboarding-requests -H 'Content-Type: applica
 ## Running the tests
 
 ```bash
-pytest    # 98 tests, fully offline: mocked HTTP, SQLite in tmp dirs
+pytest    # 114 passed, 3 skipped locally; the skips are PostgreSQL-only tests
 python -m compileall -q src tests
 ```
+
+The default suite is fully offline: mocked HTTP and temporary SQLite databases. The PostgreSQL fencing tests run when `FLOWOPS_TEST_POSTGRES_URL` points at a disposable database:
+
+```bash
+FLOWOPS_TEST_POSTGRES_URL="postgresql+psycopg://flowops:flowops@127.0.0.1:5432/flowops" \
+  pytest -q tests/test_idempotency_postgres.py
+```
+
+The CI `postgres-idempotency` job supplies a `postgres:16` service, so the same PostgreSQL take-over and conditional-update assertions run on every push and pull request.
 
 ## Roadmap status
 
@@ -186,5 +213,6 @@ python -m compileall -q src tests
 - ⬜ v0.6 — Power Automate / Microsoft Graph / PowerShell behind the onboarding checklists (needs real credentials)
 - ⬜ v0.7 — Controlled MCP and Claude-powered ticket assistance with human approval gates (needs AI credentials)
 - ✅ v1.0 foundation — Offline CI workflow and Docker Compose PostgreSQL demo
+- ✅ v1.0 reliability — Fenced idempotency ownership with stale-takeover protection on SQLite and PostgreSQL
 - ✅ v1.0 foundation — Guided portfolio demo and repeatable local smoke test
 - ⬜ v1.0 — Public deployment and screenshots
