@@ -287,7 +287,7 @@ def test_execution_logs_filter_by_status(client):
 def test_notification_failure_is_logged_not_raised(client, monkeypatch):
     calls = []
 
-    def fake_deliver(url, payload):
+    def fake_deliver(url, payload, **kwargs):
         calls.append(url)
         from src.notify import DeliveryResult
 
@@ -300,6 +300,123 @@ def test_notification_failure_is_logged_not_raised(client, monkeypatch):
     assert calls == ["https://hooks.example/t"]
     failures = client.get("/execution-logs", params={"status": "failure"}).json()
     assert any(log["action"] == "notification.webhook" for log in failures)
+
+
+# --- Notification outbox: failed webhooks stay visible and retryable ---
+
+
+class FakeDelivery:
+    """Scripted deliver_webhook replacement; records every call (offline)."""
+
+    def __init__(self, results):
+        self.results = list(results)
+        self.calls = []
+
+    def __call__(self, url, payload, **kwargs):
+        from src.notify import DeliveryResult
+
+        self.calls.append((url, payload))
+        if not self.results:  # fall back to the last scripted outcome
+            result = self._last
+        else:
+            result = self.results.pop(0)
+        self._last = result
+        return DeliveryResult(**result)
+
+
+def _failing_delivery(attempts=3, error="boom"):
+    return {"success": False, "attempts": attempts, "last_error": error}
+
+
+def _succeeding_delivery(attempts=1):
+    return {"success": True, "attempts": attempts, "last_error": None}
+
+
+def test_failed_webhook_is_stored_in_outbox(client, monkeypatch):
+    fake = FakeDelivery([_failing_delivery()])
+    monkeypatch.setattr(api, "deliver_webhook", fake)
+    monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
+    assert client.post("/tickets", json=VALID_REQUEST).status_code == 201
+
+    pending = client.get("/notifications/pending").json()
+    assert len(pending) == 1
+    entry = pending[0]
+    assert entry["status"] == "pending"
+    assert entry["ticket_id"] == "42"
+    assert entry["attempts"] == 3
+    assert entry["last_error"] == "boom"
+
+
+def test_successful_webhook_does_not_touch_outbox(client, monkeypatch):
+    fake = FakeDelivery([_succeeding_delivery()])
+    monkeypatch.setattr(api, "deliver_webhook", fake)
+    monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
+    assert client.post("/tickets", json=VALID_REQUEST).status_code == 201
+    assert client.get("/notifications/pending").json() == []
+
+
+def test_retry_endpoint_redelivers_pending_and_marks_delivered(client, monkeypatch):
+    fake = FakeDelivery([_failing_delivery(), _succeeding_delivery(attempts=1)])
+    monkeypatch.setattr(api, "deliver_webhook", fake)
+    monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
+    client.post("/tickets", json=VALID_REQUEST)
+
+    retried = client.post("/notifications/retry").json()
+    assert [entry["status"] for entry in retried] == ["delivered"]
+    assert retried[0]["attempts"] == 4  # 3 original + 1 retry attempt
+    assert retried[0]["last_error"] is None
+    # The retry re-sent the same payload that originally failed.
+    assert fake.calls[-1][1] == {
+        "event": "ticket.created",
+        "ticket": {
+            "ticket_id": "42", "requester_id": 7, "title": "Laptop will not start",
+            "status": "open", "priority": "normal", "category": "hardware",
+            "queue": "it-hardware",
+        },
+    }
+    assert client.get("/notifications/pending").json() == []
+    logs = client.get("/execution-logs").json()
+    assert any(
+        log["action"] == "notification.retry" and log["status"] == "success"
+        for log in logs
+    )
+
+
+def test_retry_keeps_still_failing_delivery_pending(client, monkeypatch):
+    fake = FakeDelivery([_failing_delivery(), _failing_delivery(attempts=1)])
+    monkeypatch.setattr(api, "deliver_webhook", fake)
+    monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
+    client.post("/tickets", json=VALID_REQUEST)
+
+    retried = client.post("/notifications/retry").json()
+    assert retried[0]["status"] == "pending"
+    assert retried[0]["attempts"] == 4
+    assert retried[0]["last_error"] == "boom"
+    assert len(client.get("/notifications/pending").json()) == 1
+    logs = client.get("/execution-logs").json()
+    assert any(
+        log["action"] == "notification.retry" and log["status"] == "failure"
+        for log in logs
+    )
+
+
+def test_retry_with_empty_queue_is_a_noop(client, monkeypatch):
+    fake = FakeDelivery([])
+    monkeypatch.setattr(api, "deliver_webhook", fake)
+    assert client.post("/notifications/retry").json() == []
+    assert fake.calls == []
+
+
+def test_dashboard_shows_pending_retries_section(client, monkeypatch):
+    fake = FakeDelivery([_failing_delivery()])
+    monkeypatch.setattr(api, "deliver_webhook", fake)
+    monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
+    client.post("/tickets", json=VALID_REQUEST)
+
+    page = client.get("/dashboard").text
+    assert "Failed webhook deliveries" in page
+    assert "pending webhook retries" in page
+    assert "hooks.example" in page  # the failing URL is surfaced
 
 
 # --- Dashboard (v1.0 preview) ---
