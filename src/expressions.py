@@ -55,24 +55,97 @@ ALLOWED_ROOTS = frozenset(
         "seniority",
         "output",
         "steps",
+        # Root for request-level facts (department, employee name, requester
+        # id, ...) supplied by the workflow engine as context["context"].
+        "context",
     }
 )
 
-_MISSING = object()  # sentinel meaning "this path was not present"
+class ExpressionError(ValueError):
+    """Raised when a predicate source cannot be compiled.  This is a
+    *definition-time* error (the author wrote bad syntax or an unsafe
+    expression); it must never happen at runtime."""
 
 
-class ExpressionSyntaxError(ValueError):
-    """Raised when a predicate cannot be parsed.  This is a *definition-time*
-    error (the author wrote bad syntax); it must never happen at runtime."""
+# Backwards-compatible alias used by src/workflow.py and older docs.
+ExpressionSyntaxError = ExpressionError
 
 
-@dataclass
+class _Missing:
+    """Sentinel meaning "this path was not present in the context".
+
+    A singleton that is falsy and reprs as ``MISSING`` so audit messages read
+    naturally.  Comparisons involving MISSING treat it like a null/absent
+    value (see ``_eval_node``), which keeps predicates failing closed.
+    """
+
+    _instance: Optional["_Missing"] = None
+
+    def __new__(cls) -> "_Missing":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return "MISSING"
+
+
+MISSING = _Missing()
+# Internal name kept for the many existing references inside this module.
+_MISSING = MISSING
+
+
+@dataclass(frozen=True)
+class CompiledPredicate:
+    """A parsed predicate that can be evaluated repeatedly against contexts."""
+
+    source: str
+    ast: Tuple[Any, ...]
+    max_depth: int
+
+    def __call__(self, context: Optional[Dict[str, Any]] = None) -> bool:
+        outcome = evaluate(self.source, context or {})
+        return outcome.value
+
+    @property
+    def unknown_roots(self) -> Tuple[str, ...]:
+        """Root identifiers outside the allow-list (fail closed at eval)."""
+        roots: List[str] = []
+
+        def walk(node: Tuple[Any, ...]) -> None:
+            if node[0] == "name":
+                root = node[1].split(".")[0]
+                if root not in ALLOWED_ROOTS and root not in roots:
+                    roots.append(root)
+            for child in node[1:]:
+                if isinstance(child, tuple):
+                    walk(child)
+                elif isinstance(child, list):
+                    for item in child:
+                        if isinstance(item, tuple):
+                            walk(item)
+
+        walk(self.ast)
+        return tuple(roots)
+
+
+@dataclass(frozen=True)
 class EvalResult:
-    """Outcome of evaluating one predicate."""
+    """Outcome of evaluating one predicate.
+
+    Boolean-like: ``bool(result)`` returns ``result.value`` so callers may
+    treat it directly as the predicate's truth value.
+    """
 
     value: bool
     unknown_identifiers: Tuple[str, ...] = ()
     detail: str = ""
+
+    def __bool__(self) -> bool:
+        return self.value
 
 
 # --------------------------------------------------------------------------
@@ -85,13 +158,18 @@ _TOKEN_RE = re.compile(
   | (?P<number>-?\d+(?:\.\d+)?)
   | (?P<name>[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*)
   | (?P<op>==|!=|<=|>=|<|>)
-  | (?P<punct>[(),])
+  | (?P<punct>[(),\[\]])
     """,
     re.VERBOSE,
 )
 
 _KEYWORDS = {"and", "or", "not", "in", "contains", "is", "null", "true",
              "false", "defined"}
+
+# Compile-time safety bounds so a malicious or accidental definition can
+# never make the parser recurse deeply or chew through huge inputs.
+MAX_PREDICATE_LENGTH = 500
+MAX_NESTING_DEPTH = 20
 
 
 def _tokenize(text: str) -> List[Tuple[str, str]]:
@@ -126,6 +204,7 @@ class _Parser:
     def __init__(self, tokens: Sequence[Tuple[str, str]]) -> None:
         self.tokens = list(tokens)
         self.pos = 0
+        self.depth = 0
 
     def peek(self) -> Optional[Tuple[str, str]]:
         return self.tokens[self.pos] if self.pos < len(self.tokens) else None
@@ -167,8 +246,14 @@ class _Parser:
             raise ExpressionSyntaxError("predicate ended unexpectedly")
         if token == ("punct", "("):
             self.pos += 1
+            self.depth += 1
+            if self.depth > MAX_NESTING_DEPTH:
+                raise ExpressionSyntaxError(
+                    f"predicate nesting too deep (limit {MAX_NESTING_DEPTH})"
+                )
             node = self.parse_or()
             self.take("punct", ")")
+            self.depth -= 1
             return node
         if token == ("keyword", "not"):
             self.pos += 1
@@ -199,6 +284,13 @@ class _Parser:
         if nxt == ("keyword", "in"):
             self.pos += 1
             return ("compare", "in", self.parse_operand(), left)
+        if nxt == ("keyword", "not"):
+            # Only "X not in Y" is legal here; anything else is a syntax error.
+            self.pos += 1
+            if self.peek() != ("keyword", "in"):
+                raise ExpressionSyntaxError(f"unexpected token {self.peek()}")
+            self.pos += 1
+            return ("not", ("compare", "in", self.parse_operand(), left))
         if nxt == ("keyword", "contains"):
             self.pos += 1
             return ("compare", "contains", left, self.parse_operand())
@@ -224,7 +316,30 @@ class _Parser:
             if value.lower() in _KEYWORDS:
                 raise ExpressionSyntaxError(f"reserved word used as identifier: {value}")
             return ("name", value)
+        if kind == "punct" and value == "[":
+            # List literal, e.g.  department in ['Sales', 'R&D']
+            self.pos += 1
+            items: List[Any] = []
+            if self.peek() != ("punct", "]"):
+                while True:
+                    items.append(self.parse_operand()[1])
+                    nxt = self.peek()
+                    if nxt == ("punct", ","):
+                        self.pos += 1
+                        continue
+                    break
+                self.take("punct", "]")
+            else:
+                self.pos += 1
+            return ("literal", items)
         raise ExpressionSyntaxError(f"cannot use token {token} as an operand")
+
+
+def _ast_depth(node: Any) -> int:
+    """Nesting depth of a parsed AST (used by compile_predicate)."""
+    if isinstance(node, tuple):
+        return 1 + max((_ast_depth(child) for child in node), default=0)
+    return 0
 
 
 def parse(expression: str) -> tuple:
@@ -232,6 +347,10 @@ def parse(expression: str) -> tuple:
     text = (expression or "").strip()
     if not text:
         raise ExpressionSyntaxError("empty predicate")
+    if len(text) > MAX_PREDICATE_LENGTH:
+        raise ExpressionSyntaxError(
+            f"predicate is longer than {MAX_PREDICATE_LENGTH} characters"
+        )
     return _Parser(_tokenize(text)).parse()
 
 
@@ -343,12 +462,23 @@ def _eval_node(node: tuple, context: Dict[str, Any], unknown: List[str]) -> bool
     raise ExpressionSyntaxError(f"bad AST node {node!r}")
 
 
-def evaluate(expression: str, context: Dict[str, Any]) -> EvalResult:
-    """Evaluate one predicate string against ``context``.
+def evaluate(expression: str, context: Dict[str, Any]) -> bool:
+    """Evaluate one predicate string against ``context`` and return a bool.
 
-    Never raises for unknown identifiers; those make the predicate False and
-    are reported in ``EvalResult.unknown_identifiers`` so callers can fail
-    closed with an audit reason instead of a 500.
+    Never raises for unknown identifiers; those make the predicate False
+    ("fail closed").  Use :func:`evaluate_detailed` when you also need the
+    audit detail (e.g. which identifiers were unknown).
+    """
+    return evaluate_detailed(expression, context).value
+
+
+def evaluate_detailed(expression: str, context: Dict[str, Any]) -> EvalResult:
+    """Evaluate one predicate and report *why* it resolved as it did.
+
+    The boolean outcome lives in ``EvalResult.value``; syntax errors and
+    unknown identifiers never raise — they fail closed (False) and are
+    reported in ``EvalResult.unknown_identifiers`` / ``EvalResult.detail`` so
+    callers can write an audit-visible reason instead of returning a 500.
     """
     unknown: List[str] = []
     try:
@@ -362,13 +492,20 @@ def evaluate(expression: str, context: Dict[str, Any]) -> EvalResult:
     return EvalResult(value, tuple(unknown), detail)
 
 
-def evaluate_all(expressions: Sequence[str], context: Dict[str, Any]) -> EvalResult:
+def evaluate_all(expressions: Sequence[str], context: Dict[str, Any]) -> bool:
+    """AND over several predicates; returns a plain bool."""
+    return evaluate_all_detailed(expressions, context).value
+
+
+def evaluate_all_detailed(
+    expressions: Sequence[str], context: Dict[str, Any]
+) -> EvalResult:
     """AND over several predicates; aggregates unknown identifiers."""
     combined_unknown: List[str] = []
     details: List[str] = []
     result = True
     for expression in expressions:
-        outcome = evaluate(expression, context)
+        outcome = evaluate_detailed(expression, context)
         result = result and outcome.value
         for name in outcome.unknown_identifiers:
             if name not in combined_unknown:
@@ -376,3 +513,26 @@ def evaluate_all(expressions: Sequence[str], context: Dict[str, Any]) -> EvalRes
         if outcome.detail:
             details.append(f"{expression!r}: {outcome.detail}")
     return EvalResult(result, tuple(combined_unknown), "; ".join(details))
+
+
+# --------------------------------------------------------------------------
+# Compile-once / evaluate-many API (used by the definition store) and small
+# helpers used by onboarding/workflow audit messages.
+# --------------------------------------------------------------------------
+def compile_predicate(source: str) -> CompiledPredicate:
+    """Parse a predicate once so definitions can be validated eagerly.
+
+    Raises ExpressionError when the source is empty, too long, nested too
+    deeply, or otherwise unparseable.  Callers (the workflow-definition
+    endpoints) surface that as an HTTP 422 — bad syntax must never reach the
+    runtime evaluator.
+    """
+    ast = parse(source)
+    return CompiledPredicate(
+        source=(source or "").strip(), ast=ast, max_depth=_ast_depth(ast)
+    )
+
+
+def describe(predicates: Sequence[str]) -> str:
+    """Human-readable AND-joined form of predicate sources (for audit rows)."""
+    return " and ".join(str(predicate) for predicate in predicates)
