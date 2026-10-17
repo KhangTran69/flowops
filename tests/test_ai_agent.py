@@ -428,3 +428,13 @@ def test_ai_metrics_and_provider_error_log(client, monkeypatch):
     assert any(row["action"] == "ai.error" for row in logs)
     metrics = client.get("/metrics").text
     assert 'flowops_ai_provider_errors_total{provider="broken-test"}' in metrics
+
+
+def test_ui_explains_when_ticket_has_no_actionable_recommendation(client):
+    response = client.post("/tickets", json=TICKET)
+    assert response.status_code == 201
+    page = client.get("/ui/tickets/42?triage=1")
+    assert page.status_code == 200
+    assert "No queue/priority changes" in page.text
+    assert "already matches the routing rules" in page.text
+    assert "data-ai-apply" not in page.text

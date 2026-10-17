@@ -59,6 +59,7 @@
   {% endif %}
 
   <h3>Recommendations</h3>
+  {% set applicable = triage.recommendations | selectattr('applicable') | list %}
   {% if triage.recommendations %}
   <div class="table-wrap">
     <table>
@@ -84,8 +85,13 @@
     </table>
   </div>
   <div class="toolbar" style="margin-top: 0.8rem;">
-    <button class="button primary" type="button" data-ai-apply="/tickets/{{ ticket.ticket_id }}/ai-recommendations/apply">Apply selected</button>
+    {% if applicable %}
+    <button class="button primary" type="button" data-ai-apply="/tickets/{{ ticket.ticket_id }}/ai-recommendations/apply">Apply selected ({{ applicable | length }})</button>
     <span class="muted small">Applying changes only queue/priority. Status is never changed by AI.</span>
+    {% else %}
+    <button class="button primary" type="button" disabled aria-disabled="true">No queue/priority changes</button>
+    <span class="muted small">This ticket already matches the routing rules. The knowledge-base suggestion is informational only; select an applicable recommendation when the AI proposes a queue or priority change.</span>
+    {% endif %}
   </div>
   {% else %}
   <p class="empty">No recommendations for this ticket.</p>

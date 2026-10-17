@@ -458,7 +458,7 @@ No real secrets or Microsoft tenant are included.
 ## Running the tests
 
 ```bash
-pytest    # 292 passed, 15 skipped locally; the skips are PostgreSQL-only tests
+pytest    # 293 passed, 15 skipped locally; the skips are PostgreSQL-only tests
 python -m compileall -q src tests
 ```
 
