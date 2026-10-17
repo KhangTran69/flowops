@@ -49,13 +49,36 @@ def test_create_offboarding_uses_offboarding_template(client):
     [
         {"employee_email": "not-an-email"},
         {"employee_name": "   "},
-        {"start_date": "November 2"},
+        {"start_date": "November 2"},     # wrong format (not ISO)
         {"request_type": "transfer"},
         {"requester_id": 0},
+        # --- Scenario 3: impossible calendar dates ---
+        # These strings match the YYYY-MM-DD pattern but name days that do not
+        # exist on any calendar.  date.fromisoformat() rejects them, so the
+        # validator must raise 422 rather than silently accepting the string.
+        {"start_date": "2026-02-30"},     # February only has 28 or 29 days
+        {"start_date": "2026-13-01"},     # month 13 does not exist
+        {"start_date": "2026-04-31"},     # April only has 30 days
     ],
 )
 def test_invalid_onboarding_requests_rejected(client, overrides):
     assert _create(client, overrides).status_code == 422
+
+
+def test_valid_edge_case_dates_are_accepted(client):
+    """Scenario 3 (positive path): real dates near boundaries must not be rejected."""
+    # Feb 28 in a non-leap year — always valid.
+    assert _create(client, {"start_date": "2026-02-28"}).status_code == 201
+    # Feb 29 in a leap year — should also be accepted.
+    assert _create(
+        client,
+        {"start_date": "2024-02-29", "employee_email": "other@example.com"},
+    ).status_code == 201
+    # None (omitted date) must also be accepted.
+    assert _create(
+        client,
+        {"start_date": None, "employee_email": "third@example.com"},
+    ).status_code == 201
 
 
 def test_approval_required_before_completion(client):

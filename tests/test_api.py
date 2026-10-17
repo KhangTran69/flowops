@@ -151,6 +151,105 @@ def test_overlong_idempotency_key_rejected(client):
     assert response.status_code == 422
 
 
+def test_same_payload_same_key_replays_original_result(client):
+    """Scenario 1: identical payload + same Idempotency-Key returns the stored result.
+
+    The second call must not re-execute the ticket pipeline (no second
+    ticket.created entry in the execution log) and must carry the
+    Idempotency-Replayed header.
+    """
+    key = "replay-same-payload"
+    headers = {"Idempotency-Key": key}
+    first = client.post("/tickets", json=VALID_REQUEST, headers=headers)
+    assert first.status_code == 201
+
+    second = client.post("/tickets", json=VALID_REQUEST, headers=headers)
+    assert second.status_code == 200
+    assert second.headers.get("Idempotency-Replayed") == "true"
+    # The replayed body must exactly match the original.
+    assert second.json() == first.json()
+    # Only one ticket must exist — no duplicate was created.
+    assert len(client.get("/tickets").json()) == 1
+    # The most recent log entry is the replay, not a second ticket.created.
+    logs = client.get("/execution-logs").json()
+    assert logs[0]["action"] == "ticket.idempotent_replay"
+    # Exactly one ticket.created in the log total (the original request).
+    created_entries = [log for log in logs if log["action"] == "ticket.created"]
+    assert len(created_entries) == 1
+
+
+def test_different_payload_same_key_returns_409(client):
+    """Scenario 2: different payload with an already-used key must return 409.
+
+    The conflict must be detected before the new request is processed, so
+    the existing ticket must remain unchanged and no second create-run may
+    be logged.
+    """
+    key = "conflict-key"
+    headers = {"Idempotency-Key": key}
+    first = client.post("/tickets", json=VALID_REQUEST, headers=headers)
+    assert first.status_code == 201
+    original_title = first.json()["title"]
+
+    # Re-use the same key with a deliberately different payload.
+    different_payload = {**VALID_REQUEST, "title": "A completely different title"}
+    conflict = client.post("/tickets", json=different_payload, headers=headers)
+    assert conflict.status_code == 409
+
+    # The stored ticket must still hold the original title.
+    stored = client.get("/tickets/42").json()
+    assert stored["title"] == original_title
+
+    # No second ticket.created log entry should have appeared.
+    logs = client.get("/execution-logs").json()
+    created_entries = [log for log in logs if log["action"] == "ticket.created"]
+    assert len(created_entries) == 1
+
+
+def test_legacy_idempotency_record_without_fingerprint_returns_409(client, tmp_path):
+    """Scenario 4: an IdempotencyRecord created before payload binding has no
+    request_hash field in its response_json.  Replaying such a key with *any*
+    payload must fail safely with 409 rather than crashing or returning a stale
+    response.
+
+    We simulate the legacy record by inserting it directly into the DB before
+    making the API call.
+    """
+    import json
+
+    from sqlalchemy import text
+
+    from src import db as _db
+
+    # Ensure the tables exist (the fixture's TestClient already opened a session
+    # that created them, but calling use_database reset the flag).
+    _db.use_database(f"sqlite:///{tmp_path}/test.db")
+    # We need a ticket row for the FK-like reference in IdempotencyRecord.
+    first = client.post("/tickets", json=VALID_REQUEST)
+    assert first.status_code == 201
+    ticket_id = first.json()["ticket_id"]
+
+    # Before payload binding, response_json stored the Ticket object directly,
+    # with no request_hash field.
+    legacy_response = json.dumps(first.json(), separators=(",", ":"))
+    with _db.engine.connect() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO idempotency_keys (key, ticket_id, response_json, created_at) "
+                "VALUES (:key, :tid, :rj, datetime('now'))"
+            ),
+            {"key": "legacy-key-no-hash", "tid": ticket_id, "rj": legacy_response},
+        )
+        conn.commit()
+
+    # Any replay of that legacy key — even with the same payload — must return
+    # 409 because the stored record has no fingerprint to verify against.
+    response = client.post(
+        "/tickets", json=VALID_REQUEST, headers={"Idempotency-Key": "legacy-key-no-hash"}
+    )
+    assert response.status_code == 409
+
+
 # --- Webhook intake (v0.4) ---
 
 
