@@ -31,6 +31,8 @@ from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
+from src import ai_agent, db, jobs, ui_session, web  # noqa: F401 - modules referenced at runtime
+from src import ai_agent, chatops, db, jobs, scheduler, ui_session, web, workflow, workflow_control
 from src import ai_agent, chatops, db, definitions, jobs, scheduler, timers, ui_session, web, workflow, workflow_control
 from src.actions import (
     ACTION_BY_STEP,
