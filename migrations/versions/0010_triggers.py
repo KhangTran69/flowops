@@ -1,7 +1,7 @@
 """Add event-driven triggers and delivery tracking (v1.4).
 
-Revision ID: 0009_triggers
-Revises: 0008_workflow_definitions
+Revision ID: 0010_triggers
+Revises: 0009_reporting_view
 """
 
 from typing import Sequence, Union
@@ -9,8 +9,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0009_triggers"
-down_revision: Union[str, None] = "0008_workflow_definitions"
+revision: str = "0010_triggers"
+down_revision: Union[str, None] = "0009_reporting_view"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
