@@ -58,6 +58,30 @@ def test_invalid_onboarding_requests_rejected(client, overrides):
     assert _create(client, overrides).status_code == 422
 
 
+@pytest.mark.parametrize(
+    "bad_date",
+    [
+        "2026-13-01",   # month 13 does not exist
+        "2026-02-30",   # February never has 30 days
+        "2026-04-31",   # April has 30 days
+        "2024-02-29x",  # trailing junk after a real leap date
+        "2026-2-3",     # right idea, wrong format (no zero padding)
+        "20260315",     # compact form is not ISO YYYY-MM-DD
+    ],
+)
+def test_impossible_or_malformed_dates_rejected(client, bad_date):
+    """ISO-shaped but impossible calendar dates must fail validation."""
+    response = _create(client, {"start_date": bad_date})
+    assert response.status_code == 422
+
+
+def test_real_leap_day_accepted(client):
+    """2024 is a leap year, so Feb 29 is a valid calendar date."""
+    response = _create(client, {"start_date": "2024-02-29"})
+    assert response.status_code == 201
+    assert response.json()["start_date"] == "2024-02-29"
+
+
 def test_approval_required_before_completion(client):
     request_id = _create(client).json()["id"]
     needs_approval = next(
