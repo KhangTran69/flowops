@@ -623,6 +623,85 @@ class WorkflowDefinitionVersionRecord(Base):
     )
 
 
+class EventSourceRecord(Base):
+    """An event source with a shared secret for signed inbound webhooks (v1.4)."""
+
+    __tablename__ = "event_sources"
+
+    key: Mapped[str] = mapped_column(String(80), primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    # Plaintext secret for HMAC verification (prototype tradeoff: production
+    # should use an encrypted secret store). Redacted from all logs, delivery
+    # payloads, and UI.
+    secret: Mapped[str] = mapped_column(String(200), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class TriggerRecord(Base):
+    """A trigger that starts workflows from webhooks or schedules (v1.4)."""
+
+    __tablename__ = "triggers"
+
+    key: Mapped[str] = mapped_column(String(80), primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    source_key: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    event_type: Mapped[str] = mapped_column(String(120), nullable=False)
+    target_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    definition_key: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    mapping_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    schedule_kind: Mapped[str] = mapped_column(String(10), nullable=False, default="webhook")
+    interval_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    daily_at_utc: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    last_fired_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class TriggerDeliveryRecord(Base):
+    """A durable trigger delivery with dedup, leasing, and retry (v1.4)."""
+
+    __tablename__ = "trigger_deliveries"
+    __table_args__ = (
+        UniqueConstraint("trigger_key", "event_id", name="uq_trigger_delivery_event"),
+        Index("ix_trigger_deliveries_status_available", "status", "available_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trigger_key: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    event_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="received"
+    )  # received|queued|succeeded|failed|skipped
+    request_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+    processed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    lease_owner_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    available_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
 class WorkflowTimerRecord(Base):
     """Leased SLA timer for a checklist item (v1.3)."""
 

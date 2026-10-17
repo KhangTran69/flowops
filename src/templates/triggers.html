@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}FlowOps — Triggers{% endblock %}
+{% block content %}
+<section class="page-header">
+  <h1>Event-Driven Triggers</h1>
+  <p class="muted">Webhook and scheduled triggers that start published workflows.</p>
+</section>
+
+<section>
+  <h2>Event Sources</h2>
+  {% if sources %}
+  <table class="data-table">
+    <thead>
+      <tr><th>Key</th><th>Name</th><th>Active</th><th>Created</th></tr>
+    </thead>
+    <tbody>
+      {% for source in sources %}
+      <tr>
+        <td><code>{{ source.key }}</code></td>
+        <td>{{ source.name }}</td>
+        <td>{{ "✓" if source.active else "✗" }}</td>
+        <td>{{ source.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">No event sources configured. Create one via <code>POST /event-sources</code>.</p>
+  {% endif %}
+</section>
+
+<section>
+  <h2>Triggers</h2>
+  {% if triggers %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Key</th><th>Name</th><th>Source</th><th>Event</th>
+        <th>Target</th><th>Schedule</th><th>Active</th><th>Last Fired</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for trigger in triggers %}
+      <tr>
+        <td><a href="/ui/triggers/{{ trigger.key }}"><code>{{ trigger.key }}</code></a></td>
+        <td>{{ trigger.name }}</td>
+        <td><code>{{ trigger.source_key }}</code></td>
+        <td>{{ trigger.event_type }}</td>
+        <td>{{ trigger.target_type }}</td>
+        <td>
+          {% if trigger.schedule_kind == "webhook" %}webhook
+          {% elif trigger.schedule_kind == "interval" %}every {{ trigger.interval_seconds }}s
+          {% elif trigger.schedule_kind == "daily" %}daily @ {{ trigger.daily_at_utc }} UTC
+          {% endif %}
+        </td>
+        <td>{{ "✓" if trigger.active else "✗" }}</td>
+        <td>{{ trigger.last_fired_at.strftime("%Y-%m-%d %H:%M") if trigger.last_fired_at else "—" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">No triggers configured. Create one via <code>POST /triggers</code>.</p>
+  {% endif %}
+</section>
+{% endblock %}

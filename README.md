@@ -37,6 +37,7 @@ FlowOps is an IT workflow automation platform. It receives support tickets and o
 | v1.0 CI + Docker | ✅ | GitHub Actions runs pytest, a Docker Compose API + PostgreSQL smoke test, and PostgreSQL reliability tests |
 | v0.6 Microsoft 365 actions | ⬜ | Real account creation via Power Automate / Microsoft Graph / PowerShell (needs credentials) |
 | v0.7 AI support agent | ✅ | Simulated AI triage, KB search, suggest-only recommendations, human-approved apply gate |
+| v1.4 Event-driven triggers | ✅ | Signed inbound webhooks, internal events, interval/daily schedules, durable delivery worker, replay dedup, safe mapping, operator UI |
 
 ## Technology stack
 

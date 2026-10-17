@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}FlowOps — Delivery #{{ delivery.id }}{% endblock %}
+{% block content %}
+<section class="page-header">
+  <h1>Delivery #{{ delivery.id }}</h1>
+  <p class="muted">
+    Trigger <a href="/ui/triggers/{{ trigger.key }}"><code>{{ trigger.key }}</code></a>
+    · Event <code>{{ delivery.event_id }}</code>
+  </p>
+</section>
+
+<section>
+  <table class="data-table">
+    <tbody>
+      <tr><th>Status</th><td>
+        <span class="badge badge-{{ delivery.status }}">{{ delivery.status }}</span>
+      </td></tr>
+      <tr><th>Request ID</th><td>{{ delivery.request_id or "—" }}</td></tr>
+      <tr><th>Attempts</th><td>{{ delivery.attempts }}/{{ delivery.max_attempts }}</td></tr>
+      <tr><th>Received</th><td>{{ delivery.received_at.strftime("%Y-%m-%d %H:%M:%S UTC") }}</td></tr>
+      <tr><th>Processed</th><td>{{ delivery.processed_at.strftime("%Y-%m-%d %H:%M:%S UTC") if delivery.processed_at else "—" }}</td></tr>
+      {% if delivery.error %}
+      <tr><th>Error</th><td><pre class="code-block">{{ delivery.error }}</pre></td></tr>
+      {% endif %}
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>Payload</h2>
+  <pre class="code-block">{{ payload | tojson(indent=2) }}</pre>
+</section>
+{% endblock %}

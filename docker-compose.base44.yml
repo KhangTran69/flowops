@@ -142,6 +142,48 @@ services:
       timeout: 3s
       retries: 3
 
+  trigger-worker:
+    image: python:3.13-slim
+    restart: on-failure
+    stop_grace_period: 15s
+    environment:
+      <<: *flowops-env
+      FLOWOPS_RUN_MIGRATIONS: "false"
+    volumes:
+      - .:/app
+    working_dir: /app
+    command:
+      ["sh", "-ec", "pip install --no-cache-dir -r requirements.txt && exec python -m src.trigger_worker --poll-interval 2"]
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os; os.kill(1,0)\""]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  trigger-scheduler:
+    image: python:3.13-slim
+    restart: on-failure
+    stop_grace_period: 15s
+    environment:
+      <<: *flowops-env
+      FLOWOPS_RUN_MIGRATIONS: "false"
+    volumes:
+      - .:/app
+    working_dir: /app
+    command:
+      ["sh", "-ec", "pip install --no-cache-dir -r requirements.txt && exec python -m src.triggers --poll --interval 2"]
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os; os.kill(1,0)\""]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
   webhook-sink:
     build: ./docker/webhook-sink
     restart: on-failure

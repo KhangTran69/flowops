@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}FlowOps — Trigger {{ trigger.key }}{% endblock %}
+{% block content %}
+<section class="page-header">
+  <h1>Trigger: {{ trigger.key }}</h1>
+  <p class="muted">{{ trigger.name }}</p>
+</section>
+
+<section>
+  <table class="data-table">
+    <tbody>
+      <tr><th>Source</th><td><code>{{ trigger.source_key }}</code></td></tr>
+      <tr><th>Event type</th><td>{{ trigger.event_type }}</td></tr>
+      <tr><th>Target</th><td>{{ trigger.target_type }}</td></tr>
+      <tr><th>Definition</th><td>{{ trigger.definition_key or "—" }}</td></tr>
+      <tr><th>Schedule</th><td>
+        {% if trigger.schedule_kind == "webhook" %}webhook
+        {% elif trigger.schedule_kind == "interval" %}every {{ trigger.interval_seconds }}s
+        {% elif trigger.schedule_kind == "daily" %}daily @ {{ trigger.daily_at_utc }} UTC
+        {% endif %}
+      </td></tr>
+      <tr><th>Active</th><td>{{ "✓" if trigger.active else "✗" }}</td></tr>
+      <tr><th>Last fired</th><td>{{ trigger.last_fired_at.strftime("%Y-%m-%d %H:%M:%S UTC") if trigger.last_fired_at else "—" }}</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>Mapping</h2>
+  <pre class="code-block">{{ trigger.mapping | tojson(indent=2) }}</pre>
+</section>
+
+<section>
+  <h2>Recent Deliveries</h2>
+  {% if deliveries %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>ID</th><th>Event ID</th><th>Status</th><th>Request</th>
+        <th>Attempts</th><th>Received</th><th>Processed</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for delivery in deliveries %}
+      <tr>
+        <td>
+          <a href="/ui/triggers/{{ trigger.key }}/deliveries/{{ delivery.id }}">#{{ delivery.id }}</a>
+        </td>
+        <td><code>{{ delivery.event_id[:40] }}{% if delivery.event_id|length > 40 %}…{% endif %}</code></td>
+        <td>
+          <span class="badge badge-{{ delivery.status }}">{{ delivery.status }}</span>
+        </td>
+        <td>{{ delivery.request_id or "—" }}</td>
+        <td>{{ delivery.attempts }}/{{ delivery.max_attempts }}</td>
+        <td>{{ delivery.received_at.strftime("%Y-%m-%d %H:%M") }}</td>
+        <td>{{ delivery.processed_at.strftime("%Y-%m-%d %H:%M") if delivery.processed_at else "—" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">No deliveries yet.</p>
+  {% endif %}
+</section>
+{% endblock %}

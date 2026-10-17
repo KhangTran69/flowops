@@ -20,7 +20,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal, Optional
 from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request, Response
+from fastapi import Body, Depends, FastAPI, Form, Header, HTTPException, Query, Request, Response
 from fastapi import status as http_status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -783,6 +783,64 @@ class WorkflowDefinitionOut(BaseModel):
     versions: list[DefinitionVersionOut] = []
 
 
+class EventSourceOut(BaseModel):
+    key: str
+    name: str
+    active: bool
+    created_at: datetime
+
+
+class EventSourceIn(BaseModel):
+    key: StrictStr
+    name: StrictStr
+    secret: StrictStr
+    active: bool = True
+
+
+class TriggerOut(BaseModel):
+    key: str
+    name: str
+    source_key: str
+    event_type: str
+    target_type: str
+    definition_key: Optional[str] = None
+    mapping: dict[str, Any] = {}
+    schedule_kind: str
+    interval_seconds: Optional[int] = None
+    daily_at_utc: Optional[str] = None
+    active: bool
+    last_fired_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class TriggerIn(BaseModel):
+    key: StrictStr
+    name: StrictStr
+    source_key: StrictStr
+    event_type: StrictStr
+    target_type: Literal["onboarding_request", "offboarding_request", "ticket"]
+    definition_key: Optional[StrictStr] = None
+    mapping: dict[str, Any] = {}
+    schedule_kind: Literal["webhook", "interval", "daily"] = "webhook"
+    interval_seconds: Optional[StrictInt] = Field(default=None, ge=1)
+    daily_at_utc: Optional[StrictStr] = None
+    active: bool = True
+
+
+class TriggerDeliveryOut(BaseModel):
+    id: int
+    trigger_key: str
+    event_id: str
+    status: str
+    request_id: Optional[str] = None
+    error: Optional[str] = None
+    received_at: datetime
+    processed_at: Optional[datetime] = None
+    attempts: int
+    max_attempts: int
+
+
 class OnboardingRequestIn(BaseModel):
     """A manager's onboarding/offboarding request (v0.5)."""
 
@@ -1219,6 +1277,37 @@ def metrics(session: Session = Depends(db.get_session)) -> Response:
     )
     for outcome, count in sorted(scheduler.TICK_COUNTS.items()):
         lines.append(f'flowops_dag_scheduler_ticks_total{{outcome="{outcome}"}} {count}')
+    # Trigger metrics (v1.4)
+    with _TRIGGER_METRICS_LOCK:
+        delivery_counts = dict(_TRIGGER_DELIVERY_COUNTS)
+        processing = dict(_TRIGGER_PROCESSING_SECONDS)
+        tick_counts = dict(_TRIGGER_SCHEDULER_TICKS)
+    lines.extend(
+        [
+            "# HELP flowops_trigger_deliveries_total Trigger deliveries by trigger and status",
+            "# TYPE flowops_trigger_deliveries_total counter",
+        ]
+    )
+    for (trigger_key, status), count in sorted(delivery_counts.items()):
+        lines.append(
+            f'flowops_trigger_deliveries_total{{trigger="{trigger_key}",status="{status}"}} {count}'
+        )
+    lines.extend(
+        [
+            "# HELP flowops_trigger_processing_seconds Trigger processing time",
+            "# TYPE flowops_trigger_processing_seconds summary",
+        ]
+    )
+    lines.append(f'flowops_trigger_processing_seconds_count {int(processing.get("count", 0))}')
+    lines.append(f'flowops_trigger_processing_seconds_sum {processing.get("sum", 0):.4f}')
+    lines.extend(
+        [
+            "# HELP flowops_trigger_scheduler_ticks_total Trigger scheduler ticks by outcome",
+            "# TYPE flowops_trigger_scheduler_ticks_total counter",
+        ]
+    )
+    for outcome, count in sorted(tick_counts.items()):
+        lines.append(f'flowops_trigger_scheduler_ticks_total{{outcome="{outcome}"}} {count}')
     lines.append(f"flowops_uptime_seconds {time.time() - _METRICS_STARTED:.1f}")
     return Response("\n".join(lines) + "\n", media_type="text/plain")
 
@@ -1960,6 +2049,428 @@ def get_workflow_definition(
     return _definition_out(session, definition)
 
 
+# ---------------------------------------------------------------------------
+# Routes: event-driven triggers (v1.4)
+import hmac as _hmac
+import hashlib as _hashlib
+
+from src.trigger_mapping import MappingError, apply_mapping, validate_mapping
+
+_TRIGGER_METRICS_LOCK = threading.Lock()
+_TRIGGER_DELIVERY_COUNTS: dict[tuple[str, str], int] = {}
+_TRIGGER_PROCESSING_SECONDS: dict[str, float] = {"count": 0.0, "sum": 0.0}
+_TRIGGER_SCHEDULER_TICKS: dict[str, int] = {"fired": 0, "empty": 0, "skipped": 0}
+
+
+def _record_trigger_delivery(trigger_key: str, status: str) -> None:
+    with _TRIGGER_METRICS_LOCK:
+        key = (trigger_key, status)
+        _TRIGGER_DELIVERY_COUNTS[key] = _TRIGGER_DELIVERY_COUNTS.get(key, 0) + 1
+
+
+def _record_trigger_processing(seconds: float) -> None:
+    with _TRIGGER_METRICS_LOCK:
+        _TRIGGER_PROCESSING_SECONDS["count"] += 1
+        _TRIGGER_PROCESSING_SECONDS["sum"] += seconds
+
+
+def _record_trigger_tick(outcome: str) -> None:
+    with _TRIGGER_METRICS_LOCK:
+        _TRIGGER_SCHEDULER_TICKS[outcome] = _TRIGGER_SCHEDULER_TICKS.get(outcome, 0) + 1
+
+
+def _event_source_out(record: db.EventSourceRecord) -> EventSourceOut:
+    return EventSourceOut(
+        key=record.key,
+        name=record.name,
+        active=record.active,
+        created_at=record.created_at,
+    )
+
+
+def _trigger_out(record: db.TriggerRecord) -> TriggerOut:
+    try:
+        mapping = json.loads(record.mapping_json) if record.mapping_json else {}
+    except (TypeError, ValueError):
+        mapping = {}
+    return TriggerOut(
+        key=record.key,
+        name=record.name,
+        source_key=record.source_key,
+        event_type=record.event_type,
+        target_type=record.target_type,
+        definition_key=record.definition_key,
+        mapping=mapping,
+        schedule_kind=record.schedule_kind,
+        interval_seconds=record.interval_seconds,
+        daily_at_utc=record.daily_at_utc,
+        active=record.active,
+        last_fired_at=record.last_fired_at,
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+    )
+
+
+def _delivery_out(record: db.TriggerDeliveryRecord) -> TriggerDeliveryOut:
+    return TriggerDeliveryOut(
+        id=record.id,
+        trigger_key=record.trigger_key,
+        event_id=record.event_id,
+        status=record.status,
+        request_id=record.request_id,
+        error=record.error,
+        received_at=record.received_at,
+        processed_at=record.processed_at,
+        attempts=record.attempts,
+        max_attempts=record.max_attempts,
+    )
+
+
+@app.get("/event-sources", response_model=list[EventSourceOut])
+def list_event_sources(
+    session: Session = Depends(db.get_session),
+) -> list[EventSourceOut]:
+    records = session.execute(
+        select(db.EventSourceRecord).order_by(db.EventSourceRecord.key)
+    ).scalars().all()
+    return [_event_source_out(r) for r in records]
+
+
+@app.post("/event-sources", response_model=EventSourceOut, status_code=http_status.HTTP_201_CREATED)
+def create_event_source(
+    request: EventSourceIn,
+    actor: Actor = Depends(_admin_actor),
+    session: Session = Depends(db.get_session),
+) -> EventSourceOut:
+    if session.get(db.EventSourceRecord, request.key) is not None:
+        raise HTTPException(409, f"Event source {request.key!r} already exists.")
+    record = db.EventSourceRecord(
+        key=request.key,
+        name=request.name,
+        secret=request.secret,
+        active=request.active,
+    )
+    session.add(record)
+    session.flush()
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="event_source.created",
+        status="success",
+        detail=f"event source {request.key!r} created",
+        actor_subject=actor.subject,
+    )
+    return _event_source_out(record)
+
+
+@app.get("/triggers", response_model=list[TriggerOut])
+def list_triggers(
+    session: Session = Depends(db.get_session),
+) -> list[TriggerOut]:
+    records = session.execute(
+        select(db.TriggerRecord).order_by(db.TriggerRecord.key)
+    ).scalars().all()
+    return [_trigger_out(r) for r in records]
+
+
+@app.post("/triggers", response_model=TriggerOut, status_code=http_status.HTTP_201_CREATED)
+def create_trigger(
+    request: TriggerIn,
+    actor: Actor = Depends(_admin_actor),
+    session: Session = Depends(db.get_session),
+) -> TriggerOut:
+    if session.get(db.TriggerRecord, request.key) is not None:
+        raise HTTPException(409, f"Trigger {request.key!r} already exists.")
+    source = session.get(db.EventSourceRecord, request.source_key)
+    if source is None:
+        raise HTTPException(422, f"Event source {request.source_key!r} not found.")
+    if request.target_type in ("onboarding_request", "offboarding_request"):
+        if not request.definition_key:
+            raise HTTPException(422, "definition_key is required for onboarding/offboarding targets.")
+        definition = definitions.get_definition(session, request.definition_key)
+        if definition is None:
+            raise HTTPException(422, f"Definition {request.definition_key!r} not found.")
+        if definition.status != "published":
+            raise HTTPException(422, f"Definition {request.definition_key!r} is not published.")
+    mapping_json = json.dumps(request.mapping, sort_keys=True, separators=(",", ":"))
+    try:
+        validate_mapping(mapping_json, request.target_type)
+    except MappingError as error:
+        raise HTTPException(422, str(error)) from error
+    if request.schedule_kind == "interval" and not request.interval_seconds:
+        raise HTTPException(422, "interval_seconds is required for interval triggers.")
+    if request.schedule_kind == "daily" and not request.daily_at_utc:
+        raise HTTPException(422, "daily_at_utc is required for daily triggers.")
+    record = db.TriggerRecord(
+        key=request.key,
+        name=request.name,
+        source_key=request.source_key,
+        event_type=request.event_type,
+        target_type=request.target_type,
+        definition_key=request.definition_key,
+        mapping_json=mapping_json,
+        schedule_kind=request.schedule_kind,
+        interval_seconds=request.interval_seconds,
+        daily_at_utc=request.daily_at_utc,
+        active=request.active,
+    )
+    session.add(record)
+    session.flush()
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="trigger.created",
+        status="success",
+        detail=f"trigger {request.key!r} created (target={request.target_type})",
+        actor_subject=actor.subject,
+    )
+    return _trigger_out(record)
+
+
+@app.put("/triggers/{key}", response_model=TriggerOut)
+def update_trigger(
+    key: str,
+    request: TriggerIn,
+    actor: Actor = Depends(_admin_actor),
+    session: Session = Depends(db.get_session),
+) -> TriggerOut:
+    record = session.get(db.TriggerRecord, key)
+    if record is None:
+        raise HTTPException(404, "Trigger not found.")
+    source = session.get(db.EventSourceRecord, request.source_key)
+    if source is None:
+        raise HTTPException(422, f"Event source {request.source_key!r} not found.")
+    if request.target_type in ("onboarding_request", "offboarding_request"):
+        if not request.definition_key:
+            raise HTTPException(422, "definition_key is required for onboarding/offboarding targets.")
+    mapping_json = json.dumps(request.mapping, sort_keys=True, separators=(",", ":"))
+    try:
+        validate_mapping(mapping_json, request.target_type)
+    except MappingError as error:
+        raise HTTPException(422, str(error)) from error
+    record.name = request.name
+    record.source_key = request.source_key
+    record.event_type = request.event_type
+    record.target_type = request.target_type
+    record.definition_key = request.definition_key
+    record.mapping_json = mapping_json
+    record.schedule_kind = request.schedule_kind
+    record.interval_seconds = request.interval_seconds
+    record.daily_at_utc = request.daily_at_utc
+    record.active = request.active
+    session.flush()
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="trigger.updated",
+        status="success",
+        detail=f"trigger {key!r} updated",
+        actor_subject=actor.subject,
+    )
+    return _trigger_out(record)
+
+
+@app.delete("/triggers/{key}")
+def delete_trigger(
+    key: str,
+    actor: Actor = Depends(_admin_actor),
+    session: Session = Depends(db.get_session),
+) -> dict:
+    record = session.get(db.TriggerRecord, key)
+    if record is None:
+        raise HTTPException(404, "Trigger not found.")
+    session.delete(record)
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="trigger.deleted",
+        status="success",
+        detail=f"trigger {key!r} deleted",
+        actor_subject=actor.subject,
+    )
+    return {"status": "deleted"}
+
+
+@app.get("/triggers/{key}", response_model=TriggerOut)
+def get_trigger(
+    key: str, session: Session = Depends(db.get_session)
+) -> TriggerOut:
+    record = session.get(db.TriggerRecord, key)
+    if record is None:
+        raise HTTPException(404, "Trigger not found.")
+    return _trigger_out(record)
+
+
+@app.get("/triggers/{key}/deliveries", response_model=list[TriggerDeliveryOut])
+def list_trigger_deliveries(
+    key: str,
+    session: Session = Depends(db.get_session),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> list[TriggerDeliveryOut]:
+    record = session.get(db.TriggerRecord, key)
+    if record is None:
+        raise HTTPException(404, "Trigger not found.")
+    records = session.execute(
+        select(db.TriggerDeliveryRecord)
+        .where(db.TriggerDeliveryRecord.trigger_key == key)
+        .order_by(db.TriggerDeliveryRecord.id.desc())
+        .offset(offset)
+        .limit(limit)
+    ).scalars().all()
+    return [_delivery_out(r) for r in records]
+
+
+@app.post("/triggers/{key}/test")
+def test_trigger(
+    key: str,
+    payload: dict[str, Any] = Body(default={}),
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> dict:
+    """Fire a trigger with a synthetic payload (no external call)."""
+    record = session.get(db.TriggerRecord, key)
+    if record is None:
+        raise HTTPException(404, "Trigger not found.")
+    event_id = f"test:{key}:{uuid.uuid4().hex[:12]}"
+    delivery = db.TriggerDeliveryRecord(
+        trigger_key=key,
+        event_id=event_id,
+        payload_json=json.dumps(payload, separators=(",", ":"), default=str),
+        status="received",
+        received_at=db.utcnow(),
+    )
+    session.add(delivery)
+    session.flush()
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="trigger.delivery.received",
+        status="success",
+        detail=f"test delivery for trigger {key!r} (event_id={event_id})",
+        actor_subject=actor.subject,
+    )
+    return {"event_id": event_id, "delivery_id": delivery.id, "status": "received"}
+
+
+@app.post("/webhooks/triggers/{trigger_key}")
+async def webhook_trigger(
+    trigger_key: str,
+    request: Request,
+    session: Session = Depends(db.get_session),
+) -> dict:
+    """Signed inbound webhook that starts a workflow via a trigger.
+
+    Headers:
+        X-FlowOps-Timestamp: unix seconds
+        X-FlowOps-Signature: sha256=<hex HMAC>
+    Body: JSON with an ``event_id`` field (or X-FlowOps-Event-ID header).
+
+    HMAC input: ``timestamp + "." + raw_body``.
+    """
+    trigger = session.get(db.TriggerRecord, trigger_key)
+    if trigger is None or not trigger.active:
+        raise HTTPException(404, "Trigger not found or inactive.")
+    if trigger.schedule_kind != "webhook":
+        raise HTTPException(404, "Trigger is not a webhook trigger.")
+
+    source = session.get(db.EventSourceRecord, trigger.source_key)
+    if source is None or not source.active:
+        raise HTTPException(404, "Event source not found or inactive.")
+
+    raw_body = await request.body()
+
+    # Timestamp window check (5 minutes).
+    timestamp_header = request.headers.get("X-FlowOps-Timestamp")
+    if not timestamp_header:
+        raise HTTPException(401, "X-FlowOps-Timestamp header is required.")
+    try:
+        ts = int(timestamp_header)
+    except ValueError:
+        raise HTTPException(401, "X-FlowOps-Timestamp must be unix seconds.")
+    now_sec = int(time.time())
+    if abs(now_sec - ts) > 300:
+        raise HTTPException(401, "Timestamp outside the 5-minute window.")
+
+    # HMAC signature verification (constant-time comparison).
+    signature_header = request.headers.get("X-FlowOps-Signature", "")
+    if not signature_header.startswith("sha256="):
+        raise HTTPException(401, "X-FlowOps-Signature must be sha256=<hex>.")
+    provided_sig = signature_header[len("sha256="):]
+    message = f"{ts}.".encode() + raw_body
+    expected_sig = _hmac.new(
+        source.secret.encode(), message, _hashlib.sha256
+    ).hexdigest()
+    if not _hmac.compare_digest(provided_sig, expected_sig):
+        raise HTTPException(401, "Invalid signature.")
+
+    # Parse body and extract event_id.
+    try:
+        body = json.loads(raw_body) if raw_body else {}
+    except (TypeError, ValueError):
+        raise HTTPException(422, "Request body must be valid JSON.")
+    if not isinstance(body, dict):
+        raise HTTPException(422, "Request body must be a JSON object.")
+
+    event_id = body.get("event_id") or request.headers.get("X-FlowOps-Event-ID")
+    if not event_id:
+        raise HTTPException(422, "event_id is required in the body or X-FlowOps-Event-ID header.")
+
+    # Deduplicate: if (trigger_key, event_id) already exists, return prior status.
+    existing = session.execute(
+        select(db.TriggerDeliveryRecord).where(
+            and_(
+                db.TriggerDeliveryRecord.trigger_key == trigger_key,
+                db.TriggerDeliveryRecord.event_id == str(event_id),
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        _record_trigger_delivery(trigger_key, "replayed")
+        db.log_execution(
+            session,
+            run_id=_new_run_id(),
+            action="trigger.delivery.replayed",
+            status="success",
+            detail=f"replay for trigger {trigger_key!r} (event_id={event_id}, status={existing.status})",
+            actor_subject=f"trigger:{trigger_key}",
+        )
+        return {
+            "event_id": existing.event_id,
+            "delivery_id": existing.id,
+            "status": existing.status,
+            "replayed": True,
+        }
+
+    # Insert new delivery.
+    # Redact any secret-like fields from the stored payload.
+    safe_body = {k: v for k, v in body.items() if k.lower() not in ("secret", "signature", "token")}
+    delivery = db.TriggerDeliveryRecord(
+        trigger_key=trigger_key,
+        event_id=str(event_id),
+        payload_json=json.dumps(safe_body, separators=(",", ":"), default=str),
+        status="received",
+        received_at=db.utcnow(),
+    )
+    session.add(delivery)
+    session.flush()
+    _record_trigger_delivery(trigger_key, "received")
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="trigger.delivery.received",
+        status="success",
+        detail=f"webhook trigger {trigger_key!r} received (event_id={event_id})",
+        actor_subject=f"trigger:{trigger_key}",
+    )
+    return {
+        "event_id": str(event_id),
+        "delivery_id": delivery.id,
+        "status": "received",
+        "replayed": False,
+    }
+
+
 def _create_onboarding_request(
     request: OnboardingRequestIn,
     session: Session,
@@ -2612,6 +3123,93 @@ def ui_workflow_job_detail(
             "job": job,
             "payload": json.dumps(payload, indent=2, sort_keys=True),
             "result": json.dumps(result, indent=2, sort_keys=True),
+        },
+    )
+
+
+@app.get("/ui/triggers", response_class=HTMLResponse, include_in_schema=False)
+def ui_triggers(
+    request: Request, session: Session = Depends(db.get_session)
+) -> HTMLResponse:
+    """Operator trigger list with status, schedule, and last fired."""
+    triggers = session.execute(
+        select(db.TriggerRecord).order_by(db.TriggerRecord.key)
+    ).scalars().all()
+    sources = session.execute(
+        select(db.EventSourceRecord).order_by(db.EventSourceRecord.key)
+    ).scalars().all()
+    return web.render(
+        request,
+        "triggers.html",
+        {
+            "active": "triggers",
+            "triggers": [_trigger_out(t) for t in triggers],
+            "sources": [_event_source_out(s) for s in sources],
+        },
+    )
+
+
+@app.get(
+    "/ui/triggers/{key}",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+)
+def ui_trigger_detail(
+    request: Request,
+    key: str,
+    session: Session = Depends(db.get_session),
+) -> HTMLResponse:
+    """Trigger detail with mapping, recent deliveries, and enable/disable."""
+    trigger = session.get(db.TriggerRecord, key)
+    if trigger is None:
+        raise HTTPException(404, "Trigger not found.")
+    deliveries = session.execute(
+        select(db.TriggerDeliveryRecord)
+        .where(db.TriggerDeliveryRecord.trigger_key == key)
+        .order_by(db.TriggerDeliveryRecord.id.desc())
+        .limit(20)
+    ).scalars().all()
+    return web.render(
+        request,
+        "trigger_detail.html",
+        {
+            "active": "triggers",
+            "trigger": _trigger_out(trigger),
+            "deliveries": [_delivery_out(d) for d in deliveries],
+        },
+    )
+
+
+@app.get(
+    "/ui/triggers/{key}/deliveries/{delivery_id}",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+)
+def ui_trigger_delivery_detail(
+    request: Request,
+    key: str,
+    delivery_id: int,
+    session: Session = Depends(db.get_session),
+) -> HTMLResponse:
+    """Delivery detail showing payload, status, request link, and error."""
+    trigger = session.get(db.TriggerRecord, key)
+    if trigger is None:
+        raise HTTPException(404, "Trigger not found.")
+    delivery = session.get(db.TriggerDeliveryRecord, delivery_id)
+    if delivery is None or delivery.trigger_key != key:
+        raise HTTPException(404, "Delivery not found.")
+    try:
+        payload = json.loads(delivery.payload_json) if delivery.payload_json else {}
+    except (TypeError, ValueError):
+        payload = {}
+    return web.render(
+        request,
+        "trigger_delivery_detail.html",
+        {
+            "active": "triggers",
+            "trigger": _trigger_out(trigger),
+            "delivery": _delivery_out(delivery),
+            "payload": payload,
         },
     )
 
