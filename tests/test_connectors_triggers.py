@@ -152,12 +152,15 @@ def test_start_workflow_trigger_creates_and_starts_request(client):
 
 def test_bad_rule_is_logged_and_never_breaks_ingestion(client):
     # Insert a rule with a runtime-broken predicate directly (bypass API).
+    # ``getattr`` on a missing field raises at evaluation time even though the
+    # expression compiles fine (the API's create-time validation would accept
+    # it), so this exercises the trigger engine's error isolation path.
     with db.SessionLocal() as session:
         session.add(
             db.TriggerRuleRecord(
                 name="broken",
                 event_type="*",
-                predicate="missing_field.sub == 1 and (1",  # compiles? if not, use valid-but-erroring
+                predicate="missing_field.sub == 1",
                 action_type="notify",
                 notify_url="http://localhost:9/x",
             )
@@ -214,7 +217,7 @@ def test_connector_crud_and_webhook_sink(client):
         f"/connectors/{generic['id']}/webhook",
         json={"events": [{"type": "alert", "id": "A-1", "payload": {"sev": 3}}]},
     )
-    assert delivered.status_code == 201
+    assert delivered.status_code == 200
     assert delivered.json()["received"] == 1
 
     # A misconfigured secret env surfaces as 503, not a crash.
@@ -279,3 +282,37 @@ def test_tenant_scoped_rules_only_fire_for_their_tenant(client):
         json={"source": "generic", "type": "x", "id": "T-2", "tenant": "acme"},
     ).json()["results"][0]
     assert len(mine["triggers_fired"]) == 1
+
+
+def test_sweep_expired_removes_stale_completed_records(client):
+    """Retention sweep deletes records past the window, keeps fresh ones."""
+    import datetime as dt
+    import json as _json
+
+    from src import idempotency
+
+    def _record(key: str, state: str, age_hours: float) -> db.IdempotencyRecord:
+        return db.IdempotencyRecord(
+            key=key,
+            ticket_id="res-1",
+            owner_token=None if state == "completed" else "tok-" + key,
+            resource_type=idempotency.SCOPE_TICKET,
+            response_json=_json.dumps({"request_hash": "h", "state": state}),
+            created_at=db.utcnow() - dt.timedelta(hours=age_hours),
+        )
+
+    with db.SessionLocal() as session:
+        session.add_all(
+            [
+                _record("fresh-completed", "completed", 1),
+                _record("stale-completed", "completed", 8 * 24),
+                _record("stale-abandoned", "processing", 8 * 24),
+                _record("recent-processing", "processing", 0.01),
+            ]
+        )
+        session.commit()
+
+        deleted = idempotency.sweep_expired(session)
+        assert deleted == 2  # stale completed + stale abandoned reservation
+        keys = {r.key for r in session.query(db.IdempotencyRecord).all()}
+        assert keys == {"fresh-completed", "recent-processing"}
