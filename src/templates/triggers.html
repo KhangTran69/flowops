@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Triggers — FlowOps{% endblock %}
+{% block content %}
+<section class="page-heading"><div><span class="eyebrow">Automation</span><h1>Event triggers</h1><p class="muted">Webhooks and schedules that start workflows.</p></div></section>
+<section class="panel">
+  <div class="panel-head"><h2>Triggers</h2><span class="muted small">{{ triggers | length }} total</span></div>
+  {% if triggers %}
+  <div class="table-wrap"><table><thead><tr><th>Key</th><th>Name</th><th>Source</th><th>Event type</th><th>Target</th><th>Schedule</th><th>Status</th><th>Last fired</th></tr></thead><tbody>
+  {% for trigger in triggers %}
+  <tr>
+    <td><a href="/ui/triggers/{{ trigger.key }}">{{ trigger.key }}</a></td>
+    <td>{{ trigger.name }}</td>
+    <td>{{ trigger.source_key }}</td>
+    <td>{{ trigger.event_type }}</td>
+    <td>{{ trigger.target_type }}</td>
+    <td>
+      {% if trigger.schedule_kind == "webhook" %}Webhook
+      {% elif trigger.schedule_kind == "interval" %}Every {{ trigger.interval_seconds }}s
+      {% elif trigger.schedule_kind == "daily" %}Daily at {{ trigger.daily_at_utc }} UTC
+      {% endif %}
+    </td>
+    <td><span class="badge {{ 'ok' if trigger.active else 'neutral' }}">{{ 'Active' if trigger.active else 'Inactive' }}</span></td>
+    <td>{{ trigger.last_fired_at.strftime('%Y-%m-%d %H:%M') if trigger.last_fired_at else '—' }}</td>
+  </tr>
+  {% endfor %}
+  </tbody></table></div>
+  {% else %}<p class="empty">No triggers yet. Create one via the API.</p>{% endif %}
+</section>
+{% endblock %}

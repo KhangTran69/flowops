@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}{{ trigger.name }} — FlowOps{% endblock %}
+{% block content %}
+<section class="page-heading"><div><span class="eyebrow">Automation</span><h1>{{ trigger.name }}</h1><p class="muted">{{ trigger.key }}</p></div></section>
+<section class="panel">
+  <div class="panel-head"><h2>Configuration</h2></div>
+  <div class="table-wrap"><table><tbody>
+  <tr><th>Key</th><td>{{ trigger.key }}</td></tr>
+  <tr><th>Name</th><td>{{ trigger.name }}</td></tr>
+  <tr><th>Source</th><td>{{ trigger.source_key }}</td></tr>
+  <tr><th>Event type</th><td>{{ trigger.event_type }}</td></tr>
+  <tr><th>Target type</th><td>{{ trigger.target_type }}</td></tr>
+  <tr><th>Definition</th><td>{{ trigger.definition_key or '—' }}</td></tr>
+  <tr><th>Schedule</th><td>
+    {% if trigger.schedule_kind == "webhook" %}Webhook
+    {% elif trigger.schedule_kind == "interval" %}Every {{ trigger.interval_seconds }}s
+    {% elif trigger.schedule_kind == "daily" %}Daily at {{ trigger.daily_at_utc }} UTC
+    {% endif %}
+  </td></tr>
+  <tr><th>Status</th><td><span class="badge {{ 'ok' if trigger.active else 'neutral' }}">{{ 'Active' if trigger.active else 'Inactive' }}</span></td></tr>
+  <tr><th>Last fired</th><td>{{ trigger.last_fired_at.strftime('%Y-%m-%d %H:%M:%S UTC') if trigger.last_fired_at else 'Never' }}</td></tr>
+  <tr><th>Created</th><td>{{ trigger.created_at.strftime('%Y-%m-%d %H:%M:%S UTC') }}</td></tr>
+  </tbody></table></div>
+</section>
+<section class="panel">
+  <div class="panel-head"><h2>Mapping</h2></div>
+  <pre class="code-block">{{ trigger.mapping_json | tojson(indent=2) }}</pre>
+</section>
+<section class="panel">
+  <div class="panel-head"><h2>Recent deliveries</h2><span class="muted small">{{ deliveries | length }} shown</span></div>
+  {% if deliveries %}
+  <div class="table-wrap"><table><thead><tr><th>ID</th><th>Event ID</th><th>Status</th><th>Request ID</th><th>Received</th></tr></thead><tbody>
+  {% for delivery in deliveries %}
+  <tr>
+    <td>{{ delivery.id }}</td>
+    <td>{{ delivery.event_id[:20] }}...</td>
+    <td><span class="badge {{ 'ok' if delivery.status == 'succeeded' else ('error' if delivery.status == 'failed' else 'info') }}">{{ delivery.status }}</span></td>
+    <td>{{ delivery.request_id or '—' }}</td>
+    <td>{{ delivery.received_at.strftime('%Y-%m-%d %H:%M') }}</td>
+  </tr>
+  {% endfor %}
+  </tbody></table></div>
+  {% else %}<p class="empty">No deliveries yet.</p>{% endif %}
+</section>
+{% endblock %}
