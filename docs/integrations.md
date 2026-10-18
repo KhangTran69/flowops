@@ -128,6 +128,12 @@ The adapter returns the same typed `ActionResult` as Graph, Power Automate,
 PowerShell, and simulated adapters, so retry, audit, and dead-letter behavior
 does not change when the execution platform changes.
 
+All HTTP-backed action adapters classify failures at the boundary: authentication
+and other 4xx responses are permanent, 429 responses remain retryable, and 5xx
+or transport failures are retryable. This prevents invalid credentials or
+missing resources from consuming the entire retry budget while preserving safe
+recovery for throttling and transient outages.
+
 ## SQL reporting (`src/reports.py`, `sql/reporting_queries.sql`)
 
 Migration `0009` creates the views `v_automation_daily`, `v_action_reliability`,

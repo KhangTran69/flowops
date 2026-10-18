@@ -22,13 +22,14 @@ from fastapi import status as http_status
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from sqlalchemy import and_, delete, or_, select, text, update
+from sqlalchemy import Integer, and_, cast, delete, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src import ai_agent, chatops, db, definitions, idempotency, jobs, logging_config, metrics, scheduler, timers, ui_session, web, workflow, workflow_control
 from src.actions import (
     ActionAdapter,
+    ActionError,
     action_for_step,
     adapter_from_environment,
 )
@@ -766,12 +767,14 @@ def list_tickets(
     session: Session = Depends(db.get_session),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
+    tenant: Optional[str] = Query(default=None, max_length=64),
 ) -> list[Ticket]:
-    """List stored tickets, ordered by numeric ticket ID."""
-    records = session.execute(select(db.TicketRecord)).scalars().all()
-    tickets = [Ticket.model_validate(record, from_attributes=True) for record in records]
-    ordered = sorted(tickets, key=lambda ticket: int(ticket.ticket_id))
-    return ordered[offset:offset + limit]
+    """List stored tickets with bounded database pagination."""
+    query = select(db.TicketRecord).order_by(cast(db.TicketRecord.ticket_id, Integer))
+    if tenant is not None:
+        query = query.where(db.TicketRecord.tenant_key == tenant)
+    records = session.execute(query.offset(offset).limit(limit)).scalars().all()
+    return [Ticket.model_validate(record, from_attributes=True) for record in records]
 
 
 @app.get("/tickets/{ticket_id}", response_model=Ticket)
@@ -1449,13 +1452,32 @@ def get_workflow_run(
 @app.get("/workflow-runs", response_model=list[WorkflowRunOut])
 def list_workflow_runs(
     status_filter: Optional[str] = Query(default=None, alias="status"),
+    tenant: Optional[str] = Query(default=None, max_length=64),
+    definition: Optional[str] = Query(default=None, max_length=128),
+    created_after: Optional[datetime] = Query(default=None),
+    created_before: Optional[datetime] = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: Session = Depends(db.get_session),
 ) -> list[WorkflowRunOut]:
-    query = select(db.WorkflowRunRecord).order_by(db.WorkflowRunRecord.id.desc())
+    query = (
+        select(db.WorkflowRunRecord)
+        .join(
+            db.OnboardingRequestRecord,
+            db.OnboardingRequestRecord.id == db.WorkflowRunRecord.request_id,
+        )
+        .order_by(db.WorkflowRunRecord.id.desc())
+    )
     if status_filter:
         query = query.where(db.WorkflowRunRecord.status == status_filter)
+    if tenant is not None:
+        query = query.where(db.OnboardingRequestRecord.tenant_key == tenant)
+    if definition is not None:
+        query = query.where(db.OnboardingRequestRecord.definition_key == definition)
+    if created_after is not None:
+        query = query.where(db.WorkflowRunRecord.created_at >= created_after)
+    if created_before is not None:
+        query = query.where(db.WorkflowRunRecord.created_at <= created_before)
     runs = session.execute(query.offset(offset).limit(limit)).scalars().all()
     return [_workflow_run_out(session, run) for run in runs]
 
@@ -1599,6 +1621,7 @@ def _execute_item(
         )
 
     action = action_for_step(item.step)
+    correlation_id = _new_run_id()
     context = {
         "request_id": record.id,
         "request_type": record.request_type,
@@ -1607,9 +1630,11 @@ def _execute_item(
         "department": record.department,
         "actor_subject": actor.subject,
         "actor_roles": list(actor.roles),
+        "tenant_key": record.tenant_key,
+        "idempotency_key": f"onboarding-action:{record.id}:{item.id}",
+        "correlation_id": correlation_id,
         **workflow.action_context_outputs(item, items),
     }
-    correlation_id = _new_run_id()
     started_at = db.utcnow()
     started = time.perf_counter()
     last_error = ""
@@ -1623,11 +1648,11 @@ def _execute_item(
                 checklist_item_id=item.id,
                 action=action,
                 actor_subject=actor.subject,
-                adapter=ACTION_ADAPTER.__class__.__name__,
+                adapter=getattr(ACTION_ADAPTER, "adapter_name", ACTION_ADAPTER.__class__.__name__),
                 correlation_id=correlation_id,
                 attempt=attempt,
                 status="succeeded",
-                external_reference=result.detail[:256],
+                external_reference=(result.external_reference or result.detail)[:256],
                 started_at=started_at,
                 completed_at=completed_at,
                 duration_ms=int((time.perf_counter() - started) * 1000),
@@ -1660,8 +1685,9 @@ def _execute_item(
                 )
             _, items = _load_request(session, record.id)
             return _request_out(record, items)
-        except Exception as error:  # adapter failures must be logged and retried
+        except Exception as error:  # adapter failures must be logged and classified
             last_error = str(error)
+            retryable = not isinstance(error, ActionError) or error.retryable
             session.add(db.ActionExecutionRecord(
                 request_id=record.id,
                 checklist_item_id=item.id,
@@ -1670,13 +1696,16 @@ def _execute_item(
                 adapter=ACTION_ADAPTER.__class__.__name__,
                 correlation_id=correlation_id,
                 attempt=attempt,
-                status="retrying" if attempt < attempts_limit else "failed",
-                error_category="adapter_error",
+                status="retrying" if retryable and attempt < attempts_limit else "failed",
+                error_category=getattr(error, "category", "adapter_error"),
                 error_detail=last_error[:1000],
                 started_at=started_at,
                 completed_at=db.utcnow(),
                 duration_ms=int((time.perf_counter() - started) * 1000),
             ))
+            if not retryable:
+                attempts_limit = attempt
+                break
 
     item.status = "failed"
     workflow.apply_graph_transitions(

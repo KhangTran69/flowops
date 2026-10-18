@@ -33,8 +33,11 @@
 {% if triage %}
 <section class="panel" aria-labelledby="ai-heading">
   <div class="panel-head">
-    <h2 id="ai-heading">AI Triage</h2>
-    <span class="badge info">adapter: {{ triage.adapter }}</span>
+    <div>
+      <h2 id="ai-heading">AI Triage</h2>
+      <span class="badge info">adapter: {{ triage.adapter }}</span>
+    </div>
+    <a class="button small ghost" href="/ui/tickets/{{ ticket.ticket_id }}?triage=1" aria-label="Re-run AI triage for ticket {{ ticket.ticket_id }}">Re-run triage</a>
   </div>
   <p>{{ triage.summary.text }}</p>
   {% if triage.summary.urgency_signals %}
@@ -48,7 +51,7 @@
   <div class="feature-grid">
     {% for match in triage.knowledge_base %}
     <article class="feature-card">
-      <h3><a href="/knowledge-base?query={{ match.article.id }}">{{ match.article.title }}</a></h3>
+      <h3><a href="/ui/knowledge-base?query={{ match.article.id }}">{{ match.article.title }}</a></h3>
       <p>{{ match.article.summary }}</p>
       <p class="small muted">score {{ match.score }} · {{ match.article.category }}</p>
     </article>
@@ -89,7 +92,7 @@
     <button class="button primary" type="button" data-ai-apply="/tickets/{{ ticket.ticket_id }}/ai-recommendations/apply">Apply selected ({{ applicable | length }})</button>
     <span class="muted small">Applying changes only queue/priority. Status is never changed by AI.</span>
     {% else %}
-    <button class="button primary" type="button" disabled aria-disabled="true">No queue/priority changes</button>
+    <span class="badge">No queue/priority changes</span>
     <span class="muted small">This ticket already matches the routing rules. The knowledge-base suggestion is informational only; select an applicable recommendation when the AI proposes a queue or priority change.</span>
     {% endif %}
   </div>

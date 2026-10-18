@@ -202,6 +202,9 @@ def test_ui_ticket_list_and_triage_panel(client):
     detail = client.get(f"/ui/tickets/{ticket_id}?triage=1")
     assert detail.status_code == 200
     assert "AI Triage" in detail.text
+    assert f"/ui/tickets/{ticket_id}?triage=1" in detail.text
+    assert "Re-run triage" in detail.text
+    assert "/ui/knowledge-base?query=kb-network-outage" in detail.text
     assert "queue-reassign" in detail.text
     assert f"/tickets/{ticket_id}/ai-recommendations/apply" in detail.text
 

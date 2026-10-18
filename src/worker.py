@@ -138,6 +138,23 @@ def _complete_onboarding_job(
     if request is None or item is None or item.request_id != request.id:
         raise _PermanentJobError("Onboarding request or checklist item no longer exists.")
     if item.status == "completed":
+        # A previous execution may have completed the checklist item before
+        # losing its lease or committing the job row. Finalize the job as an
+        # idempotent replay instead of returning with the job stuck in
+        # ``running`` forever.
+        finished = jobs.complete_job(
+            session,
+            job.id,
+            job.lease_owner_token or "",
+            result={"already_completed": True, "item_id": item.id},
+        )
+        if not finished:
+            session.rollback()
+            return {"fenced": True, "item_id": item.id}
+        scheduler.advance_from_job(
+            session, job, success=True, output={"already_completed": True}
+        )
+        session.commit()
         return {"already_completed": True, "item_id": item.id}
 
     items = session.execute(

@@ -82,6 +82,29 @@ def test_enqueue_is_idempotent_per_item(client):
     assert len(client.get("/workflow-jobs").json()) == 1
 
 
+def test_worker_finalizes_job_when_item_was_already_completed(client):
+    request_id, item_id = _create_onboarding_item(client)
+    session = db.SessionLocal()
+    try:
+        item = session.get(db.ChecklistItemRecord, item_id)
+        item.status = "completed"
+        job = jobs.enqueue_job(
+            session,
+            job_type=jobs.JOB_ONBOARDING_ITEM,
+            payload={"request_id": request_id, "item_id": item_id, "action": "none"},
+        )
+        session.commit()
+        job_id = job.id
+    finally:
+        session.close()
+
+    processed = worker.run_once(worker_id="idempotent-worker")
+    assert processed is not None
+    assert processed.id == job_id
+    assert processed.status == "succeeded"
+    assert processed.result_json and "already_completed" in processed.result_json
+
+
 def test_stale_worker_cannot_complete_after_takeover(client):
     request_id, item_id = _create_onboarding_item(client)
     job = client.post(

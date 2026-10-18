@@ -75,6 +75,11 @@ require a dev bearer token or Entra JWT and record the actor on execution logs.
 `/ready` checks the database; `/metrics` exposes request, job, and outbox
 gauges; every response carries a correlation ID.
 
+Workflow run queries support bounded pagination plus tenant, definition, status,
+and creation-time filters. External action contexts carry the tenant key and a
+stable action idempotency key, while adapter errors distinguish permanent
+configuration/authentication failures from retryable rate limits and outages.
+
 ## AI assistance boundary
 
 The AI layer is intentionally suggest-only. `src/ai_agent.py` produces a

@@ -95,6 +95,8 @@ class FlowOpsTools:
     ) -> dict:
         """Create an onboarding/offboarding request; its approval steps wait for a human."""
         self._require_writes("request_onboarding")
+        if not tenant_key or not tenant_key.strip():
+            raise FlowOpsToolError("request_onboarding is a write tool and requires tenant_key")
         body = {
             "request_type": request_type,
             "employee_name": employee_name,

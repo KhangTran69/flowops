@@ -353,4 +353,3 @@ class NotificationOutboxOut(BaseModel):
     attempts: int
     last_error: Optional[str] = None
     created_at: datetime
-

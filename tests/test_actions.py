@@ -110,6 +110,36 @@ def test_adapter_selection_requires_webhook_url():
     assert isinstance(adapter_from_environment({"FLOWOPS_ACTION_ADAPTER": "power_automate", "FLOWOPS_POWER_AUTOMATE_URL": "https://flow.example/trigger"}), PowerAutomateAdapter)
 
 
+def test_power_automate_classifies_authentication_failures(monkeypatch):
+    from src.actions import AuthenticationActionError, PowerAutomateAdapter
+
+    class Response:
+        ok = False
+        status_code = 401
+
+    monkeypatch.setattr("src.actions.requests.post", lambda *args, **kwargs: Response())
+    with pytest.raises(AuthenticationActionError) as error:
+        PowerAutomateAdapter("https://flow.example/trigger").execute("create_user_account", {})
+    assert error.value.retryable is False
+    assert "401" in str(error.value)
+
+
+def test_action_result_contains_execution_metadata():
+    from src.actions import SimulatedMicrosoftAdapter
+
+    result = SimulatedMicrosoftAdapter().execute(
+        "create_user_account",
+        {
+            "employee_email": "jane@example.com",
+            "idempotency_key": "action-1",
+            "correlation_id": "corr-1",
+        },
+    )
+    assert result.adapter == "SimulatedMicrosoftAdapter"
+    assert result.idempotency_key == "action-1"
+    assert result.correlation_id == "corr-1"
+
+
 def test_rpa_adapter_is_a_first_class_action_adapter(monkeypatch):
     from src.actions import ActionResult, adapter_from_environment
 

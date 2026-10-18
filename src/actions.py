@@ -18,6 +18,55 @@ from typing import Any, Protocol
 import requests
 
 
+class ActionError(RuntimeError):
+    """Base error for an external action with explicit retry semantics."""
+
+    retryable = True
+    category = "action_error"
+
+
+class RetryableActionError(ActionError):
+    category = "retryable_action_error"
+
+
+class PermanentActionError(ActionError):
+    retryable = False
+    category = "permanent_action_error"
+
+
+class ConfigurationActionError(PermanentActionError):
+    category = "configuration_error"
+
+
+class AuthenticationActionError(PermanentActionError):
+    category = "authentication_error"
+
+
+class RateLimitActionError(RetryableActionError):
+    category = "rate_limit"
+
+
+def action_error_from_response(response: requests.Response, adapter: str) -> ActionError:
+    """Classify an HTTP response without retaining the provider response body."""
+    status = response.status_code
+    if status in (401, 403):
+        return AuthenticationActionError(f"{adapter} rejected the request (HTTP {status}).")
+    if status == 429:
+        return RateLimitActionError(f"{adapter} rate limited the request (HTTP 429).")
+    if 400 <= status < 500:
+        return PermanentActionError(f"{adapter} rejected the request (HTTP {status}).")
+    return RetryableActionError(f"{adapter} request failed (HTTP {status}).")
+
+
+def ensure_action_response(response: requests.Response, adapter: str) -> None:
+    """Raise a classified error while supporting simple test doubles."""
+    if hasattr(response, "ok"):
+        if not response.ok:
+            raise action_error_from_response(response, adapter)
+        return
+    response.raise_for_status()
+
+
 @dataclass(frozen=True)
 class ActionResult:
     """Result returned by an external-action adapter."""
@@ -25,6 +74,11 @@ class ActionResult:
     action: str
     detail: str
     output: dict[str, Any] = field(default_factory=dict)
+    adapter: str = ""
+    external_reference: str | None = None
+    duration_ms: int = 0
+    idempotency_key: str | None = None
+    correlation_id: str | None = None
 
     def __getitem__(self, key: str) -> Any:
         """Expose legacy mapping-style access for webhook adapters."""
@@ -34,6 +88,8 @@ class ActionResult:
             return self.detail
         if key == "output":
             return self.output
+        if key == "external_reference":
+            return self.external_reference
         raise KeyError(key)
 
 
@@ -59,16 +115,23 @@ ACTION_BY_STEP: dict[str, str] = {
 class SimulatedMicrosoftAdapter:
     """Safe local adapter used until real Microsoft credentials are supplied."""
 
+    adapter_name = "SimulatedMicrosoftAdapter"
+
     def execute(self, action: str, context: dict[str, Any]) -> ActionResult:
         employee = context["employee_email"]
         return ActionResult(
             action=action,
             detail=f"simulated Microsoft action '{action}' for {employee}",
+            adapter=self.adapter_name,
+            idempotency_key=context.get("idempotency_key"),
+            correlation_id=context.get("correlation_id"),
         )
 
 
 class PowerAutomateAdapter:
     """POSTs sanitized checklist context to a Power Automate trigger."""
+
+    adapter_name = "power_automate"
 
     def __init__(self, url: str, timeout: float = 10.0) -> None:
         self.url = url
@@ -83,8 +146,14 @@ class PowerAutomateAdapter:
             json=payload,
             timeout=self.timeout,
         )
-        response.raise_for_status()
-        return ActionResult(action=action, detail="Power Automate webhook accepted action")
+        ensure_action_response(response, "Power Automate")
+        return ActionResult(
+            action=action,
+            detail="Power Automate webhook accepted action",
+            adapter=self.adapter_name,
+            idempotency_key=context.get("idempotency_key"),
+            correlation_id=context.get("correlation_id"),
+        )
 
 
 class GenericWebhookAdapter:
@@ -94,6 +163,8 @@ class GenericWebhookAdapter:
     If a ``secret`` is provided, the ``X-Webhook-Secret`` header is set by
     default and can be overridden via ``headers``.
     """
+
+    adapter_name = "generic_webhook"
 
     def __init__(
         self,
@@ -119,16 +190,23 @@ class GenericWebhookAdapter:
             headers=self.headers or None,
             timeout=self.timeout,
         )
-        response.raise_for_status()
-        return ActionResult(action=action, detail="Generic webhook accepted action")
+        ensure_action_response(response, "Webhook")
+        return ActionResult(
+            action=action,
+            detail="Generic webhook accepted action",
+            adapter=self.adapter_name,
+            idempotency_key=context.get("idempotency_key"),
+            correlation_id=context.get("correlation_id"),
+        )
 
 
-class PowerShellError(RuntimeError):
+class PowerShellError(ActionError):
     """A failed PowerShell action; ``retryable`` is False for bad input/config."""
 
     def __init__(self, message: str, *, retryable: bool = True) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.category = "powershell_error"
 
 
 DEFAULT_POWERSHELL_SCRIPT = (

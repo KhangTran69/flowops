@@ -94,6 +94,8 @@ def test_mcp_tools_go_through_the_api(client):
     pending = read_only.list_pending_approvals()
     assert pending and all(p["tenant_key"] == "acme" for p in pending)
     assert isinstance(read_only.list_failed_jobs(), list)
+    with pytest.raises(FlowOpsToolError, match="requires tenant_key"):
+        writer.request_onboarding("onboarding", "A", "a@acme.com", "IT", 1)
 
 
 def test_mcp_server_registers_and_calls_tools(client):

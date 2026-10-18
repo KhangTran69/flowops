@@ -9,11 +9,13 @@ import os
 from typing import Any
 
 import requests
-from src.actions import ActionResult
+from src.actions import ActionResult, ensure_action_response
 
 
 class RPAWebhookAdapter:
     """POSTs checklist context to an RPA webhook endpoint."""
+
+    adapter_name = "rpa"
 
     def __init__(
         self,
@@ -41,10 +43,13 @@ class RPAWebhookAdapter:
             headers=self.headers or None,
             timeout=self.timeout,
         )
-        response.raise_for_status()
+        ensure_action_response(response, "RPA")
         return ActionResult(
             action=action,
             detail=f"RPA webhook accepted action '{action}' for bot '{self.bot}'",
+            adapter=self.adapter_name,
+            idempotency_key=context.get("idempotency_key"),
+            correlation_id=context.get("correlation_id"),
         )
 
 

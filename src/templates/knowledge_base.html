@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Knowledge base — FlowOps{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <span class="eyebrow">Operator guide</span>
+    <h1>Knowledge base</h1>
+    <p class="muted">Search troubleshooting guidance and recommended response steps.</p>
+  </div>
+  <a class="button ghost" href="/ui/tickets">Back to tickets</a>
+</section>
+
+<section class="panel">
+  <form method="get" action="/ui/knowledge-base" class="filter-form">
+    <div class="filter-field" style="flex: 1 1 18rem;">
+      <label for="kb-query">Search articles</label>
+      <input id="kb-query" name="query" value="{{ query }}" placeholder="Try laptop, VPN, password reset…" autocomplete="off">
+    </div>
+    <div class="filter-field">
+      <label for="kb-category">Category</label>
+      <select id="kb-category" name="category">
+        <option value="">All categories</option>
+        {% for option in categories %}<option value="{{ option }}" {% if option == category %}selected{% endif %}>{{ option }}</option>{% endfor %}
+      </select>
+    </div>
+    <button class="button primary" type="submit">Search</button>
+  </form>
+</section>
+
+{% if articles %}
+<section class="feature-grid" aria-label="Knowledge-base articles">
+  {% for article in articles %}
+  <article class="feature-card">
+    <div class="panel-head">
+      <span class="badge info">{{ article.category }}</span>
+      <span class="muted small">{{ article.id }}</span>
+    </div>
+    <h2>{{ article.title }}</h2>
+    <p>{{ article.summary }}</p>
+    <h3>Recommended steps</h3>
+    <ol class="steps-list">
+      {% for step in article.steps %}<li>{{ step }}</li>{% endfor %}
+    </ol>
+    <div class="article-keywords"><span class="muted small">Keywords:</span> {% for keyword in article.keywords %}<span class="badge">{{ keyword }}</span> {% endfor %}</div>
+  </article>
+  {% endfor %}
+</section>
+{% else %}
+<p class="empty">No articles matched your search. Try a broader term such as “access”, “hardware”, or “network”.</p>
+{% endif %}
+{% endblock %}

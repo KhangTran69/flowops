@@ -11,7 +11,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from src import chatops, db, definitions, jobs, scheduler, ui_session, web, workflow
+from src import ai_agent, chatops, db, definitions, jobs, scheduler, ui_session, web, workflow
 
 from fastapi import APIRouter
 
@@ -167,6 +167,36 @@ def ui_tickets(
         request,
         "tickets.html",
         {"active": "tickets", "tickets": tickets},
+    )
+
+
+@router.get("/ui/knowledge-base", response_class=HTMLResponse, include_in_schema=False)
+def ui_knowledge_base(
+    request: Request,
+    query: Optional[str] = Query(default=None, max_length=200),
+    category: Optional[str] = Query(default=None, max_length=64),
+) -> HTMLResponse:
+    """Render knowledge-base results for operators instead of raw JSON."""
+    articles = list(ai_agent.list_knowledge_base())
+    if query:
+        exact = [article for article in articles if article.id.lower() == query.lower()]
+        if exact:
+            articles = exact
+        else:
+            articles = [match.article for match in ai_agent.search_knowledge_base(query)]
+    if category:
+        articles = [article for article in articles if article.category == category]
+    categories = sorted({article.category for article in ai_agent.list_knowledge_base()})
+    return web.render(
+        request,
+        "knowledge_base.html",
+        {
+            "active": "knowledge_base",
+            "articles": articles,
+            "query": query or "",
+            "category": category or "",
+            "categories": categories,
+        },
     )
 
 

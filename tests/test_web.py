@@ -53,6 +53,15 @@ def test_static_assets_are_served(client):
     assert "text/javascript" in js.headers["content-type"]
 
 
+def test_knowledge_base_ui_renders_articles_instead_of_json(client):
+    response = client.get("/ui/knowledge-base", params={"query": "kb-hardware"})
+    assert response.status_code == 200
+    assert "Knowledge base" in response.text
+    assert "Triage laptop, monitor, and peripheral faults" in response.text
+    assert "Recommended steps" in response.text
+    assert "application/json" not in response.headers.get("content-type", "")
+
+
 def test_dashboard_template_and_empty_states(client):
     page = client.get("/dashboard").text
     assert "FlowOps monitoring dashboard" in page
