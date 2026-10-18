@@ -20,6 +20,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    event,
     inspect,
     text,
 )
@@ -353,13 +354,44 @@ class OffboardingCompletionRecord(Base):
 
 _tables_ready = False
 _tables_lock = threading.Lock()
+
+def _sqlite_connect_args(url: str) -> dict:
+    """SQLite needs a generous busy timeout so concurrent workers queue, not fail."""
+    if not str(url).startswith("sqlite"):
+        return {}
+    return {"check_same_thread": False, "timeout": 30}
+
+
+def _enable_sqlite_pragmas(target_engine) -> None:
+    """WAL + busy_timeout keep concurrent workers from raising 'database is locked'.
+
+    WAL lets readers proceed during a write and busy_timeout makes a blocked
+    writer wait instead of failing immediately, which is what makes running more
+    than one worker against SQLite viable.
+    """
+    if target_engine.dialect.name != "sqlite":
+        return
+    if target_engine.url.database in (None, "", ":memory:"):
+        return
+
+    @event.listens_for(target_engine, "connect")
+    def _set_sqlite_pragmas(dbapi_connection, _record):  # pragma: no cover - driver hook
+        cursor = dbapi_connection.cursor()
+        try:
+            # journal_mode is set once in _ensure_tables: switching it requires an
+            # exclusive lock, so doing it on every connect can block under load.
+            cursor.execute("PRAGMA busy_timeout=30000")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+        finally:
+            cursor.close()
+
+
 engine = create_engine(
     DEFAULT_DATABASE_URL,
-    connect_args={"check_same_thread": False}
-    if DEFAULT_DATABASE_URL.startswith("sqlite")
-    else {},
+    connect_args=_sqlite_connect_args(DEFAULT_DATABASE_URL),
 )
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+_enable_sqlite_pragmas(engine)
 
 
 def use_database(url: str) -> None:
@@ -367,9 +399,10 @@ def use_database(url: str) -> None:
     global engine, SessionLocal, _tables_ready
     engine = create_engine(
         url,
-        connect_args={"check_same_thread": False} if url.startswith("sqlite") else {},
+        connect_args=_sqlite_connect_args(url),
     )
     SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+    _enable_sqlite_pragmas(engine)
     _tables_ready = False
 
 
@@ -564,6 +597,9 @@ def _ensure_tables() -> None:
         if _tables_ready:
             return
         _ensure_sqlite_dir()
+        if engine.dialect.name == "sqlite" and engine.url.database not in (None, "", ":memory:"):
+            with engine.begin() as connection:
+                connection.execute(text("PRAGMA journal_mode=WAL"))
         Base.metadata.create_all(engine)
         _add_missing_columns()
         _ensure_idempotency_owner_token()
