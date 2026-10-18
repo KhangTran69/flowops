@@ -2463,6 +2463,7 @@ def list_audit_trail(
     ]
 
 
+from src.routes import connectors as _connector_routes  # noqa: E402  (v1.4)
 from src.routes import reports as _report_routes  # noqa: E402
 from src.routes import tenants as _tenant_routes  # noqa: E402
 from src.routes import triggers as _trigger_routes  # noqa: E402
@@ -2470,6 +2471,7 @@ from src.routes import ui as _ui_routes  # noqa: E402  (registered last: owns th
 
 app.include_router(_tenant_routes.router)
 app.include_router(_report_routes.router)
+app.include_router(_connector_routes.router)
 app.include_router(_trigger_routes.router)
 
 app.include_router(_ui_routes.router)

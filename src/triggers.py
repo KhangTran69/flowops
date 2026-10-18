@@ -300,8 +300,11 @@ def is_due_daily(trigger: db.TriggerRecord, now: datetime) -> bool:
     if trigger.last_fired_at.tzinfo is None:
         trigger.last_fired_at = trigger.last_fired_at.replace(tzinfo=timezone.utc)
 
-    # Fire if we haven't fired since today's target time
-    return trigger.last_fired_at < today_target
+    # Due only when the most recent occurrence of the target time (today's if
+    # it has passed, otherwise yesterday's) has not yet been fired; before the
+    # scheduled hour the trigger must wait, not fire early.
+    latest_target = today_target if today_target <= now else today_target - timedelta(days=1)
+    return trigger.last_fired_at < latest_target
 
 
 def next_window_start(trigger: db.TriggerRecord, now: datetime) -> datetime:

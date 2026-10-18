@@ -742,6 +742,93 @@ class WorkflowDefinitionVersionRecord(Base):
     )
 
 
+class ConnectorRecord(Base):
+    """Configured event source (v1.4 connector framework).
+
+    ``config_json`` holds connector settings; secret values are stored as
+    environment-variable *names* (like ``TenantRecord.credential_ref``), never
+    as raw credentials. Example Jira config::
+
+        {"base_url": "https://acme.atlassian.net", "email": "bot@acme.io",
+         "api_token_env": "FLOWOPS_JIRA_TOKEN", "jql": "project = OPS"}
+    """
+
+    __tablename__ = "connectors"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    connector_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="polling")
+    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    config_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    cursor_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    last_polled_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class EventRecord(Base):
+    """Raw normalized external event (v1.4 event-driven triggers).
+
+    ``fingerprint`` is ``source:event_type:external_id`` and enforces at-least-
+    once ingestion: replays from pollers or retried webhooks become no-ops.
+    """
+
+    __tablename__ = "events"
+    __table_args__ = (
+        UniqueConstraint("fingerprint", name="uq_event_fingerprint"),
+        Index("ix_events_source_type", "source", "event_type"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(40), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    external_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(400), nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    processed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class TriggerRuleRecord(Base):
+    """Event-driven trigger rule (v1.4).
+
+    Matches events by ``event_type`` (or ``"*"``) plus a safe predicate over
+    the event context, then fires exactly one action: start an onboarding
+    workflow run (``start_workflow``) or enqueue an outbox notification
+    (``notify``).
+    """
+
+    __tablename__ = "trigger_rules"
+    __table_args__ = (
+        UniqueConstraint(
+            "name", "tenant_key", name="uq_trigger_rule_name_tenant"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    source: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    event_type: Mapped[str] = mapped_column(String(80), nullable=False, default="*")
+    predicate: Mapped[str] = mapped_column(String(2000), nullable=False, default="true")
+    action_type: Mapped[str] = mapped_column(String(24), nullable=False)
+    request_type: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    static_inputs_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    notify_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    fired_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
 class WorkflowTimerRecord(Base):
     """Leased SLA timer for a checklist item (v1.3)."""
 
