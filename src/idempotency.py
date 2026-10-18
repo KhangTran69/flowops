@@ -49,6 +49,12 @@ REPLAY_ACTIONS = {
     SCOPE_ONBOARDING: "onboarding.request.idempotent_replay",
 }
 
+# Lifecycle states, stored inside the ``response_json`` payload under the
+# ``state`` key (the table has no dedicated status column; legacy rows are
+# matched via a JSON-shape LIKE, so these literals must stay compact-stable).
+STATE_PROCESSING = "processing"
+STATE_COMPLETED = "completed"
+
 
 def _retention_hours() -> float:
     raw = os.environ.get("FLOWOPS_IDEMPOTENCY_RETENTION_HOURS", "168")

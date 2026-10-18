@@ -354,11 +354,6 @@ def build_connector(connector_type: str, config: dict[str, Any]) -> SourceConnec
         if key.endswith("_env"):
             value = os.environ.get(str(config[key]), "")
             if not value:
-                if connector_type == "slack" and key == "signing_secret_env":
-                    # Slack signing secret is optional: unsigned deliveries
-                    # are accepted (verified only when a secret is set).
-                    kwargs["signing_secret"] = ""
-                    continue
                 raise ValueError(
                     f"Connector {connector_type!r}: env var {config[key]!r} is not set"
                 )
@@ -517,6 +512,11 @@ def _fire_rule(
     except json.JSONDecodeError:
         inputs = {}
     if not _rule_allows_tenant(locked, event, inputs):
+        # Roll back only the idempotency-log row added above so a blocked
+        # firing can be retried later (e.g. after the tenant is allow-listed)
+        # without poisoning the (rule, event) key or aborting the savepoint.
+        session.flush()
+        session.begin_nested().rollback()
         return FiredAction(
             locked.id, locked.name, locked.action_type,
             f"tenant {event.tenant_key!r} not allowed by rule", ok=False,
@@ -552,6 +552,16 @@ def _fire_start_workflow(
 
     request_type = rule.request_type or "onboarding"
     tenant_key = event.tenant_key or rule.tenant_key
+    # Fail fast with a clean FiredAction if the tenant is unknown/inactive,
+    # instead of letting _create_onboarding_request's HTTPException abort the
+    # ingestion savepoint.
+    if tenant_key is not None:
+        tenant = session.get(db.TenantRecord, tenant_key)
+        if tenant is None or not tenant.active:
+            return FiredAction(
+                rule.id, rule.name, rule.action_type,
+                f"unknown or inactive tenant {tenant_key!r}", ok=False,
+            )
     emails = inputs.get("employee_emails") or [
         f"{event.source}-trigger@flowops.local"
     ]
