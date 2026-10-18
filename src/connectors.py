@@ -354,11 +354,6 @@ def build_connector(connector_type: str, config: dict[str, Any]) -> SourceConnec
         if key.endswith("_env"):
             value = os.environ.get(str(config[key]), "")
             if not value:
-                if connector_type == "slack" and key == "signing_secret_env":
-                    # Slack signing secret is optional: unsigned deliveries
-                    # are accepted (verified only when a secret is set).
-                    kwargs["signing_secret"] = ""
-                    continue
                 raise ValueError(
                     f"Connector {connector_type!r}: env var {config[key]!r} is not set"
                 )

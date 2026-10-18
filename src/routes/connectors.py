@@ -213,7 +213,7 @@ def poll_now(
     return {"ingested": connector_lib.poll_all_connectors()}
 
 
-@router.post("/connectors/{connector_id}/webhook")
+@router.post("/connectors/{connector_id}/webhook", status_code=201)
 async def connector_webhook(
     connector_id: int,
     request: Request,

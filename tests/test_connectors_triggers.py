@@ -10,6 +10,7 @@ from src import api, connectors, db
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("FLOWOPS_ACTION_ADAPTER", "simulated")
     db.use_database(f"sqlite:///{tmp_path / 'connectors.db'}")
+    db._ensure_tables()  # direct SessionLocal use below needs tables before first request
     with TestClient(api.app) as test_client:
         yield test_client
 
@@ -258,11 +259,14 @@ def test_poll_all_connectors_survives_failures(client, monkeypatch):
 
 
 def test_tenant_scoped_rules_only_fire_for_their_tenant(client):
-    _make_rule(client, name="acme-only", tenant_key="acme", event_type="*")
+    # Tenants must exist before a tenant-scoped rule can be created.
     with db.SessionLocal() as session:
         session.add(db.TenantRecord(key="acme", name="Acme"))
         session.add(db.TenantRecord(key="globex", name="Globex"))
         session.commit()
+    _make_rule(
+        client, name="acme-only", tenant_key="acme", event_type="*", predicate="1 == 1"
+    )
 
     other = client.post(
         "/events",
