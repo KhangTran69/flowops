@@ -217,7 +217,7 @@ def test_connector_crud_and_webhook_sink(client):
         f"/connectors/{generic['id']}/webhook",
         json={"events": [{"type": "alert", "id": "A-1", "payload": {"sev": 3}}]},
     )
-    assert delivered.status_code == 200
+    assert delivered.status_code == 201  # first delivery creates events, like POST /events
     assert delivered.json()["received"] == 1
 
     # A misconfigured secret env surfaces as 503, not a crash.
