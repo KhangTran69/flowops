@@ -1,0 +1,58 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "displayName": "FlowOps MSP Automation (sanitized reference)",
+    "artifactType": "power-platform-solution-manifest",
+    "portable": false,
+    "nativeExportRequired": true,
+    "security": "No URLs, connection IDs, environment IDs, or secrets are included."
+  },
+  "parameters": {
+    "flowopsBaseUrl": {
+      "type": "string",
+      "defaultValue": "https://flowops.example.invalid"
+    },
+    "flowopsBearerToken": {
+      "type": "secureString",
+      "metadata": {
+        "description": "Bind through an environment variable or Key Vault-backed connection reference."
+      }
+    }
+  },
+  "components": [
+    {
+      "name": "HR New Starter - FlowOps",
+      "type": "cloud-flow",
+      "trigger": "When an HTTP request is received",
+      "definition": "hr-new-starter.json",
+      "connections": [
+        "shared_http",
+        "shared_teams",
+        "shared_approvals"
+      ]
+    },
+    {
+      "name": "FlowOps Event Notifications",
+      "type": "cloud-flow",
+      "trigger": "When an HTTP request is received",
+      "definition": "event-notifications.json",
+      "connections": [
+        "shared_http",
+        "shared_teams",
+        "shared_sharepoint"
+      ]
+    }
+  ],
+  "deployment": {
+    "import": "Create a Power Platform solution, add the listed cloud flows, and replace parameters with environment variables.",
+    "nativeExport": "After importing and testing, export the managed or unmanaged solution from Power Platform and store the sanitized zip outside this repository.",
+    "requiredTests": [
+      "duplicate request_id",
+      "approval rejection",
+      "HTTP 401/403",
+      "HTTP 429/5xx",
+      "FlowOps dead-letter job"
+    ]
+  }
+}

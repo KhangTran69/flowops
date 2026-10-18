@@ -27,6 +27,7 @@ DEFAULT_MAX_PARALLEL = 4
 DEFAULT_LEASE_SECONDS = 60
 TICK_COUNTS = {"claimed": 0, "empty": 0}
 TRIGGER_TICK_COUNTS = {"fired": 0, "skipped": 0}
+CONNECTOR_TICK_COUNTS = {"ingested": 0, "errors": 0}
 
 
 def _env_int(name: str, default: int) -> int:
@@ -463,12 +464,31 @@ def tick_all(*, now: Optional[datetime] = None, worker_id: str = "scheduler") ->
                 status="success",
                 ticket_id=None,
                 duration_ms=0,
-                detail=f"scheduled trigger={tick.trigger_key}, event_id={tick.event_id}",
-                actor_subject=f"trigger:{tick.trigger_key}",
+                detail=f"scheduled trigger={trigger_tick.trigger_key}, event_id={trigger_tick.event_id}",
+                actor_subject=f"trigger:{trigger_tick.trigger_key}",
             )
         if not trigger_ticks:
             TRIGGER_TICK_COUNTS["skipped"] = TRIGGER_TICK_COUNTS.get("skipped", 0) + 1
         session.commit()
+
+        # Poll due source connectors (v1.4). Imported lazily: src.connectors
+        # imports this module, so a top-level import would be circular. The
+        # poller owns its sessions and isolates per-connector failures.
+        from src import connectors
+
+        try:
+            CONNECTOR_TICK_COUNTS["ingested"] += connectors.poll_all_connectors(now=now)
+        except Exception as error:  # pragma: no cover - defensive heartbeat guard
+            CONNECTOR_TICK_COUNTS["errors"] += 1
+            db.log_execution(
+                session,
+                run_id=uuid.uuid4().hex[:12],
+                action="scheduler.connector_poll_error",
+                status="failure",
+                detail=f"{type(error).__name__}: {error}",
+                actor_subject="scheduler",
+            )
+            session.commit()
 
         return claimed
     finally:

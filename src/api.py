@@ -12,8 +12,9 @@ import threading
 import time
 import uuid
 from collections import Counter
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal, Optional
+from typing import Any, AsyncIterator, Literal, Optional
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
@@ -139,6 +140,14 @@ def _notify_action_failure(
 # monkeypatch this module attribute with failing/succeeding doubles.
 ACTION_ADAPTER = adapter_from_environment()
 
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
+    """Validate security configuration when the application starts."""
+    validate_auth_configuration()
+    ui_session.validate_ui_auth_configuration()
+    yield
+
 app = FastAPI(
     title="FlowOps",
     description=(
@@ -147,6 +156,7 @@ app = FastAPI(
         "ticket data is simulated, not real support tickets."
     ),
     version="1.0.0-preview",
+    lifespan=_lifespan,
 )
 app.mount(
     "/static",
@@ -195,12 +205,6 @@ async def correlation_and_metrics(request: Request, call_next):
     _record_request(request.method, route_path, response.status_code, duration)
     response.headers["X-Correlation-ID"] = correlation_id
     return response
-
-
-@app.on_event("startup")
-def _validate_auth_on_startup() -> None:
-    validate_auth_configuration()
-    ui_session.validate_ui_auth_configuration()
 
 
 @app.get("/auth/me")
@@ -359,7 +363,7 @@ def metrics_endpoint(session: Session = Depends(db.get_session)) -> Response:
     job_counts = Counter(job.status for job in job_records)
     lines.extend(
         [
-            "flowops_workflow_jobs",
+            "# HELP flowops_workflow_jobs Workflow jobs by state",
             "# TYPE flowops_workflow_jobs gauge",
         ]
     )
@@ -2463,6 +2467,7 @@ def list_audit_trail(
     ]
 
 
+from src.routes import analytics as _analytics_routes  # noqa: E402  (v1.5)
 from src.routes import connectors as _connector_routes  # noqa: E402  (v1.4)
 from src.routes import reports as _report_routes  # noqa: E402
 from src.routes import tenants as _tenant_routes  # noqa: E402
@@ -2473,5 +2478,6 @@ app.include_router(_tenant_routes.router)
 app.include_router(_report_routes.router)
 app.include_router(_connector_routes.router)
 app.include_router(_trigger_routes.router)
+app.include_router(_analytics_routes.router)
 
 app.include_router(_ui_routes.router)

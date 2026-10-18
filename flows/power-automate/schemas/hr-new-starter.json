@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "FlowOps HR new starter",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "request_id",
+    "employee_name",
+    "employee_email",
+    "department",
+    "requester_id"
+  ],
+  "properties": {
+    "request_id": { "type": "string", "minLength": 1 },
+    "employee_name": { "type": "string", "minLength": 1 },
+    "employee_email": { "type": "string", "format": "email" },
+    "department": { "type": "string", "minLength": 1 },
+    "requester_id": { "type": "integer", "minimum": 1 },
+    "tenant_key": { "type": ["string", "null"] },
+    "start_date": { "type": ["string", "null"] }
+  }
+}

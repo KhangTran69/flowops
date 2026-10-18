@@ -1,0 +1,42 @@
+{
+  "name": "FlowOps MSP automation reference",
+  "version": "1.0.0",
+  "artifactType": "rewst-reference-manifest",
+  "portable": false,
+  "nativeExportRequired": true,
+  "description": "Sanitized workflow blueprint. Recreate these blocks in a Rewst workspace and export the native package from that workspace.",
+  "workflows": [
+    {
+      "name": "HR New Starter - FlowOps",
+      "trigger": "webhook",
+      "subworkflows": [
+        "normalize-and-validate",
+        "create-flowops-request",
+        "human-approval",
+        "provision-m365",
+        "sync-connectwise",
+        "notify-service-delivery"
+      ],
+      "idempotency": "rewst-hr-{{ request_id }}",
+      "requiredInputs": ["request_id", "employee_email", "department", "tenant_key"],
+      "failurePolicy": {
+        "retryStatusCodes": [408, 429, 500, 502, 503, 504],
+        "deadLetterPermanentFailures": true,
+        "capture": ["rewst_job_id", "flowops_correlation_id", "tenant_key"]
+      }
+    },
+    {
+      "name": "Tenant Drift and Failed Jobs Digest",
+      "trigger": "schedule: weekdays 06:00",
+      "subworkflows": ["tenant-drift-check", "failed-job-report", "notify-on-call"],
+      "failurePolicy": {
+        "retryStatusCodes": [408, 429, 500, 502, 503, 504],
+        "notifyOnFailure": true
+      }
+    }
+  ],
+  "credentials": {
+    "policy": "Use Rewst credential objects. Never put secret values in workflow variables, logs, tickets, or this repository.",
+    "references": ["flowops_api", "microsoft_graph", "exchange_online", "connectwise_manage", "teams"]
+  }
+}

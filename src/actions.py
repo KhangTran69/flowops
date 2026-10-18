@@ -26,6 +26,16 @@ class ActionResult:
     detail: str
     output: dict[str, Any] = field(default_factory=dict)
 
+    def __getitem__(self, key: str) -> Any:
+        """Expose legacy mapping-style access for webhook adapters."""
+        if key == "action":
+            return self.action
+        if key == "detail":
+            return self.detail
+        if key == "output":
+            return self.output
+        raise KeyError(key)
+
 
 class ActionAdapter(Protocol):
     """Interface implemented by real or simulated action providers."""
@@ -75,6 +85,42 @@ class PowerAutomateAdapter:
         )
         response.raise_for_status()
         return ActionResult(action=action, detail="Power Automate webhook accepted action")
+
+
+class GenericWebhookAdapter:
+    """POSTs sanitized checklist context to an external webhook endpoint.
+
+    Works with Make, Rewst, Zapier, or any generic webhook consumer.
+    If a ``secret`` is provided, the ``X-Webhook-Secret`` header is set by
+    default and can be overridden via ``headers``.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        headers: dict[str, str] | None = None,
+        timeout: float = 10.0,
+        secret: str | None = None,
+    ) -> None:
+        self.url = url
+        self.timeout = timeout
+        self.secret = secret
+        self.headers = dict(headers or {})
+        if secret and "X-Webhook-Secret" not in self.headers:
+            self.headers["X-Webhook-Secret"] = secret
+
+    def execute(self, action: str, context: dict[str, Any]) -> ActionResult:
+        payload: dict[str, Any] = {"action": action, "context": context}
+        if context.get("idempotency_key"):
+            payload["idempotency_key"] = context["idempotency_key"]
+        response = requests.post(
+            self.url,
+            json=payload,
+            headers=self.headers or None,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        return ActionResult(action=action, detail="Generic webhook accepted action")
 
 
 class PowerShellError(RuntimeError):
@@ -321,8 +367,24 @@ def adapter_from_environment(environ: dict[str, str] | None = None) -> ActionAda
             exchange_fallback=fallback,
             default_sku=values.get("FLOWOPS_GRAPH_DEFAULT_SKU") or "O365_BUSINESS_PREMIUM",
         )
+    if name == "webhook":
+        url = values.get("FLOWOPS_WEBHOOK_URL")
+        if not url:
+            raise ValueError("FLOWOPS_WEBHOOK_URL is required for webhook")
+        return GenericWebhookAdapter(
+            url=url,
+            timeout=float(values.get("FLOWOPS_WEBHOOK_TIMEOUT", "10.0")),
+            secret=values.get("FLOWOPS_WEBHOOK_SECRET") or None,
+        )
     if name == "powershell":
         return _powershell_from_environment(values)
+    if name == "rpa":
+        from src.rpa import rpa_from_env
+
+        adapter = rpa_from_env(values)
+        if adapter is None:
+            raise ValueError("FLOWOPS_RPA_WEBHOOK_URL is required for rpa")
+        return adapter
     raise ValueError(f"Unsupported FLOWOPS_ACTION_ADAPTER: {name!r}")
 
 

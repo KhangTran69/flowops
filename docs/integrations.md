@@ -118,6 +118,16 @@ Three exported workflows: email-to-ticket intake, HR new starter to
 onboarding, and a nightly drift and dead-letter digest that is also the error
 workflow for the other two. See [flows/n8n/README.md](../flows/n8n/README.md).
 
+## RPA webhook adapter (`src/rpa.py`)
+
+Set `FLOWOPS_ACTION_ADAPTER=rpa` to send approved checklist actions to an
+external RPA bot endpoint. `FLOWOPS_RPA_BOT` selects the bot/work queue and
+`FLOWOPS_RPA_SECRET` is sent as `X-RPA-Secret`. The stable workflow
+`idempotency_key` is included in the payload so a bot can deduplicate retries.
+The adapter returns the same typed `ActionResult` as Graph, Power Automate,
+PowerShell, and simulated adapters, so retry, audit, and dead-letter behavior
+does not change when the execution platform changes.
+
 ## SQL reporting (`src/reports.py`, `sql/reporting_queries.sql`)
 
 Migration `0009` creates the views `v_automation_daily`, `v_action_reliability`,

@@ -4,7 +4,7 @@
 
 FlowOps is an IT workflow automation platform. It receives support tickets and onboarding/offboarding requests, validates their data, classifies and routes them according to business rules, persists records, logs every workflow execution, and exposes a monitoring dashboard.
 
-> **MSP automation highlights:** [integrations guide](docs/integrations.md) (Graph, Exchange Online PowerShell, ConnectWise, Claude, MCP, multi-tenant) · [n8n workflows](flows/n8n/) · [SQL reports](sql/reporting_queries.sql) · [runbooks](docs/runbooks/).
+> **MSP automation highlights:** [job alignment](docs/job-alignment.md) · [integrations guide](docs/integrations.md) (Graph, Exchange Online PowerShell, ConnectWise, Claude, MCP, multi-tenant) · [Power Automate guide](flows/power-automate/) · [Rewst blueprint](flows/rewst/) · [n8n workflows](flows/n8n/) · [SQL reports](sql/reporting_queries.sql) · [runbooks](docs/runbooks/).
 
 > ⚠️ **This is a learning prototype, not a production ticketing system.** Sample data comes from [JSONPlaceholder](https://jsonplaceholder.typicode.com/), a free fake REST API. These are **simulated** tickets, not real IT support requests.
 
@@ -14,6 +14,18 @@ FlowOps is an IT workflow automation platform. It receives support tickets and o
 2. **Employee onboarding and offboarding** — a manager submits a request; the system generates a checklist for accounts, equipment, software access, and approvals, then tracks completion.
 3. **AI support agent** — an AI model summarizes ticket history, suggests solutions from a knowledge base, and recommends actions; sensitive actions always require human approval.
 4. **Automation monitoring dashboard** — track successful and failed workflow runs, processing time, tickets handled automatically, and estimated staff time saved.
+
+## Five-minute job-relevant demo
+
+1. Start the API with `uvicorn src.api:app --reload`.
+2. Submit a ticket or HR onboarding request through the API docs at `/docs`.
+3. Show the idempotent request, approval gate, worker job, and audit event.
+4. Open `/dashboard` and `/reports/summary` to show reliability and time-saved KPIs.
+5. Compare the same workflow's [n8n export](flows/n8n/), [Power Automate build](flows/power-automate/), and [Rewst blueprint](flows/rewst/).
+
+The platform-specific layer is deliberately thin. FlowOps owns validation,
+tenant scoping, idempotency, auditability, and error semantics so a workflow
+can move between automation tools without changing the safety model.
 
 ## What is implemented
 
@@ -40,6 +52,8 @@ FlowOps is an IT workflow automation platform. It receives support tickets and o
 | v0.6 Microsoft 365 actions | ✅ | Real Microsoft Graph client (OAuth2 client credentials, OData `$filter`, `@odata.nextLink`, 429 `Retry-After`) and Exchange Online PowerShell for steps Graph can't do. Tested offline; live use needs tenant credentials |
 | v1.4 Multi-tenant (GDAP) | ✅ | Tenant registry, per-tenant credentials and licence/usage-location config, cross-tenant config-drift check |
 | v1.4 PSA + AI integrations | ✅ | ConnectWise Manage client (conditions, PATCH, notes, time entries) with idempotent ticket sync; Claude provider; MCP server for AI agents |
+| v1.5 RPA adapter | ✅ | First-class webhook adapter for UiPath/Automation Anywhere/Blue Prism-style bots with bot routing, idempotency propagation, and secret headers |
+| v1.5 Operational analytics | ✅ | Tenant-scoped run analytics, step bottlenecks, SLA breach/risk reporting, and stale workflow heartbeat detection |
 | v1.4 n8n + SQL reporting + runbooks | ✅ | Exported n8n workflows, SQL KPI views + PostgreSQL function, plain-English runbooks for non-technical staff |
 | v0.7 AI support agent | ✅ | Simulated AI triage, KB search, suggest-only recommendations, human-approved apply gate |
 
@@ -79,11 +93,14 @@ flowops/
 │   ├── connectwise.py        # ConnectWise Manage client + idempotent ticket sync
 │   ├── reports.py            # SQL reporting views and KPI queries
 │   ├── mcp_server.py         # MCP server exposing FlowOps tools to Claude/AI agents
+│   ├── rpa.py                # generic RPA webhook adapter with bot routing
 │   ├── web.py                # Jinja2 rendering helpers
 │   ├── templates/            # shared layout, landing, dashboard, operator pages
 │   └── static/               # local CSS and vanilla JavaScript
 ├── migrations/               # Alembic migrations (0009: tenants + reporting views)
 ├── flows/n8n/                # exported n8n workflows calling FlowOps webhooks
+├── flows/power-automate/     # Power Automate build guide and schemas
+├── flows/rewst/              # Rewst workflow blueprint and migration notes
 ├── scripts/powershell/       # Exchange Online action script (JSON in/out, dry-run)
 ├── sql/reporting_queries.sql # hand-written KPI queries
 ├── docs/runbooks/            # plain-English runbooks for non-technical staff
@@ -195,6 +212,10 @@ services without deleting the stored PostgreSQL data. Use
 | `GET /ready` | Readiness probe including database connectivity |
 | `GET /metrics` | Prometheus-style request, job, and outbox metrics |
 | `GET /dashboard` | Server-rendered HTML monitoring dashboard |
+| `GET /analytics/summary?days=&tenant=` | Read-only workflow outcomes, durations, approvals, and SLA summary |
+| `GET /analytics/steps?days=&tenant=` | Read-only step duration and failure leaderboard |
+| `GET /analytics/health?stuck_minutes=&tenant=` | Tenant-scoped active runs with stale scheduler heartbeats |
+| `GET /ui/analytics` | Operator analytics and workflow-health page |
 | `GET /ui/onboarding-requests[/{id}]` | Operator onboarding list/detail pages |
 | `GET /ui/notifications` | Operator pending/dead-letter outbox page |
 | `GET /ui/workflow-jobs` | Operator workflow queue page |

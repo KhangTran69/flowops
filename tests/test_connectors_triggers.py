@@ -1,5 +1,7 @@
 """v1.4 event-driven triggers & connector framework (in-process, offline)."""
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -259,6 +261,19 @@ def test_poll_all_connectors_survives_failures(client, monkeypatch):
     with db.SessionLocal() as session:
         actions = [r.action for r in session.query(db.ExecutionLogRecord).all()]
     assert "connector.poll_failed" in actions
+
+
+def test_connector_due_normalizes_naive_time_and_bad_backoff_state():
+    record = db.ConnectorRecord(
+        name="legacy",
+        connector_type="generic_json",
+        kind="polling",
+        config_json='{"poll_interval": 30}',
+        cursor_json='{"failures": "not-a-number"}',
+        last_polled_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+
+    assert connectors.connector_due(record, datetime.now()) is True
 
 
 def test_tenant_scoped_rules_only_fire_for_their_tenant(client):

@@ -1,0 +1,66 @@
+{
+  "name": "HR New Starter - FlowOps",
+  "artifactType": "power-automate-reference-definition",
+  "portable": false,
+  "notes": "Sanitized logical definition. Build this inside a Power Platform solution; do not import as a native flow export.",
+  "trigger": {
+    "type": "Request",
+    "method": "POST",
+    "schemaRef": "schemas/hr-new-starter.json"
+  },
+  "actions": [
+    {
+      "name": "Compose idempotency key",
+      "type": "Compose",
+      "expression": "concat('power-automate-hr-', triggerBody()?['request_id'])"
+    },
+    {
+      "name": "Create FlowOps onboarding request",
+      "type": "Http",
+      "method": "POST",
+      "uri": "@{parameters('flowopsBaseUrl')}/onboarding-requests",
+      "headers": {
+        "Authorization": "environment-variable:FlowOpsBearerToken",
+        "Idempotency-Key": "@{outputs('Compose_idempotency_key')}"
+      },
+      "body": {
+        "request_type": "onboarding",
+        "employee_name": "@{triggerBody()?['employee_name']}",
+        "employee_email": "@{triggerBody()?['employee_email']}",
+        "department": "@{triggerBody()?['department']}",
+        "requester_id": "@{triggerBody()?['requester_id']}",
+        "tenant_key": "@{triggerBody()?['tenant_key']}",
+        "start_date": "@{triggerBody()?['start_date']}"
+      },
+      "retryPolicy": {
+        "type": "exponential",
+        "retryOn": [408, 429, 500, 502, 503, 504]
+      }
+    },
+    {
+      "name": "Parse FlowOps response",
+      "type": "ParseJson",
+      "requiredProperties": ["id", "status", "checklist"]
+    },
+    {
+      "name": "Start approval",
+      "type": "Approval",
+      "condition": "contains gated checklist items",
+      "onRejected": "terminate:rejected"
+    },
+    {
+      "name": "Notify service delivery",
+      "type": "Teams",
+      "body": ["id", "employee_email", "tenant_key", "status"]
+    },
+    {
+      "name": "Return accepted",
+      "type": "Response",
+      "statusCode": 202
+    }
+  ],
+  "errorScope": {
+    "runAfter": ["has failed", "has timed out", "is skipped"],
+    "actions": ["capture workflow run id", "POST /events power_automate_failure", "notify Teams", "return non-2xx"]
+  }
+}

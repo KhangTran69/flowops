@@ -110,6 +110,37 @@ def test_adapter_selection_requires_webhook_url():
     assert isinstance(adapter_from_environment({"FLOWOPS_ACTION_ADAPTER": "power_automate", "FLOWOPS_POWER_AUTOMATE_URL": "https://flow.example/trigger"}), PowerAutomateAdapter)
 
 
+def test_rpa_adapter_is_a_first_class_action_adapter(monkeypatch):
+    from src.actions import ActionResult, adapter_from_environment
+
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+    def fake_post(url, json, headers, timeout):
+        calls.append((url, json, headers, timeout))
+        return Response()
+
+    monkeypatch.setattr("src.rpa.requests.post", fake_post)
+    adapter = adapter_from_environment(
+        {
+            "FLOWOPS_ACTION_ADAPTER": "rpa",
+            "FLOWOPS_RPA_WEBHOOK_URL": "https://rpa.example/run",
+            "FLOWOPS_RPA_BOT": "joiner-bot",
+            "FLOWOPS_RPA_SECRET": "secret",
+        }
+    )
+    result = adapter.execute(
+        "provision_hardware",
+        {"employee_email": "jane@example.com", "idempotency_key": "join-1"},
+    )
+    assert isinstance(result, ActionResult)
+    assert calls[0][1]["idempotency_key"] == "join-1"
+    assert calls[0][2]["X-RPA-Secret"] == "secret"
+
+
 def test_per_action_retry_limit_and_failure_notification(client, monkeypatch):
     calls = []
     notifications = []
@@ -242,3 +273,119 @@ def test_powershell_adapter_from_environment():
     assert isinstance(adapter, PowerShellAdapter)
     assert adapter.command_path == "pwsh.exe"
     assert adapter.dry_run is True
+
+
+def test_webhook_adapter_posts(monkeypatch):
+    from src.actions import GenericWebhookAdapter, ActionResult
+
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+    def fake_post(url, json, headers=None, timeout=None):
+        calls.append((url, json, headers, timeout))
+        return Response()
+
+    monkeypatch.setattr("src.actions.requests.post", fake_post)
+    context = {
+        "employee_email": "jane@example.com",
+        "idempotency_key": "abc-123",
+    }
+    result = GenericWebhookAdapter(
+        "https://webhook.example/trigger",
+        headers={"X-Custom": "yes"},
+        secret="shh",
+        timeout=5.0,
+    ).execute("create_user_account", context)
+
+    assert isinstance(result, ActionResult)
+    assert result.action == "create_user_account"
+    assert calls[0][0] == "https://webhook.example/trigger"
+    payload = calls[0][1]
+    assert payload["action"] == "create_user_account"
+    assert payload["context"] == context
+    assert payload["idempotency_key"] == "abc-123"
+    headers = calls[0][2]
+    assert headers["X-Webhook-Secret"] == "shh"
+    assert headers["X-Custom"] == "yes"
+    assert calls[0][3] == 5.0
+
+
+def test_webhook_adapter_without_idempotency_key(monkeypatch):
+    from src.actions import GenericWebhookAdapter, ActionResult
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+    captured = []
+
+    def fake_post(url, json, headers=None, timeout=None):
+        captured.append(json)
+        return Response()
+
+    monkeypatch.setattr("src.actions.requests.post", fake_post)
+    result = GenericWebhookAdapter("https://webhook.example/trigger").execute(
+        "disable_user_account", {"employee_email": "jane@example.com"}
+    )
+    assert isinstance(result, ActionResult)
+    assert "idempotency_key" not in captured[0]
+
+
+def test_webhook_adapter_requires_url():
+    from src.actions import GenericWebhookAdapter, adapter_from_environment
+
+    with pytest.raises(ValueError, match="FLOWOPS_WEBHOOK_URL"):
+        adapter_from_environment({"FLOWOPS_ACTION_ADAPTER": "webhook"})
+    adapter = adapter_from_environment(
+        {
+            "FLOWOPS_ACTION_ADAPTER": "webhook",
+            "FLOWOPS_WEBHOOK_URL": "https://webhook.example/trigger",
+            "FLOWOPS_WEBHOOK_SECRET": "topsecret",
+        }
+    )
+    assert isinstance(adapter, GenericWebhookAdapter)
+    assert adapter.headers["X-Webhook-Secret"] == "topsecret"
+
+
+def test_rpa_adapter_posts_and_from_env(monkeypatch):
+    from src.rpa import RPAWebhookAdapter, rpa_from_env
+
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+    def fake_post(url, json, headers=None, timeout=None):
+        calls.append((url, json, headers, timeout))
+        return Response()
+
+    monkeypatch.setattr("src.rpa.requests.post", fake_post)
+    result = RPAWebhookAdapter(
+        "https://rpa.example/run",
+        bot="onboarding-bot",
+        secret="rpa-secret",
+    ).execute("create_user_account", {"employee_email": "jane@example.com"})
+
+    assert result["action"] == "create_user_account"
+    assert calls[0][0] == "https://rpa.example/run"
+    payload = calls[0][1]
+    assert payload["bot"] == "onboarding-bot"
+    assert payload["action"] == "create_user_account"
+    assert payload["context"] == {"employee_email": "jane@example.com"}
+    assert calls[0][2]["X-RPA-Secret"] == "rpa-secret"
+
+    assert rpa_from_env({}) is None
+    adapter = rpa_from_env(
+        {
+            "FLOWOPS_RPA_WEBHOOK_URL": "https://rpa.example/run",
+            "FLOWOPS_RPA_BOT": "offboarding-bot",
+            "FLOWOPS_RPA_SECRET": "s3cr3t",
+        }
+    )
+    assert isinstance(adapter, RPAWebhookAdapter)
+    assert adapter.bot == "offboarding-bot"
+    assert adapter.headers["X-RPA-Secret"] == "s3cr3t"

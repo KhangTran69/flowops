@@ -15,3 +15,6 @@ data/*.db
 
 # pytest
 .pytest_cache/
+
+# Local scratch databases and generated test artifacts
+tmp/

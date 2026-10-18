@@ -756,15 +756,81 @@ def ingest_events(session: Session, events: list[NormalizedEvent]) -> list[dict[
 POLL_INTERVAL_SECONDS = max(
     5, int(os.environ.get("FLOWOPS_CONNECTOR_POLL_INTERVAL", "60"))
 )
+#: Floor for a per-connector ``poll_interval`` config — protects external
+#: systems from a scheduler that ticks every couple of seconds.
+MIN_CONNECTOR_POLL_SECONDS = 30
+#: Backoff multiplier cap: a failing source is retried at most 32x its base
+#: interval (e.g. 5m base -> 2h40m between attempts) until it succeeds once.
+MAX_BACKOFF_MULTIPLIER = 32
 
 
-def poll_all_connectors() -> int:
-    """Poll every enabled polling connector once. Returns events ingested.
+def _as_utc(value: datetime) -> datetime:
+    """Normalize scheduler timestamps before comparing persisted values."""
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _poll_state(record: "db.ConnectorRecord") -> dict[str, int]:
+    try:
+        state = json.loads(record.cursor_json or "{}")
+    except (TypeError, ValueError):
+        state = {}
+    if not isinstance(state, dict):
+        state = {}
+    return {
+        "failures": max(0, _safe_int(state.get("failures"))),
+        "last_batch": max(0, _safe_int(state.get("last_batch"))),
+    }
+
+
+def _connector_base_interval(record: "db.ConnectorRecord") -> int:
+    try:
+        configured = json.loads(record.config_json or "{}").get("poll_interval")
+    except (TypeError, ValueError):
+        configured = None
+    if configured is None:
+        return POLL_INTERVAL_SECONDS
+    try:
+        return max(MIN_CONNECTOR_POLL_SECONDS, int(configured))
+    except (TypeError, ValueError):
+        return POLL_INTERVAL_SECONDS
+
+
+def connector_due(record: "db.ConnectorRecord", now: datetime) -> bool:
+    """True when this polling connector should be polled at ``now``.
+
+    A connector is due when ``now - last_polled_at`` covers its effective
+    interval: the base interval (config ``poll_interval``, else the global
+    default) multiplied by exponential backoff for consecutive failures.
+    """
+    now = _as_utc(now)
+    state = _poll_state(record)
+    interval = _connector_base_interval(record) * min(
+        2 ** min(state["failures"], 8), MAX_BACKOFF_MULTIPLIER
+    )
+    if record.last_polled_at is None:
+        return True
+    last = record.last_polled_at
+    if last.tzinfo is None:  # SQLite returns naive datetimes
+        last = last.replace(tzinfo=timezone.utc)
+    return (now - last).total_seconds() >= interval
+
+
+def poll_all_connectors(now: Optional[datetime] = None, *, only_due: bool = True) -> int:
+    """Poll due connectors once. Returns events ingested.
 
     Each connector runs in its own session/transaction so one failing source
     (bad credentials, network outage) never blocks the others; failures are
-    recorded in the execution log for the operator console.
+    recorded in the execution log for the operator console and push the
+    connector's next attempt back exponentially.
     """
+    at = _as_utc(now or datetime.now(timezone.utc))
     count = 0
     session = db.SessionLocal()
     try:
@@ -775,12 +841,20 @@ def poll_all_connectors() -> int:
                 db.ConnectorRecord.kind == "polling",
             )
         ).scalars().all()
+        if only_due:
+            records = [record for record in records if connector_due(record, at)]
     finally:
         session.close()
 
     for record in records:
         session = db.SessionLocal()
         try:
+            # Re-attach inside this connector's own session: `records` came
+            # from a session that is already closed, and mutating a detached
+            # instance would silently never reach the database.
+            record = session.get(db.ConnectorRecord, record.id)
+            if record is None or not record.enabled:
+                continue
             connector = build_connector(
                 record.connector_type, json.loads(record.config_json or "{}")
             )
@@ -789,12 +863,18 @@ def poll_all_connectors() -> int:
             ingested = sum(
                 1 for s in summaries if not s["duplicate"] and "error" not in s
             )
-            record.last_polled_at = datetime.now(timezone.utc)
-            record.cursor_json = json.dumps({"last_batch": len(events)})
+            record.last_polled_at = at
+            record.cursor_json = json.dumps(
+                {"failures": 0, "last_batch": len(events)}
+            )
             session.commit()
             count += ingested
         except Exception as error:
             session.rollback()
+            state = _poll_state(record)
+            state["failures"] += 1
+            record.last_polled_at = at
+            record.cursor_json = json.dumps(state)
             db.log_execution(
                 session,
                 run_id=_new_run_id(),

@@ -1,0 +1,173 @@
+{% extends "base.html" %}
+{% block title %}Analytics — FlowOps{% endblock %}
+{% block content %}
+<section class="page-heading analytics-heading">
+  <div>
+    <span class="eyebrow">Operations · v1.5</span>
+    <h1>Run analytics &amp; SLA reporting</h1>
+    <p class="muted">Outcomes, durations, bottlenecks, approvals, and SLA breaches computed from the workflow ledger.</p>
+  </div>
+  <form method="get" action="/ui/analytics" class="filter-form">
+    <div class="filter-field">
+      <label for="tenant">Tenant</label>
+      <select id="tenant" name="tenant">
+      <option value="" {% if not tenant %}selected{% endif %}>All tenants</option>
+      {% for key in tenants %}<option value="{{ key }}" {% if key == tenant %}selected{% endif %}>{{ key }}</option>{% endfor %}
+      </select>
+    </div>
+    <div class="filter-field">
+      <label for="days">History window</label>
+      <select id="days" name="days">
+      {% for option in (7, 30, 90) %}
+      <option value="{{ option }}" {% if option == days %}selected{% endif %}>{{ option }} days</option>
+      {% endfor %}
+      </select>
+    </div>
+    <div class="filter-field">
+      <label for="stuck_minutes">Stale threshold</label>
+      <select id="stuck_minutes" name="stuck_minutes">
+      {% for option in (15, 30, 60, 120) %}
+      <option value="{{ option }}" {% if option == stuck_minutes %}selected{% endif %}>{{ option }} minutes</option>
+      {% endfor %}
+      </select>
+    </div>
+    <button type="submit" class="button primary small">Update view</button>
+  </form>
+</section>
+
+<section class="insight-strip {% if health.stuck_count or summary.sla.overdue_pending %}risk{% else %}clear{% endif %}" aria-label="Current operational status" aria-live="polite">
+  <div class="insight-icon" aria-hidden="true">{% if health.stuck_count or summary.sla.overdue_pending %}!{% else %}✓{% endif %}</div>
+  <div>
+    {% if health.stuck_count or summary.sla.overdue_pending %}
+    <strong>Attention needed</strong>
+    <span class="muted">{{ health.stuck_count }} stale workflow{{ '' if health.stuck_count == 1 else 's' }} and {{ summary.sla.overdue_pending }} overdue pending SLA timer{{ '' if summary.sla.overdue_pending == 1 else 's' }}.</span>
+    {% else %}
+    <strong>Everything is moving</strong>
+    <span class="muted">No stale workflow heartbeats or overdue pending timers detected.</span>
+    {% endif %}
+  </div>
+  <a class="button small ghost insight-link" href="#health-heading">Review health</a>
+</section>
+
+<section class="panel">
+  <div class="panel-head"><h2>Runs</h2><span class="muted small">{{ summary.runs.total }} runs · completion rate {{ '%d%%' % ((summary.runs.completion_rate or 0) * 100) if summary.runs.completion_rate is not none else '—' }}</span></div>
+  <div class="stat-grid">
+    <div class="stat"><span class="stat-value">{{ summary.runs.total }}</span><span class="stat-label">runs in window</span></div>
+    <div class="stat"><span class="stat-value {% if summary.runs.active %}attention{% endif %}">{{ summary.runs.active }}</span><span class="stat-label">active runs</span></div>
+    <div class="stat"><span class="stat-value">{{ oldest_active_label }}</span><span class="stat-label">oldest active run</span></div>
+    <div class="stat"><span class="stat-value">{{ median_duration_label }}</span><span class="stat-label">median duration</span></div>
+    <div class="stat"><span class="stat-value">{{ p95_duration_label }}</span><span class="stat-label">p95 duration</span></div>
+    <div class="stat"><span class="stat-value {% if summary.sla.breached + summary.sla.overdue_pending %}attention{% endif %}">{{ summary.sla.breached + summary.sla.overdue_pending }}</span><span class="stat-label">SLA items at risk</span></div>
+    <div class="stat"><span class="stat-value">{{ sla_overrun_label }}</span><span class="stat-label">median SLA overrun</span></div>
+  </div>
+  {% if status_rows %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Status</th><th style="width:55%">Runs</th><th>Count</th></tr></thead>
+    <tbody>{% for row in status_rows %}<tr>
+      <td><span class="badge {{ 'ok' if row.status == 'completed' else ('fail' if row.status in ('failed','cancelled') else 'info') }}">{{ row.status }}</span></td>
+      <td><div class="meter" aria-hidden="true"><span class="meter-fill {{ 'ok' if row.status == 'completed' else ('fail' if row.status in ('failed','cancelled') else '') }}" style="width: {{ row.bar }}%"></span></div></td>
+      <td>{{ row.count }}</td>
+    </tr>{% endfor %}</tbody>
+  </table></div>
+  {% else %}<p class="empty">No workflow runs in this window yet.</p>{% endif %}
+</section>
+
+<section class="panel" aria-labelledby="health-heading">
+  <div class="panel-head">
+    <h2 id="health-heading">Workflow health</h2>
+    <span class="muted small">Stale after {{ health.threshold_minutes }} minutes · JSON at <a href="/analytics/health">/analytics/health</a></span>
+  </div>
+  {% if health.stuck_runs %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Run</th><th>Request</th><th>Tenant</th><th>Last heartbeat</th><th>Stale for</th><th>Action</th></tr></thead>
+    <tbody>{% for row in health.stuck_runs %}<tr>
+      <td>#{{ row.run_id }}</td>
+      <td>#{{ row.request_id }}</td>
+      <td>{{ row.tenant_key or '—' }}</td>
+      <td>{{ row.heartbeat_label }}</td>
+      <td><span class="badge fail">{{ row.age_label }}</span></td>
+      <td><a class="button small ghost" href="/ui/onboarding-requests/{{ row.request_id }}">Inspect</a></td>
+    </tr>{% endfor %}</tbody>
+  </table></div>
+  {% else %}
+  <p class="empty">No stale workflow heartbeats detected.</p>
+  {% endif %}
+</section>
+
+<div class="panel-grid">
+  <section class="panel">
+    <div class="panel-head"><h2>By definition</h2></div>
+    {% if summary.by_definition %}
+    <div class="table-wrap"><table>
+      <thead><tr><th>Definition</th><th>Type</th><th>Runs</th><th>Failed</th><th>Median</th><th>p95</th></tr></thead>
+      <tbody>{% for row in summary.by_definition %}<tr>
+        <td>{{ row.definition_key }}</td>
+        <td>{{ row.request_type or '—' }}</td>
+        <td>{{ row.runs }}</td>
+        <td>{{ row.failed }}</td>
+        <td>{{ row.median_label }}</td>
+        <td>{{ row.p95_label }}</td>
+      </tr>{% endfor %}</tbody>
+    </table></div>
+    {% else %}<p class="empty">No definitions exercised in this window.</p>{% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><h2>SLA timers</h2></div>
+    {% if summary.sla.total %}
+    <div class="table-wrap"><table>
+      <thead><tr><th>Status</th><th>Timers</th></tr></thead>
+      <tbody>{% for status, count in summary.sla.by_status.items() %}<tr>
+        <td><span class="badge {{ 'fail' if status == 'fired' else 'info' }}">{{ status }}</span></td>
+        <td>{{ count }}</td>
+      </tr>{% endfor %}</tbody>
+    </table></div>
+    <p class="muted small">Breach rate {{ '%d%%' % ((summary.sla.breach_rate or 0) * 100) if summary.sla.breach_rate is not none else '—' }} · {{ summary.sla.overdue_pending }} pending timer{{ '' if summary.sla.overdue_pending == 1 else 's' }} currently overdue.</p>
+    {% else %}<p class="empty">No SLA timers in this window.</p>{% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><h2>Approvals</h2></div>
+    {% if summary.approvals.total %}
+    <div class="table-wrap"><table>
+      <thead><tr><th>Status</th><th>Items</th></tr></thead>
+      <tbody>{% for status, count in summary.approvals.by_status.items() %}<tr>
+        <td>{{ status }}</td>
+        <td>{{ count }}</td>
+      </tr>{% endfor %}</tbody>
+    </table></div>
+    {% else %}<p class="empty">No approval-gated steps in this window.</p>{% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><h2>Top tenants</h2></div>
+    {% if summary.by_tenant %}
+    <div class="table-wrap"><table>
+      <thead><tr><th>Tenant</th><th>Requests</th></tr></thead>
+      <tbody>{% for row in summary.by_tenant %}<tr>
+        <td>{{ row.tenant_key }}</td>
+        <td>{{ row.requests }}</td>
+      </tr>{% endfor %}</tbody>
+    </table></div>
+    {% else %}<p class="empty">No onboarding requests in this window.</p>{% endif %}
+  </section>
+</div>
+
+<section class="panel">
+  <div class="panel-head"><h2>Step bottlenecks</h2><span class="muted small">Median step duration, slowest first · JSON at <a href="/analytics/steps">/analytics/steps</a></span></div>
+  {% if step_rows %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Step</th><th style="width:40%">Median</th><th>Median</th><th>p95</th><th>Succeeded</th><th>Failed</th></tr></thead>
+    <tbody>{% for row in step_rows %}<tr class="{{ '' if row.ranked else 'muted-row' }}">
+      <td>{{ row.step }}</td>
+      <td><div class="meter" aria-hidden="true"><span class="meter-fill {{ 'fail' if row.failure_rate and row.failure_rate > 0.5 else '' }}" style="width: {{ row.bar }}%"></span></div></td>
+      <td>{{ row.duration_label }}</td>
+      <td>{{ row.p95_label }}</td>
+      <td>{{ row.succeeded }}</td>
+      <td>{{ row.failed }}</td>
+    </tr>{% endfor %}</tbody>
+  </table></div>
+  <p class="muted small">Steps with fewer than 2 timed successes are listed but not ranked.</p>
+  {% else %}<p class="empty">No completed step runs in this window.</p>{% endif %}
+</section>
+{% endblock %}
