@@ -55,10 +55,13 @@ def test_summary_reports_active_runs_and_overdue_pending_timers(client):
         "/analytics/summary",
         params={"days": 30, "tenant": "acme"},
     )
+    elapsed = (db.utcnow().replace(tzinfo=timezone.utc) - now).total_seconds()
     assert response.status_code == 200
     body = response.json()
     assert body["runs"]["active"] == 1
-    assert body["runs"]["oldest_active_seconds"] == pytest.approx(7200.0, abs=1.0)
+    # The server measures age against its own clock after setup ran, so allow
+    # for the wall time this test has spent (slow CI runners took ~3s).
+    assert 7200.0 - 1.0 <= body["runs"]["oldest_active_seconds"] <= 7200.0 + elapsed + 1.0
     assert body["runs"]["failure_rate"] == 0.0
     assert body["sla"]["overdue_pending"] == 1
 
