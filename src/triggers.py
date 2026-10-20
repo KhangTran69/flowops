@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import re
 import secrets
 import time
@@ -57,47 +58,86 @@ def _resolve_path(path: str, scope: Mapping[str, Any]) -> Any:
     return current
 
 
+TRIGGER_SCOPE_FIELDS = ("key", "name", "source_key", "event_type")
+MAX_MAPPING_DEPTH = 16
+MAX_MAPPING_NODES = 1000
+MAX_EVENT_ID_LENGTH = 128
+_DANGEROUS_WORDS = re.compile(r"\b(import|exec|eval|compile)\b|__", re.IGNORECASE)
+
+
+def _validate_reference(value: str) -> None:
+    """Validate a ``$``-prefixed reference string."""
+    if value.startswith("$event."):
+        path = value[len("$event."):]
+    elif value.startswith("$trigger."):
+        path = value[len("$trigger."):]
+        if path not in TRIGGER_SCOPE_FIELDS:
+            raise MappingError(
+                f"Unknown trigger field {value!r}; allowed: {TRIGGER_SCOPE_FIELDS}"
+            )
+    else:
+        raise MappingError(
+            f"Unsupported reference {value!r}; only $event.<path> and $trigger.<field> are allowed"
+        )
+    if not _PATH.match(path):
+        raise MappingError(f"Invalid path reference: {value!r}")
+    if any(segment.startswith("_") for segment in path.split(".")):
+        raise MappingError(f"Private/dunder path segments are not allowed: {value!r}")
+
+
+def _validate_node(value: Any, depth: int, counter: list[int]) -> None:
+    counter[0] += 1
+    if counter[0] > MAX_MAPPING_NODES:
+        raise MappingError(f"Mapping exceeds {MAX_MAPPING_NODES} nodes")
+    if depth > MAX_MAPPING_DEPTH:
+        raise MappingError(f"Mapping nesting exceeds depth {MAX_MAPPING_DEPTH}")
+    if value is None or isinstance(value, (bool, int)):
+        return
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            raise MappingError(f"Non-finite number {value!r} is not allowed")
+        return
+    if isinstance(value, str):
+        if value.startswith("$"):
+            _validate_reference(value)
+        elif _DANGEROUS_WORDS.search(value):
+            raise MappingError(f"Potentially dangerous literal: {value!r}")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str) or not key:
+                raise MappingError(f"Mapping keys must be non-empty strings: {key!r}")
+            if key.startswith("$") or key.startswith("__"):
+                raise MappingError(f"Mapping key {key!r} is not allowed")
+            _validate_node(item, depth + 1, counter)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_node(item, depth + 1, counter)
+        return
+    raise MappingError(f"Mapping value {value!r} is not a literal, dict, or list")
+
+
 def _validate_mapping(mapping: dict[str, Any]) -> None:
     """Validate that a mapping only uses allowed patterns.
 
     Allowed patterns:
-    * Fixed literals (strings, numbers, booleans, null)
-    * $event.<dot.path>
-    * $trigger.<field>
+    * Fixed literals (strings, finite numbers, booleans, null)
+    * $event.<dot.path> (no private/dunder segments)
+    * $trigger.<field> where field is one of TRIGGER_SCOPE_FIELDS
+    * Nested dicts/lists of the above, bounded in depth and size
 
-    Any other pattern raises MappingError.
+    Any other ``$``-prefixed string, non-string or reserved key, or literal
+    containing code-like keywords raises MappingError.
     """
-    for key, value in mapping.items():
-        if isinstance(value, (str, int, float, bool, type(None))):
-            if isinstance(value, str):
-                # Check if it's a path reference
-                if value.startswith("$event.") or value.startswith("$trigger."):
-                    # Validate the path format
-                    if not _PATH.match(value[1:]):
-                        raise MappingError(f"Invalid path reference: {value!r}")
-                # Check for dangerous patterns in literals
-                elif any(keyword in value.lower() for keyword in ("import", "exec", "eval", "compile", "__")):
-                    raise MappingError(f"Potentially dangerous literal: {value!r}")
-            continue
-        if isinstance(value, dict):
-            _validate_mapping(value)
-            continue
-        if isinstance(value, list):
-            for item in value:
-                if isinstance(item, (str, int, float, bool, type(None))):
-                    if isinstance(item, str):
-                        if item.startswith("$event.") or item.startswith("$trigger."):
-                            if not _PATH.match(item[1:]):
-                                raise MappingError(f"Invalid path reference: {item!r}")
-                        elif any(keyword in item.lower() for keyword in ("import", "exec", "eval", "compile", "__")):
-                            raise MappingError(f"Potentially dangerous literal: {item!r}")
-                    continue
-                if isinstance(item, dict):
-                    _validate_mapping(item)
-                    continue
-                raise MappingError(f"Mapping value {value!r} is not a literal or dict")
-            continue
-        raise MappingError(f"Mapping value {value!r} is not a literal, dict, or list")
+    if not isinstance(mapping, dict):
+        raise MappingError("Mapping must be a JSON object")
+    _validate_node(mapping, 0, [0])
+
+
+def validate_mapping(mapping: Any) -> None:
+    """Public validation entry point used by the API on create/update."""
+    _validate_mapping(mapping)
 
 
 def apply_mapping(
@@ -157,23 +197,19 @@ def verify_signature(
     if abs(now - timestamp) > 300:  # 5 minutes
         return False
 
+    if not isinstance(signature, str) or not signature.startswith("sha256="):
+        return False
+
     expected = hmac.new(
         secret.encode(),
-        f"{timestamp}.{payload.decode()}".encode(),
+        str(timestamp).encode() + b"." + payload,
         hashlib.sha256,
     ).hexdigest()
-
-    if not signature.startswith("sha256="):
+    provided = signature[len("sha256="):]
+    try:
+        return hmac.compare_digest(expected, provided)
+    except TypeError:  # non-ASCII signature text
         return False
-
-    provided = signature[7:]
-    if len(expected) != len(provided):
-        return False
-
-    result = 0
-    for a, b in zip(expected.encode(), provided.encode()):
-        result |= a ^ b
-    return result == 0
 
 
 def generate_event_id() -> str:

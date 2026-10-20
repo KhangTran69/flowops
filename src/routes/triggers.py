@@ -194,11 +194,18 @@ def trigger_webhook(
         payload = json.loads(body_bytes.decode())
     except (json.JSONDecodeError, UnicodeDecodeError):
         raise HTTPException(status_code=422, detail="Malformed JSON payload.")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="Webhook payload must be a JSON object.")
 
     # Extract event ID from header or body
     event_id = x_flowops_event_id or payload.get("event_id")
     if not event_id:
         raise HTTPException(status_code=422, detail="Event ID is required (header or body field).")
+    if not isinstance(event_id, str) or len(event_id) > triggers.MAX_EVENT_ID_LENGTH:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Event ID must be a string of at most {triggers.MAX_EVENT_ID_LENGTH} characters.",
+        )
 
     # Check for replay
     existing = session.execute(
@@ -307,6 +314,10 @@ def create_trigger(
         raise HTTPException(status_code=422, detail="interval_seconds is required for interval schedules.")
     if payload.schedule_kind == "daily" and not payload.daily_at_utc:
         raise HTTPException(status_code=422, detail="daily_at_utc is required for daily schedules.")
+    try:
+        triggers.validate_mapping(payload.mapping_json)
+    except triggers.MappingError as error:
+        raise HTTPException(status_code=422, detail=f"Invalid mapping: {error}") from error
 
     trigger = db.TriggerRecord(
         key=payload.key,
@@ -396,6 +407,10 @@ def update_trigger(
     if payload.active is not None:
         trigger.active = payload.active
     if payload.mapping_json is not None:
+        try:
+            triggers.validate_mapping(payload.mapping_json)
+        except triggers.MappingError as error:
+            raise HTTPException(status_code=422, detail=f"Invalid mapping: {error}") from error
         trigger.mapping_json = json.dumps(payload.mapping_json, separators=(",", ":"))
     trigger.updated_at = db.utcnow()
     session.flush()
