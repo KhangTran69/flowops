@@ -147,6 +147,11 @@ class TriggerDeliveryOut(BaseModel):
     processed_at: Optional[datetime] = None
 
 
+async def _read_raw_body(request: Request) -> bytes:
+    """Read the exact webhook bytes on the ASGI event loop."""
+    return await request.body()
+
+
 @router.post("/webhooks/triggers/{trigger_key}")
 def trigger_webhook(
     trigger_key: str,
@@ -154,6 +159,7 @@ def trigger_webhook(
     x_flowops_timestamp: Optional[str] = Header(default=None, alias="X-FlowOps-Timestamp"),
     x_flowops_signature: Optional[str] = Header(default=None, alias="X-FlowOps-Signature"),
     x_flowops_event_id: Optional[str] = Header(default=None, alias="X-FlowOps-Event-ID"),
+    body_bytes: bytes = Depends(_read_raw_body),
     session: Session = Depends(db.get_session),
 ) -> dict[str, Any]:
     """Signed inbound webhook for event-driven triggers.
@@ -178,10 +184,6 @@ def trigger_webhook(
         timestamp = int(x_flowops_timestamp) if x_flowops_timestamp else 0
     except (ValueError, TypeError):
         raise HTTPException(status_code=401, detail="Invalid timestamp.")
-
-    # Read raw body
-    import asyncio
-    body_bytes = asyncio.run(request.body())
 
     # Verify signature
     if not triggers.verify_signature(body_bytes, x_flowops_signature or "", source.secret, timestamp):

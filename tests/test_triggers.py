@@ -254,10 +254,13 @@ def test_daily_schedule_not_due(session):
     trigger = _create_trigger(session)
     trigger.schedule_kind = "daily"
     trigger.daily_at_utc = "12:00"
-    trigger.last_fired_at = db.utcnow() - timedelta(hours=1)
+    now = db.utcnow()
+    # Model a run that already happened in the current scheduling window;
+    # using a fixed noon schedule relative to wall-clock time makes this test
+    # fail whenever the suite runs after noon UTC.
+    trigger.last_fired_at = now
     session.commit()
 
-    now = db.utcnow()
     assert not triggers.is_due_daily(trigger, now)
 
 
