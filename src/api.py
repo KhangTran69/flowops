@@ -8,6 +8,7 @@ the v1.0 preview keeps failed webhook deliveries in a retryable outbox.
 
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -19,7 +20,9 @@ from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi import status as http_status
-from fastapi.responses import RedirectResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import Integer, and_, cast, delete, or_, select, text, update
@@ -159,6 +162,36 @@ app = FastAPI(
     version="1.0.0-preview",
     lifespan=_lifespan,
 )
+
+
+_SENSITIVE_FIELD = re.compile(r"secret|password|passwd|token|signature|api[_-]?key|authorization", re.I)
+
+
+def _redact_sensitive(value):
+    """Recursively replace values of sensitive-looking keys with a placeholder."""
+    if isinstance(value, dict):
+        return {
+            k: ("[REDACTED]" if isinstance(k, str) and _SENSITIVE_FIELD.search(k) else _redact_sensitive(v))
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_sensitive(v) for v in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def _redacting_validation_handler(request: Request, exc: RequestValidationError):
+    """422 handler that never echoes secrets back (FastAPI echoes raw input by default)."""
+    errors = []
+    for error in exc.errors():
+        error = dict(error)
+        loc = [str(part) for part in error.get("loc", ())]
+        if any(_SENSITIVE_FIELD.search(part) for part in loc):
+            error["input"] = "[REDACTED]"
+        elif "input" in error:
+            error["input"] = _redact_sensitive(error["input"])
+        errors.append(error)
+    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errors)})
 app.mount(
     "/static",
     StaticFiles(directory=str(web.BASE_DIR / "static")),
