@@ -46,7 +46,7 @@ class RPAWebhookAdapter:
         ensure_action_response(response, "RPA")
         return ActionResult(
             action=action,
-            detail=f"RPA webhook accepted action '{action}' for bot '{self.bot}'",
+            detail="RPA job submitted",
             adapter=self.adapter_name,
             idempotency_key=context.get("idempotency_key"),
             correlation_id=context.get("correlation_id"),

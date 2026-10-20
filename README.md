@@ -4,7 +4,7 @@
 
 FlowOps is an IT workflow automation platform. It receives support tickets and onboarding/offboarding requests, validates their data, classifies and routes them according to business rules, persists records, logs every workflow execution, and exposes a monitoring dashboard.
 
-> **MSP automation highlights:** [job alignment](docs/job-alignment.md) · [integrations guide](docs/integrations.md) (Graph, Exchange Online PowerShell, ConnectWise, Claude, MCP, multi-tenant) · [Power Automate guide](flows/power-automate/) · [Rewst blueprint](flows/rewst/) · [n8n workflows](flows/n8n/) · [SQL reports](sql/reporting_queries.sql) · [runbooks](docs/runbooks/).
+> **MSP automation highlights:** [job alignment](docs/job-alignment.md) · [integrations guide](docs/integrations.md) · [Power Automate bridge](docs/bridges/power-automate.md) · [Make/Rewst/Zapier bridge](docs/bridges/make-rewst-zapier.md) · [RPA bridge](docs/rpa-bridge.md) · [MCP connectors](docs/mcp.md) · [AI agents](docs/ai-agents.md) · [automation library](docs/automation-library.md) · [security credentials](docs/runbooks/security-credentials.md) · [multi-tenant GDAP](docs/runbooks/multi-tenant-gdap.md) · [Power Automate artifacts](flows/power-automate/) · [Rewst blueprint](flows/rewst/) · [n8n workflows](flows/n8n/) · [SQL reports](sql/reporting_queries.sql) · [runbooks](docs/runbooks/).
 
 > ⚠️ **This is a learning prototype, not a production ticketing system.** Sample data comes from [JSONPlaceholder](https://jsonplaceholder.typicode.com/), a free fake REST API. These are **simulated** tickets, not real IT support requests.
 

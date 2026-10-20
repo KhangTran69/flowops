@@ -1,4 +1,28 @@
 {% extends "base.html" %}
+{% macro readable_value(value) -%}
+  {% if value is mapping %}
+    <div class="data-list">
+      {% for key, child in value.items() %}
+      <div class="data-row">
+        <dt>{{ key | replace('_', ' ') | title }}</dt>
+        <dd>{{ readable_value(child) }}</dd>
+      </div>
+      {% endfor %}
+    </div>
+  {% elif value is sequence and value is not string %}
+    {% if value %}
+    <ul class="data-list data-list--stacked">
+      {% for child in value %}<li>{{ readable_value(child) }}</li>{% endfor %}
+    </ul>
+    {% else %}<span class="muted">None</span>{% endif %}
+  {% elif value is none %}
+    <span class="muted">—</span>
+  {% elif value is boolean %}
+    <span class="badge {{ 'ok' if value else 'fail' }}">{{ 'Yes' if value else 'No' }}</span>
+  {% else %}
+    <span class="data-value">{{ value }}</span>
+  {% endif %}
+{%- endmacro %}
 {% block title %}Job #{{ job.id }} — FlowOps{% endblock %}
 {% block content %}
 <section class="page-heading">
@@ -30,7 +54,15 @@
   </dl>
 </section>
 <section class="split-grid">
-  <div class="panel"><h2>Payload</h2><pre class="code-block">{{ payload }}</pre></div>
-  <div class="panel"><h2>Result</h2><pre class="code-block">{{ result }}</pre></div>
+  <div class="panel data-panel">
+    <div class="panel-head"><div><h2>What was requested</h2><p class="muted small">Inputs used to run this job.</p></div></div>
+    {% if payload %}{{ readable_value(payload) }}{% else %}<p class="muted">No request details available.</p>{% endif %}
+    <details class="raw-details"><summary>View raw data</summary><pre class="code-block">{{ payload_json }}</pre></details>
+  </div>
+  <div class="panel data-panel">
+    <div class="panel-head"><div><h2>What happened</h2><p class="muted small">Output returned by the workflow.</p></div></div>
+    {% if result %}{{ readable_value(result) }}{% else %}<p class="muted">No result recorded yet.</p>{% endif %}
+    <details class="raw-details"><summary>View raw data</summary><pre class="code-block">{{ result_json }}</pre></details>
+  </div>
 </section>
 {% endblock %}

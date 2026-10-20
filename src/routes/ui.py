@@ -517,8 +517,10 @@ def ui_workflow_job_detail(
         {
             "active": "jobs",
             "job": job,
-            "payload": json.dumps(payload, indent=2, sort_keys=True),
-            "result": json.dumps(result, indent=2, sort_keys=True),
+            "payload": payload,
+            "result": result,
+            "payload_json": json.dumps(payload, indent=2, sort_keys=True),
+            "result_json": json.dumps(result, indent=2, sort_keys=True),
         },
     )
 

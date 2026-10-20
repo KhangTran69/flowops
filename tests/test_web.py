@@ -177,7 +177,9 @@ def test_job_detail_page_renders(client):
     page = client.get(f"/ui/workflow-jobs/{job['id']}")
     assert page.status_code == 200
     assert "Job state" in page.text
-    assert "Payload" in page.text
+    assert "What was requested" in page.text
+    assert "Item Id" in page.text
+    assert "View raw data" in page.text
     assert f"/workflow-jobs/{job['id']}/cancel" in page.text
 
 

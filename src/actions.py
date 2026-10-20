@@ -193,7 +193,7 @@ class GenericWebhookAdapter:
         ensure_action_response(response, "Webhook")
         return ActionResult(
             action=action,
-            detail="Generic webhook accepted action",
+            detail="Webhook accepted action",
             adapter=self.adapter_name,
             idempotency_key=context.get("idempotency_key"),
             correlation_id=context.get("correlation_id"),
@@ -448,7 +448,7 @@ def adapter_from_environment(environ: dict[str, str] | None = None) -> ActionAda
     if name == "webhook":
         url = values.get("FLOWOPS_WEBHOOK_URL")
         if not url:
-            raise ValueError("FLOWOPS_WEBHOOK_URL is required for webhook")
+            raise RuntimeError("FLOWOPS_WEBHOOK_URL is required for webhook")
         return GenericWebhookAdapter(
             url=url,
             timeout=float(values.get("FLOWOPS_WEBHOOK_TIMEOUT", "10.0")),

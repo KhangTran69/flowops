@@ -367,7 +367,7 @@ def test_webhook_adapter_without_idempotency_key(monkeypatch):
 def test_webhook_adapter_requires_url():
     from src.actions import GenericWebhookAdapter, adapter_from_environment
 
-    with pytest.raises(ValueError, match="FLOWOPS_WEBHOOK_URL"):
+    with pytest.raises(RuntimeError, match="FLOWOPS_WEBHOOK_URL"):
         adapter_from_environment({"FLOWOPS_ACTION_ADAPTER": "webhook"})
     adapter = adapter_from_environment(
         {

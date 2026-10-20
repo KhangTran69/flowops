@@ -12,6 +12,11 @@ __pycache__/
 data/*.json
 data/tickets/
 data/*.db
+data/*.db-shm
+data/*.db-wal
+
+# macOS
+.DS_Store
 
 # pytest
 .pytest_cache/
