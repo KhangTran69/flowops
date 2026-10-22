@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}People & IT operations — FlowOps{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div><p class="eyebrow">PEOPLE OPERATIONS</p><h1>Employee onboarding & IT assets</h1>
+  <p class="lede">Coordinate approvals, equipment, setup tasks, and automation from one place.</p></div>
+</section>
+<section class="stat-grid" aria-label="Workforce summary">
+  {% for label, value in [("Pending approvals", counts.pending_approvals), ("In progress", counts.in_progress), ("Overdue IT tasks", counts.overdue_tasks), ("Available assets", counts.available_assets), ("Assigned assets", counts.assigned_assets), ("Automation failures", counts.failed_automation_deliveries)] %}
+  <article class="stat-card"><span class="stat-value">{{ value }}</span><span class="stat-label">{{ label }}</span></article>
+  {% endfor %}
+</section>
+<section class="section">
+  <div class="section-heading"><h2>Work queues</h2><p>Open a queue to continue the onboarding flow.</p></div>
+  <div class="feature-grid workforce-links">
+    <a class="feature-card" href="/workforce/ui/employees"><h3>Employees</h3><p>Create employee records and start onboarding.</p></a>
+    <a class="feature-card" href="/workforce/ui/onboarding"><h3>Onboarding requests</h3><p>Track lifecycle and readiness.</p></a>
+    <a class="feature-card" href="/workforce/ui/approvals"><h3>Manager approvals</h3><p>Review requests assigned to you.</p></a>
+    <a class="feature-card" href="/workforce/ui/tasks"><h3>IT setup tasks</h3><p>Assign, schedule, and complete the setup checklist.</p></a>
+    <a class="feature-card" href="/workforce/ui/assets"><h3>Asset inventory</h3><p>Manage equipment and assignment history.</p></a>
+    <a class="feature-card" href="/workforce/ui/automation"><h3>Automation deliveries</h3><p>Inspect n8n delivery and workflow status.</p></a>
+    <a class="feature-card" href="/workforce/ui/audit"><h3>Audit history</h3><p>Review attributed changes.</p></a>
+  </div>
+</section>
+<p class="notice">Local simulated adapter: account provisioning is a demo outcome. No external accounts or messages are created.</p>
+{% endblock %}

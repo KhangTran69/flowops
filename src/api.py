@@ -2535,11 +2535,13 @@ from src.routes import reports as _report_routes  # noqa: E402
 from src.routes import tenants as _tenant_routes  # noqa: E402
 from src.routes import triggers as _trigger_routes  # noqa: E402
 from src.routes import ui as _ui_routes  # noqa: E402  (registered last: owns the /ui catch-all)
+from src.routes import workforce as _workforce_routes  # noqa: E402
 
 app.include_router(_tenant_routes.router)
 app.include_router(_report_routes.router)
 app.include_router(_connector_routes.router)
 app.include_router(_trigger_routes.router)
+app.include_router(_workforce_routes.router)
 app.include_router(_analytics_routes.router)
 
 app.include_router(_ui_routes.router)

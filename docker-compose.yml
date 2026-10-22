@@ -19,6 +19,11 @@ x-flowops-env: &flowops-env
   FLOWOPS_TIMER_INTERVAL: ${FLOWOPS_TIMER_INTERVAL:-2}
   FLOWOPS_ESCALATION_WEBHOOK_URL: ${FLOWOPS_ESCALATION_WEBHOOK_URL:-}
   FLOWOPS_ACTION_ADAPTER: ${FLOWOPS_ACTION_ADAPTER:-simulated}
+  FLOWOPS_AUTOMATION_ADAPTER: ${FLOWOPS_AUTOMATION_ADAPTER:-simulated}
+  FLOWOPS_N8N_WEBHOOK_URL: ${FLOWOPS_N8N_WEBHOOK_URL:-}
+  FLOWOPS_N8N_WEBHOOK_SECRET: ${FLOWOPS_N8N_WEBHOOK_SECRET:-}
+  FLOWOPS_AUTOMATION_CALLBACK_SECRET: ${FLOWOPS_AUTOMATION_CALLBACK_SECRET:-}
+  FLOWOPS_N8N_API_KEY: ${FLOWOPS_N8N_API_KEY:-}
   FLOWOPS_POWER_AUTOMATE_URL: ${FLOWOPS_POWER_AUTOMATE_URL:-}
   FLOWOPS_GRAPH_URL: ${FLOWOPS_GRAPH_URL:-https://graph.microsoft.com/v1.0}
   FLOWOPS_GRAPH_ACCESS_TOKEN: ${FLOWOPS_GRAPH_ACCESS_TOKEN:-}
@@ -132,6 +137,23 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "pgrep -f 'src.outbox_worker' >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  workforce-outbox:
+    build: .
+    restart: unless-stopped
+    stop_grace_period: 15s
+    command: ["python", "-m", "src.workforce_worker"]
+    environment:
+      <<: *flowops-env
+      FLOWOPS_RUN_MIGRATIONS: "false"
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'src.workforce_worker' >/dev/null"]
       interval: 10s
       timeout: 3s
       retries: 3

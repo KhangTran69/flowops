@@ -7,6 +7,11 @@ x-flowops-env: &flowops-env
   FLOWOPS_UI_AUTH_REQUIRED: "false"
   FLOWOPS_SESSION_COOKIE_SECURE: "false"
   FLOWOPS_ACTION_ADAPTER: simulated
+  FLOWOPS_AUTOMATION_ADAPTER: ${FLOWOPS_AUTOMATION_ADAPTER:-simulated}
+  FLOWOPS_N8N_WEBHOOK_URL: ${FLOWOPS_N8N_WEBHOOK_URL:-}
+  FLOWOPS_N8N_WEBHOOK_SECRET: ${FLOWOPS_N8N_WEBHOOK_SECRET:-}
+  FLOWOPS_AUTOMATION_CALLBACK_SECRET: ${FLOWOPS_AUTOMATION_CALLBACK_SECRET:-}
+  FLOWOPS_N8N_API_KEY: ${FLOWOPS_N8N_API_KEY:-}
   FLOWOPS_AI_ADAPTER: simulated
   FLOWOPS_NOTIFICATION_WEBHOOK_URL: http://webhook-sink:8080/webhook
   FLOWOPS_ACTION_FAILURE_WEBHOOK_URL: http://webhook-sink:8080/webhook
@@ -133,6 +138,27 @@ services:
     working_dir: /app
     command:
       ["sh", "-ec", "pip install --no-cache-dir -r requirements.txt && exec python -m src.outbox_worker --poll-interval 2"]
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os; os.kill(1,0)\""]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  workforce-outbox:
+    image: python:3.13-slim
+    restart: on-failure
+    stop_grace_period: 15s
+    environment:
+      <<: *flowops-env
+      FLOWOPS_RUN_MIGRATIONS: "false"
+    volumes:
+      - .:/app
+    working_dir: /app
+    command:
+      ["sh", "-ec", "pip install --no-cache-dir -r requirements.txt && exec python -m src.workforce_worker"]
     depends_on:
       app:
         condition: service_healthy

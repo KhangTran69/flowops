@@ -28,6 +28,9 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("FLOWOPS_AUTH_REQUIRED", "true")
     monkeypatch.setenv("FLOWOPS_ENVIRONMENT", "development")
     monkeypatch.setenv("FLOWOPS_DEV_BEARER_TOKEN", "dev-secret")
+    monkeypatch.setenv("FLOWOPS_DEMO_USERS", __import__("json").dumps({"admin": {
+        "password_hash": ui_session.hash_demo_password("admin", salt="test-salt"),
+        "roles": ["automation.operator", "automation.admin"]}}))
     monkeypatch.setenv("FLOWOPS_RATE_LIMIT_PER_MINUTE", "0")
     db.use_database(f"sqlite:///{tmp_path}/ui-auth.db")
     with TestClient(api.app) as test_client:

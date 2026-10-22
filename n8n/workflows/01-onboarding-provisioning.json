@@ -1,0 +1,55 @@
+{
+  "name": "FlowOps | Approved onboarding provisioning",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "flowops/onboarding-approved",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "9b4c6887-bba0-491e-9f83-262f3b248e51",
+      "name": "Approved onboarding event",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [240, 300],
+      "webhookId": "flowops-onboarding-approved",
+      "credentials": {"httpHeaderAuth": {"id": "FLOWOPS_N8N_API_CREDENTIAL_ID", "name": "FlowOps API key (configure)"}}
+    },
+    {
+      "parameters": {
+        "jsCode": "const event = $json.body ?? $json;\nif (event.eventType !== 'workforce.onboarding.approved' || !event.eventId || !event.data?.requestId) { throw new Error('Invalid FlowOps onboarding event envelope'); }\nreturn [{ json: { eventId: event.eventId, requestId: event.data.requestId, workEmail: event.data.workEmail, outcome: 'success', detail: 'Simulated account provisioning in n8n; no external identity was created.' } }];"
+      },
+      "id": "a55fc09c-9249-4168-8d40-025a29a6f57e",
+      "name": "Validate and simulate provisioning",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR-FLOWOPS-HOST/workforce/automation/callbacks/provisioning",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { eventId: $json.eventId, outcome: $json.outcome, detail: $json.detail } }}",
+        "options": {"timeout": 10000}
+      },
+      "id": "766fe148-adef-41eb-b085-2cfb6ebca43f",
+      "name": "Confirm workflow outcome",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [780, 300],
+      "credentials": {"httpHeaderAuth": {"id": "FLOWOPS_CALLBACK_CREDENTIAL_ID", "name": "FlowOps callback key (configure)"}}
+    }
+  ],
+  "connections": {"Approved onboarding event": {"main": [[{"node": "Validate and simulate provisioning", "type": "main", "index": 0}]]}, "Validate and simulate provisioning": {"main": [[{"node": "Confirm workflow outcome", "type": "main", "index": 0}]]}},
+  "active": false,
+  "settings": {"executionOrder": "v1", "saveManualExecutions": true, "callerPolicy": "workflowsFromSameOwner"},
+  "versionId": "9d8a4e17-d53f-433c-860c-6c36e0c25e02",
+  "meta": {"templateCredsSetupCompleted": false},
+  "tags": []
+}

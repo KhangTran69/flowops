@@ -22,6 +22,7 @@
         <a href="/ui/tickets" {% if active == "tickets" %}aria-current="page"{% endif %}>Tickets</a>
         <a href="/ui/knowledge-base" {% if active == "knowledge_base" %}aria-current="page"{% endif %}>Knowledge base</a>
         <a href="/ui/onboarding-requests" {% if active == "onboarding" %}aria-current="page"{% endif %}>Onboarding</a>
+        <a href="/workforce/ui" {% if active in ("workforce", "employees", "approvals", "tasks", "assets", "automation") %}aria-current="page"{% endif %}>Workforce</a>
         <a href="/ui/notifications" {% if active == "notifications" %}aria-current="page"{% endif %}>Notifications</a>
         <a href="/notifications/pending" class="sr-only">Pending notifications API</a>
         <a href="/ui/workflow-jobs" {% if active == "jobs" %}aria-current="page"{% endif %}>Jobs</a>

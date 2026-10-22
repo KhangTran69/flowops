@@ -1,0 +1,15 @@
+{
+  "name": "FlowOps | Daily overdue task reminders",
+  "nodes": [
+    {"parameters": {"rule": {"interval": [{"field": "days", "triggerAtHour": 9}]}}, "id": "2a88c913-225c-48d5-a6fb-b061e7f7842a", "name": "Daily at 09:00 UTC", "type": "n8n-nodes-base.scheduleTrigger", "typeVersion": 1.2, "position": [220, 300]},
+    {"parameters": {"url": "https://YOUR-FLOWOPS-HOST/workforce/integration/overdue-tasks?limit=100", "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth", "options": {"timeout": 10000}}, "id": "0641e3a8-2e18-43e0-87ea-3f8c2041bc2b", "name": "Get overdue tasks", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [480, 300], "credentials": {"httpHeaderAuth": {"id": "FLOWOPS_API_CREDENTIAL_ID", "name": "FlowOps API key (configure)"}}},
+    {"parameters": {"jsCode": "const result = $input.first()?.json ?? [];\nconst tasks = Array.isArray(result) ? result : (result.data ?? []);\nconst today = new Date().toISOString().slice(0, 10);\nreturn tasks.map(task => ({ json: { eventId: `overdue:${task.taskId}:${today}`, taskId: task.taskId, outcome: 'SIMULATED', detail: 'Daily overdue reminder recorded by n8n. Notification delivery is simulated.' } }));"}, "id": "ec075793-d641-4c4e-85ea-5596e8030894", "name": "Prepare idempotent reminder outcomes", "type": "n8n-nodes-base.code", "typeVersion": 2, "position": [740, 300]},
+    {"parameters": {"method": "POST", "url": "https://YOUR-FLOWOPS-HOST/workforce/integration/reminders", "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ { eventId: $json.eventId, taskId: $json.taskId, outcome: $json.outcome, detail: $json.detail } }}", "options": {"timeout": 10000}}, "id": "41c141a6-e66b-4f71-96b4-31b85d0b7e8c", "name": "Record reminder outcome", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [1000, 300], "credentials": {"httpHeaderAuth": {"id": "FLOWOPS_API_CREDENTIAL_ID", "name": "FlowOps API key (configure)"}}}
+  ],
+  "connections": {"Daily at 09:00 UTC": {"main": [[{"node": "Get overdue tasks", "type": "main", "index": 0}]]}, "Get overdue tasks": {"main": [[{"node": "Prepare idempotent reminder outcomes", "type": "main", "index": 0}]]}, "Prepare idempotent reminder outcomes": {"main": [[{"node": "Record reminder outcome", "type": "main", "index": 0}]]}},
+  "active": false,
+  "settings": {"executionOrder": "v1", "saveManualExecutions": true, "callerPolicy": "workflowsFromSameOwner"},
+  "versionId": "c2ad25ea-8166-4739-a054-70c8b6d275b6",
+  "meta": {"templateCredsSetupCompleted": false},
+  "tags": []
+}

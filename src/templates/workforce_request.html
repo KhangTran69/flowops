@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Onboarding #{{ item.id }} — FlowOps{% endblock %}
+{% block content %}
+<nav class="workforce-subnav" aria-label="Workforce pages"><a href="/workforce/ui">Overview</a><a href="/workforce/ui/onboarding">All requests</a><a href="/workforce/ui/tasks">IT tasks</a></nav>
+<section class="page-heading"><div><p class="eyebrow">ONBOARDING REQUEST #{{ item.id }}</p><h1>{{ item.employee_name }}</h1><p class="lede">{{ item.department }} · starts {{ item.start_date }} · manager {{ item.manager_subject }}</p></div><span class="status-pill">{{ item.status }}</span></section>
+<section class="panel-grid">
+  <article class="panel"><h2>Employee</h2><p>{{ item.employee_name }}</p><p>{{ item.employee_email }}</p><p>{{ item.department }}</p></article>
+  <article class="panel"><h2>Approval</h2>{% if item.approval %}<p>{{ item.approval.decision }} by {{ item.approval.actor_subject }}</p><p>{{ item.approval.decided_at }}</p><p>{{ item.approval.comment or "No comment recorded." }}</p>{% else %}<p>Awaiting manager decision.</p>{% endif %}</article>
+</section>
+<section class="panel table-wrap"><div class="panel-head"><h2>Required IT setup</h2><span>{{ item.tasks | selectattr('status', 'equalto', 'DONE') | list | length }} / {{ item.tasks | length }} complete</span></div>
+{% if item.tasks %}<table><thead><tr><th>Task</th><th>Assignee</th><th>Due</th><th>Status</th><th>Notes</th></tr></thead><tbody>{% for task in item.tasks %}<tr><td>{{ task.title }}</td><td>{{ task.assignee_subject or "Unassigned" }}</td><td>{{ task.due_at or "—" }}</td><td>{{ task.status }}</td><td>{{ task.completion_notes or "—" }}</td></tr>{% endfor %}</tbody></table>{% else %}<div class="empty-state"><p>Tasks are created when the assigned manager approves the request.</p></div>{% endif %}</section>
+<p class="notice">Account provisioning is labeled simulated unless the n8n integration is configured. The app never creates real accounts in mock mode.</p>
+{% endblock %}
