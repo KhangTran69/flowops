@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} — FlowOps{% endblock %}
+{% block content %}
+<nav class="workforce-subnav" aria-label="Workforce pages">
+  <a href="/workforce/ui">Overview</a><a href="/workforce/ui/employees">Employees</a>
+  <a href="/workforce/ui/onboarding">Requests</a><a href="/workforce/ui/approvals">Approvals</a>
+  <a href="/workforce/ui/tasks">IT tasks</a><a href="/workforce/ui/assets">Assets</a>
+  <a href="/workforce/ui/automation">Automation</a><a href="/workforce/ui/audit">Audit</a>
+</nav>
+<section class="page-heading"><div><p class="eyebrow">WORKFORCE OPERATIONS</p><h1>{{ title }}</h1><p class="lede">{{ description }}</p></div></section>
+<p id="workforce-feedback" class="notice" role="status" aria-live="polite" hidden></p>
+{% if form == "employee" %}
+<details class="panel" open><summary><strong>Add employee</strong></summary><form class="workforce-form" data-endpoint="/workforce/employees">
+  <label>Employee ID<input name="employee_number" required maxlength="64"></label><label>Full name<input name="full_name" required maxlength="200"></label>
+  <label>Work email<input name="work_email" type="email" required></label><label>Department<input name="department" required></label>
+  <label>Job title<input name="job_title" required></label><label>Start date<input name="start_date" type="date" required></label>
+  <label>Manager account subject<input name="manager_subject" required maxlength="256" aria-describedby="manager-help"><small id="manager-help">Must match the manager's authenticated account subject.</small></label>
+  <button class="button primary" type="submit">Create employee</button></form></details>
+{% elif form == "onboarding" %}
+<details class="panel"><summary><strong>Start onboarding</strong></summary><form class="workforce-form" data-endpoint="/workforce/onboarding-requests">
+ <label>Employee ID<input name="employee_id" type="number" min="1" required></label><button class="button primary" type="submit">Create draft</button></form>
+ <p>After creating a draft, submit it using the Requests API or Swagger. Only HR can submit drafts.</p></details>
+{% elif form == "approvals" %}<p class="notice">Approving creates the five required IT tasks and queues a provisioning event atomically. Rejection requires a reason.</p>
+{% elif form == "assets" %}<details class="panel" open><summary><strong>Add asset</strong></summary><form class="workforce-form" data-endpoint="/workforce/assets">
+ <label>Asset tag<input name="asset_tag" required></label><label>Serial number<input name="serial_number"></label>
+ <label>Category<input name="category" required placeholder="Laptop"></label><label>Brand and model<input name="brand_model" required></label>
+ <label>Condition<select name="condition"><option>GOOD</option><option>FAIR</option><option>POOR</option></select></label><button class="button primary">Add asset</button></form></details>
+{% elif form == "tasks" %}<p class="notice">Tasks are created once following approval. Update assignment and status from the IT task API; completion is blocked for cancelled requests.</p>
+{% elif form == "automation" %}<p class="notice">Delivery means n8n accepted the event. Workflow completion is confirmed separately by its authenticated callback.</p>{% endif %}
+<section class="panel table-wrap" aria-label="{{ title }} records">
+{% if rows %}<table><thead><tr>{% for column in columns %}<th scope="col">{{ column }}</th>{% endfor %}{% if form in ("employee", "onboarding", "approvals", "tasks", "assets", "automation") %}<th scope="col">Actions</th>{% endif %}</tr></thead>
+<tbody>{% for row in rows %}<tr data-record-id="{{ row.get('_id', '') }}">{% for column in columns %}<td>{{ row.get(column, "—") }}</td>{% endfor %}
+{% if form in ("employee", "onboarding", "approvals", "tasks", "assets", "automation") %}<td class="row-actions">
+{% if form == "employee" %}<button class="button small" data-action="create-onboarding">Start onboarding</button>
+{% elif form == "approvals" %}<button class="button small" data-action="approve">Approve</button><button class="button small danger" data-action="reject">Reject</button>
+{% elif form == "onboarding" and row.get("Status") == "DRAFT" %}<button class="button small" data-action="submit">Submit for approval</button>
+{% elif form == "tasks" and row.get("Status") != "DONE" %}<button class="button small" data-action="update-task">Assign / update</button><button class="button small" data-action="complete-task">Mark done</button>
+{% elif form == "assets" and row.get("Status") == "AVAILABLE" %}<button class="button small" data-action="assign-asset">Assign</button><button class="button small" data-action="asset-maintenance">Maintenance</button>
+{% elif form == "assets" and row.get("Status") == "ASSIGNED" %}<button class="button small" data-action="return-asset">Return</button><button class="button small" data-action="asset-history">History</button>
+{% elif form == "assets" %}<button class="button small" data-action="asset-available">Mark available</button><button class="button small" data-action="asset-history">History</button>
+{% elif form == "onboarding" %}<a class="button small" href="/workforce/ui/onboarding/{{ row.get('_id') }}">Details</a>
+{% elif form == "automation" and (row.get("Delivery") == "FAILED" or row.get("Workflow") == "FAILED") %}<button class="button small" data-action="retry-event">Retry</button>
+{% elif form == "automation" and row.get("Delivery") == "PENDING" %}<button class="button small" data-action="simulate-event">Run simulated provisioning</button>{% endif %}</td>{% endif %}</tr>{% endfor %}</tbody></table>
+{% else %}<div class="empty-state"><h2>Nothing here yet</h2><p>New records will appear in this queue when they are created.</p></div>{% endif %}
+</section>
+<script src="/static/js/workforce.js" defer></script>
+{% endblock %}

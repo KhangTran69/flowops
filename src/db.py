@@ -14,6 +14,7 @@ from sqlalchemy import (
     event,
     Boolean,
     DateTime,
+    ForeignKey,
     Index,
     Integer,
     String,
@@ -955,6 +956,153 @@ class TriggerDeliveryRecord(Base):
     processed_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+
+class EmployeeRecord(Base):
+    """Employee directory entry for HR onboarding (employees do not log in)."""
+
+    __tablename__ = "employees"
+    __table_args__ = (
+        UniqueConstraint("employee_number", name="uq_employee_number"),
+        UniqueConstraint("work_email", name="uq_employee_work_email"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    employee_number: Mapped[str] = mapped_column(String(64), nullable=False)
+    full_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    work_email: Mapped[str] = mapped_column(String(320), nullable=False)
+    department: Mapped[str] = mapped_column(String(120), nullable=False)
+    job_title: Mapped[str] = mapped_column(String(160), nullable=False)
+    start_date: Mapped[str] = mapped_column(String(10), nullable=False)
+    manager_subject: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="ACTIVE")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class StaffOnboardingRecord(Base):
+    """Employee-specific request and approval lifecycle."""
+
+    __tablename__ = "staff_onboarding_requests"
+    __table_args__ = (Index("ix_staff_onboarding_status", "status"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id"), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="DRAFT")
+    created_by: Mapped[str] = mapped_column(String(256), nullable=False)
+    submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class WorkforceApprovalRecord(Base):
+    __tablename__ = "workforce_approval_decisions"
+    __table_args__ = (UniqueConstraint("request_id", name="uq_workforce_approval_request"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    request_id: Mapped[int] = mapped_column(ForeignKey("staff_onboarding_requests.id"), nullable=False, index=True)
+    actor_subject: Mapped[str] = mapped_column(String(256), nullable=False)
+    decision: Mapped[str] = mapped_column(String(16), nullable=False)
+    comment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ITTaskRecord(Base):
+    __tablename__ = "it_setup_tasks"
+    __table_args__ = (
+        UniqueConstraint("request_id", "task_key", name="uq_it_task_request_key"),
+        Index("ix_it_setup_tasks_status_due", "status", "due_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    request_id: Mapped[int] = mapped_column(ForeignKey("staff_onboarding_requests.id"), nullable=False, index=True)
+    task_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    assignee_subject: Mapped[Optional[str]] = mapped_column(String(256), nullable=True, index=True)
+    due_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="TODO")
+    completion_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ITAssetRecord(Base):
+    __tablename__ = "it_assets"
+    __table_args__ = (UniqueConstraint("asset_tag", name="uq_it_asset_tag"),
+                      UniqueConstraint("serial_number", name="uq_it_asset_serial"))
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    asset_tag: Mapped[str] = mapped_column(String(64), nullable=False)
+    serial_number: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    category: Mapped[str] = mapped_column(String(80), nullable=False)
+    brand_model: Mapped[str] = mapped_column(String(200), nullable=False)
+    condition: Mapped[str] = mapped_column(String(24), nullable=False, default="GOOD")
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="AVAILABLE", index=True)
+    employee_id: Mapped[Optional[int]] = mapped_column(ForeignKey("employees.id"), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AssetAssignmentRecord(Base):
+    __tablename__ = "it_asset_assignments"
+    __table_args__ = (Index("ix_asset_assignment_current", "asset_id", "returned_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    asset_id: Mapped[int] = mapped_column(ForeignKey("it_assets.id"), nullable=False, index=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id"), nullable=False, index=True)
+    assigned_by: Mapped[str] = mapped_column(String(256), nullable=False)
+    assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    returned_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    return_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+class WorkforceAuditRecord(Base):
+    __tablename__ = "workforce_audit_events"
+    __table_args__ = (Index("ix_workforce_audit_created", "created_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    actor_subject: Mapped[str] = mapped_column(String(256), nullable=False)
+    action: Mapped[str] = mapped_column(String(80), nullable=False)
+    entity_type: Mapped[str] = mapped_column(String(48), nullable=False)
+    entity_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class WorkforceAutomationEventRecord(Base):
+    """Transactional outbox for n8n event delivery and callback idempotency."""
+
+    __tablename__ = "workforce_automation_events"
+    __table_args__ = (UniqueConstraint("event_id", name="uq_workforce_event_id"),
+                      Index("ix_workforce_event_delivery", "delivery_status", "next_attempt_at"))
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    request_id: Mapped[int] = mapped_column(ForeignKey("staff_onboarding_requests.id"), nullable=False, index=True)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    delivery_status: Mapped[str] = mapped_column(String(24), nullable=False, default="PENDING")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    lease_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    workflow_status: Mapped[str] = mapped_column(String(24), nullable=False, default="WAITING")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class WorkforceReminderRecord(Base):
+    __tablename__ = "workforce_reminder_events"
+    __table_args__ = (UniqueConstraint("event_id", name="uq_workforce_reminder_event"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    task_id: Mapped[int] = mapped_column(ForeignKey("it_setup_tasks.id"), nullable=False, index=True)
+    outcome: Mapped[str] = mapped_column(String(24), nullable=False)
+    detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 @event.listens_for(Base.metadata, "before_drop")
 def _drop_reporting_views(target, connection, **kw) -> None:

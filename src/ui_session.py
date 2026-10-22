@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 import secrets
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Mapping, Optional
 
@@ -106,21 +108,45 @@ def validate_ui_auth_configuration(
         )
 
 
-ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "admin"
+_PASSWORD_HASH_ROUNDS = 310_000
+_WORKFORCE_ROLES = {"HR", "MANAGER", "IT_ADMIN", "automation.operator", "automation.admin"}
+
+
+def hash_demo_password(password: str, *, salt: Optional[str] = None) -> str:
+    """Create a PBKDF2-SHA256 hash for a development demo account."""
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), _PASSWORD_HASH_ROUNDS).hex()
+    return f"pbkdf2_sha256${_PASSWORD_HASH_ROUNDS}${salt}${digest}"
+
+
+def _verify_password(password: str, encoded: str) -> bool:
+    try:
+        algorithm, rounds, salt, expected = encoded.split("$", 3)
+        if algorithm != "pbkdf2_sha256" or not 100_000 <= int(rounds) <= 2_000_000:
+            return False
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), int(rounds)).hex()
+        return secrets.compare_digest(actual, expected)
+    except (ValueError, TypeError):
+        return False
 
 
 def authenticate_admin(username: str, password: str) -> Optional[Actor]:
-    """Accept only the single admin account for the operator console."""
-    username_ok = secrets.compare_digest(username.encode(), ADMIN_USERNAME.encode())
-    password_ok = secrets.compare_digest(password.encode(), ADMIN_PASSWORD.encode())
-    if not (username_ok and password_ok):
+    """Authenticate only explicitly configured, development-gated accounts."""
+    if os.environ.get("FLOWOPS_ENVIRONMENT", "development").lower() != "development":
         return None
-    return Actor(
-        subject=ADMIN_USERNAME,
-        roles=("automation.operator", "automation.admin"),
-        source="session",
-    )
+    try:
+        users = json.loads(os.environ.get("FLOWOPS_DEMO_USERS", "{}"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(users, dict):
+        return None
+    account = users.get(username)
+    if not isinstance(account, dict) or not _verify_password(password, str(account.get("password_hash", ""))):
+        return None
+    roles = tuple(str(role) for role in account.get("roles", []))
+    if not roles or any(role not in _WORKFORCE_ROLES for role in roles):
+        return None
+    return Actor(subject=username, roles=roles, source="session")
 
 
 def create_session(actor: Actor) -> UISession:

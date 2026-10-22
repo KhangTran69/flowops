@@ -35,8 +35,21 @@ def _ensure_column(table_name: str, column_name: str, column: sa.Column) -> None
 def upgrade() -> None:
     bind = op.get_bind()
     existing = set(sa.inspect(bind).get_table_names())
+    # Keep the historical baseline stable as new model classes are added.
+    # These tables are owned by the dedicated 0011_workforce revision.
+    deferred_tables = {
+        "employees",
+        "staff_onboarding_requests",
+        "workforce_approval_decisions",
+        "it_setup_tasks",
+        "it_assets",
+        "it_asset_assignments",
+        "workforce_audit_events",
+        "workforce_automation_events",
+        "workforce_reminder_events",
+    }
     for table in db.Base.metadata.sorted_tables:
-        if table.name not in existing:
+        if table.name not in existing and table.name not in deferred_tables:
             table.create(bind)
 
     # Additive columns introduced after the original local schema.

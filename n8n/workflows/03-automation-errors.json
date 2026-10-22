@@ -1,0 +1,15 @@
+{
+  "name": "FlowOps | Record automation failures and notify operations",
+  "nodes": [
+    {"parameters": {}, "id": "a50b3bdd-eb8f-439d-b29a-92a334a83ad7", "name": "Workflow error", "type": "n8n-nodes-base.errorTrigger", "typeVersion": 1, "position": [220, 300]},
+    {"parameters": {"method": "POST", "url": "https://YOUR-FLOWOPS-HOST/workforce/integration/errors", "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ { eventId: $json.execution?.id || $execution.id, workflowName: $json.workflow?.name || 'unknown', error: String($json.execution?.error?.message || 'n8n workflow failed').slice(0, 1000) } }}", "options": {"timeout": 10000}}, "id": "ce98b5dd-9d85-465f-bc2d-49ecbf74f6ac", "name": "Record failure in FlowOps", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [500, 300], "credentials": {"httpHeaderAuth": {"id": "FLOWOPS_API_CREDENTIAL_ID", "name": "FlowOps API key (configure)"}}},
+    {"parameters": {"method": "POST", "url": "https://YOUR-OPS-NOTIFICATION-WEBHOOK", "sendBody": true, "specifyBody": "json", "jsonBody": "={{ { text: `FlowOps automation failed: ${$node['Workflow error'].json.workflow?.name || 'unknown workflow'} — ${$node['Workflow error'].json.execution?.error?.message || 'see n8n execution history'}` } }}", "options": {"timeout": 10000}}, "id": "a466809c-8bf9-4206-a41b-106d7f9b10c6", "name": "Notify operations (configure URL)", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [780, 300]},
+    {"parameters": {"content": "Before activating, set the notification webhook URL to your approved operations endpoint and confirm its expected payload shape.", "height": 120, "width": 350}, "id": "561c7ca0-ad41-4880-a3d0-fcabdf2c16dc", "name": "Notification setup", "type": "n8n-nodes-base.stickyNote", "typeVersion": 1, "position": [780, 500]}
+  ],
+  "connections": {"Workflow error": {"main": [[{"node": "Record failure in FlowOps", "type": "main", "index": 0}]]}, "Record failure in FlowOps": {"main": [[{"node": "Notify operations (configure URL)", "type": "main", "index": 0}]]}},
+  "active": false,
+  "settings": {"executionOrder": "v1", "saveManualExecutions": true, "callerPolicy": "workflowsFromSameOwner"},
+  "versionId": "c79ea66a-26f0-4762-83a4-c1a72d2f1a24",
+  "meta": {"templateCredsSetupCompleted": false},
+  "tags": []
+}
