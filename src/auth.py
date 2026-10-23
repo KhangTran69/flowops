@@ -16,6 +16,7 @@ class Actor:
     subject: str
     roles: tuple[str, ...]
     source: str = "local"  # local | bearer | session
+    tenant_key: Optional[str] = None
 
 
 class AuthenticationError(ValueError):
@@ -67,7 +68,9 @@ def _authenticate_jwt(token: str, values: dict[str, str]) -> Actor:
     roles = _roles(claims)
     if required_role and required_role not in roles:
         raise AuthenticationError("Bearer token lacks the required automation role.")
-    return Actor(subject=claims["sub"], roles=roles)
+    tenant_key = claims.get("flowops_tenant_key", claims.get("tenant_key"))
+    return Actor(subject=claims["sub"], roles=roles,
+                 tenant_key=str(tenant_key).strip() if tenant_key else None)
 
 
 def validate_auth_configuration(
@@ -115,5 +118,6 @@ def authenticate_bearer(
         and expected
         and secrets.compare_digest(token, expected)
     ):
-        return Actor(subject="configured-bearer", roles=("automation.operator",))
+        return Actor(subject="configured-bearer", roles=("automation.operator",),
+                     tenant_key=values.get("FLOWOPS_DEV_TENANT_KEY") or None)
     raise AuthenticationError("Entra authentication is required in protected mode.")

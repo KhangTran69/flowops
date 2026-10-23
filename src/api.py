@@ -248,6 +248,7 @@ def auth_me(actor: Actor = Depends(_actor_from_header)) -> dict:
         "subject": actor.subject,
         "roles": list(actor.roles),
         "source": actor.source,
+        "tenant_key": actor.tenant_key,
     }
 
 

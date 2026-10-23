@@ -22,13 +22,15 @@ def test_authentication_is_optional_for_local_development():
 
 
 def test_required_auth_rejects_missing_or_wrong_token():
-    environ = {"FLOWOPS_AUTH_REQUIRED": "true", "FLOWOPS_DEV_BEARER_TOKEN": "dev-secret"}
+    environ = {"FLOWOPS_AUTH_REQUIRED": "true", "FLOWOPS_DEV_BEARER_TOKEN": "dev-secret",
+               "FLOWOPS_DEV_TENANT_KEY": "tenant-demo"}
     with pytest.raises(AuthenticationError):
         authenticate_bearer(None, environ=environ)
     with pytest.raises(AuthenticationError):
         authenticate_bearer("Bearer wrong", environ=environ)
     actor = authenticate_bearer("Bearer dev-secret", environ=environ)
     assert actor.roles == ("automation.operator",)
+    assert actor.tenant_key == "tenant-demo"
 
 
 def test_graph_adapter_uses_tenant_resolver():
@@ -69,7 +71,8 @@ def test_entra_jwt_claims_and_jwks_cache(monkeypatch):
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     public_jwk = json.loads(RSAAlgorithm.to_jwk(private_key.public_key()))
     public_jwk.update({"kid": "test-key", "use": "sig"})
-    payload = {"iss": "https://issuer", "aud": "client", "sub": "user-1", "exp": 4102444800, "roles": ["automation.operator"]}
+    payload = {"iss": "https://issuer", "aud": "client", "sub": "user-1", "exp": 4102444800,
+               "roles": ["automation.operator"], "flowops_tenant_key": "tenant-demo"}
     token = __import__("jwt").encode(payload, private_key, algorithm="RS256", headers={"kid": "test-key"})
 
     calls = []
@@ -79,9 +82,10 @@ def test_entra_jwt_claims_and_jwks_cache(monkeypatch):
 
     monkeypatch.setattr("src.auth.requests.get", lambda *args, **kwargs: calls.append(args) or Response())
     environ = {"FLOWOPS_AUTH_REQUIRED": "true", "FLOWOPS_ENVIRONMENT": "production", "FLOWOPS_ENTRA_ISSUER": "https://issuer", "FLOWOPS_ENTRA_AUDIENCE": "client", "FLOWOPS_ENTRA_JWKS_URL": "https://issuer/keys"}
-    authenticate_bearer(f"Bearer {token}", environ=environ)
+    actor = authenticate_bearer(f"Bearer {token}", environ=environ)
     authenticate_bearer(f"Bearer {token}", environ=environ)
     assert len(calls) == 1
+    assert actor.tenant_key == "tenant-demo"
 
 
 def test_execute_requires_auth_when_enabled(client, monkeypatch):

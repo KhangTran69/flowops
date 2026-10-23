@@ -12,6 +12,7 @@ def main() -> int:
         return 2
     username = input("Development username: ").strip()
     role = input("Role (HR, MANAGER, IT_ADMIN): ").strip().upper()
+    tenant_key = input("Tenant key (default demo): ").strip() or "demo"
     if not username or role not in {"HR", "MANAGER", "IT_ADMIN"}:
         print("Username and one supported role are required.", file=sys.stderr)
         return 2
@@ -19,7 +20,8 @@ def main() -> int:
     if len(password) < 12:
         print("Use at least 12 characters.", file=sys.stderr)
         return 2
-    print(json.dumps({username: {"password_hash": hash_demo_password(password), "roles": [role]}}, separators=(",", ":")))
+    print(json.dumps({username: {"password_hash": hash_demo_password(password), "roles": [role],
+                                  "tenant_key": tenant_key}}, separators=(",", ":")))
     return 0
 
 

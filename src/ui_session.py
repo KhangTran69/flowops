@@ -32,6 +32,7 @@ class UISession:
     subject: str
     roles: tuple[str, ...]
     csrf_token: str
+    tenant_key: Optional[str] = None
 
 
 def _values(environ: Optional[Mapping[str, str]] = None) -> Mapping[str, str]:
@@ -146,7 +147,10 @@ def authenticate_admin(username: str, password: str) -> Optional[Actor]:
     roles = tuple(str(role) for role in account.get("roles", []))
     if not roles or any(role not in _WORKFORCE_ROLES for role in roles):
         return None
-    return Actor(subject=username, roles=roles, source="session")
+    tenant_key = account.get("tenant_key")
+    if tenant_key is not None and (not isinstance(tenant_key, str) or not tenant_key.strip()):
+        return None
+    return Actor(subject=username, roles=roles, source="session", tenant_key=tenant_key)
 
 
 def create_session(actor: Actor) -> UISession:
@@ -154,6 +158,7 @@ def create_session(actor: Actor) -> UISession:
         subject=actor.subject,
         roles=tuple(actor.roles),
         csrf_token=secrets.token_urlsafe(32),
+        tenant_key=actor.tenant_key,
     )
 
 
@@ -163,6 +168,7 @@ def encode_session(session: UISession, secret: Optional[str] = None) -> str:
             "subject": session.subject,
             "roles": list(session.roles),
             "csrf": session.csrf_token,
+            "tenant_key": session.tenant_key,
         }
     )
 
@@ -182,9 +188,14 @@ def decode_session(
     subject = str(data.get("subject", "")).strip()
     roles = tuple(str(role) for role in data.get("roles", []))
     csrf = str(data.get("csrf", ""))
+    tenant_key = data.get("tenant_key")
+    if tenant_key is not None:
+        tenant_key = str(tenant_key).strip()
+        if not tenant_key:
+            raise UISessionError("Invalid UI session tenant.")
     if not subject or not csrf or not roles:
         raise UISessionError("Invalid UI session payload.")
-    return UISession(subject=subject, roles=roles, csrf_token=csrf)
+    return UISession(subject=subject, roles=roles, csrf_token=csrf, tenant_key=tenant_key)
 
 
 def read_session(request) -> Optional[UISession]:
@@ -214,7 +225,7 @@ def clear_session_cookie(response) -> None:
 
 
 def actor_from_session(session: UISession) -> Actor:
-    return Actor(subject=session.subject, roles=session.roles, source="session")
+    return Actor(subject=session.subject, roles=session.roles, source="session", tenant_key=session.tenant_key)
 
 
 def csrf_matches(request, session: UISession) -> bool:
