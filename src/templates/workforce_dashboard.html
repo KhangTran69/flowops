@@ -6,7 +6,7 @@
   <p class="lede">Coordinate approvals, equipment, setup tasks, and automation from one place.</p></div>
 </section>
 <section class="stat-grid" aria-label="Workforce summary">
-  {% for label, value in [("Pending approvals", counts.pending_approvals), ("In progress", counts.in_progress), ("Overdue IT tasks", counts.overdue_tasks), ("Available assets", counts.available_assets), ("Assigned assets", counts.assigned_assets), ("Automation failures", counts.failed_automation_deliveries)] %}
+  {% for label, value in [("Pending approvals", counts.pending_approvals), ("In progress", counts.in_progress), ("Overdue IT tasks", counts.overdue_tasks), ("Available assets", counts.available_assets), ("Assigned assets", counts.assigned_assets), ("Automation failures", counts.failed_automation_deliveries), ("Missing callbacks", counts.missing_automation_callbacks)] %}
   <article class="stat-card"><span class="stat-value">{{ value }}</span><span class="stat-label">{{ label }}</span></article>
   {% endfor %}
 </section>

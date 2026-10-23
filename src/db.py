@@ -603,6 +603,8 @@ def _ensure_tables() -> None:
                 connection.execute(text("PRAGMA journal_mode=WAL"))
         Base.metadata.create_all(engine)
         _add_missing_columns()
+        if engine.dialect.name == "sqlite":
+            _ensure_workforce_indexes()
         _ensure_idempotency_owner_token()
         _ensure_idempotency_resource_type()
         _ensure_execution_log_actor()
@@ -612,6 +614,23 @@ def _ensure_tables() -> None:
 
         reports.ensure_views(engine)
         _tables_ready = True
+
+
+def _ensure_workforce_indexes() -> None:
+    """Keep local SQLite databases aligned with Alembic-created workforce indexes."""
+    for model in (
+        EmployeeRecord,
+        StaffOnboardingRecord,
+        WorkforceApprovalRecord,
+        ITTaskRecord,
+        ITAssetRecord,
+        AssetAssignmentRecord,
+        WorkforceAuditRecord,
+        WorkforceAutomationEventRecord,
+        WorkforceReminderRecord,
+    ):
+        for index in model.__table__.indexes:
+            index.create(engine, checkfirst=True)
 
 
 def get_session():
@@ -965,6 +984,7 @@ class EmployeeRecord(Base):
     __table_args__ = (
         UniqueConstraint("employee_number", name="uq_employee_number"),
         UniqueConstraint("work_email", name="uq_employee_work_email"),
+        Index("ix_employees_tenant_status", "tenant_key", "status"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -975,6 +995,7 @@ class EmployeeRecord(Base):
     job_title: Mapped[str] = mapped_column(String(160), nullable=False)
     start_date: Mapped[str] = mapped_column(String(10), nullable=False)
     manager_subject: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="ACTIVE")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -983,10 +1004,17 @@ class StaffOnboardingRecord(Base):
     """Employee-specific request and approval lifecycle."""
 
     __tablename__ = "staff_onboarding_requests"
-    __table_args__ = (Index("ix_staff_onboarding_status", "status"),)
+    __table_args__ = (
+        Index("ix_staff_onboarding_status", "status"),
+        Index("ix_staff_onboarding_tenant_status", "tenant_key", "status"),
+        Index("uq_staff_onboarding_one_active", "employee_id", unique=True,
+              sqlite_where=text("status IN ('DRAFT','PENDING_APPROVAL','APPROVED','IN_PROGRESS')"),
+              postgresql_where=text("status IN ('DRAFT','PENDING_APPROVAL','APPROVED','IN_PROGRESS')")),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id"), nullable=False, index=True)
+    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="DRAFT")
     created_by: Mapped[str] = mapped_column(String(256), nullable=False)
     submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -1002,6 +1030,7 @@ class WorkforceApprovalRecord(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     request_id: Mapped[int] = mapped_column(ForeignKey("staff_onboarding_requests.id"), nullable=False, index=True)
+    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     actor_subject: Mapped[str] = mapped_column(String(256), nullable=False)
     decision: Mapped[str] = mapped_column(String(16), nullable=False)
     comment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -1017,6 +1046,7 @@ class ITTaskRecord(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     request_id: Mapped[int] = mapped_column(ForeignKey("staff_onboarding_requests.id"), nullable=False, index=True)
+    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     task_key: Mapped[str] = mapped_column(String(64), nullable=False)
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
@@ -1042,6 +1072,7 @@ class ITAssetRecord(Base):
     condition: Mapped[str] = mapped_column(String(24), nullable=False, default="GOOD")
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="AVAILABLE", index=True)
     employee_id: Mapped[Optional[int]] = mapped_column(ForeignKey("employees.id"), nullable=True, index=True)
+    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -1052,6 +1083,7 @@ class AssetAssignmentRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     asset_id: Mapped[int] = mapped_column(ForeignKey("it_assets.id"), nullable=False, index=True)
     employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id"), nullable=False, index=True)
+    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     assigned_by: Mapped[str] = mapped_column(String(256), nullable=False)
     assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     returned_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -1060,10 +1092,19 @@ class AssetAssignmentRecord(Base):
 
 class WorkforceAuditRecord(Base):
     __tablename__ = "workforce_audit_events"
-    __table_args__ = (Index("ix_workforce_audit_created", "created_at"),)
+    __table_args__ = (
+        Index("ix_workforce_audit_created", "created_at"),
+        Index("uq_workforce_error_tenant", "tenant_key", "entity_id", unique=True,
+              sqlite_where=text("action = 'automation.error' AND entity_type = 'automation_event' AND tenant_key IS NOT NULL"),
+              postgresql_where=text("action = 'automation.error' AND entity_type = 'automation_event' AND tenant_key IS NOT NULL")),
+        Index("uq_workforce_error_global", "entity_id", unique=True,
+              sqlite_where=text("action = 'automation.error' AND entity_type = 'automation_event' AND tenant_key IS NULL"),
+              postgresql_where=text("action = 'automation.error' AND entity_type = 'automation_event' AND tenant_key IS NULL")),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     actor_subject: Mapped[str] = mapped_column(String(256), nullable=False)
+    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     action: Mapped[str] = mapped_column(String(80), nullable=False)
     entity_type: Mapped[str] = mapped_column(String(48), nullable=False)
     entity_id: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -1082,11 +1123,13 @@ class WorkforceAutomationEventRecord(Base):
     event_id: Mapped[str] = mapped_column(String(64), nullable=False)
     event_type: Mapped[str] = mapped_column(String(80), nullable=False)
     request_id: Mapped[int] = mapped_column(ForeignKey("staff_onboarding_requests.id"), nullable=False, index=True)
+    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
     delivery_status: Mapped[str] = mapped_column(String(24), nullable=False, default="PENDING")
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     lease_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     workflow_status: Mapped[str] = mapped_column(String(24), nullable=False, default="WAITING")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -1100,6 +1143,7 @@ class WorkforceReminderRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     event_id: Mapped[str] = mapped_column(String(128), nullable=False)
     task_id: Mapped[int] = mapped_column(ForeignKey("it_setup_tasks.id"), nullable=False, index=True)
+    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     outcome: Mapped[str] = mapped_column(String(24), nullable=False)
     detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

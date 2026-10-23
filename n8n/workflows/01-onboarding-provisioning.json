@@ -19,7 +19,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const event = $json.body ?? $json;\nif (event.eventType !== 'workforce.onboarding.approved' || !event.eventId || !event.data?.requestId) { throw new Error('Invalid FlowOps onboarding event envelope'); }\nreturn [{ json: { eventId: event.eventId, requestId: event.data.requestId, workEmail: event.data.workEmail, outcome: 'success', detail: 'Simulated account provisioning in n8n; no external identity was created.' } }];"
+        "jsCode": "const event = $json.body ?? $json;\nif (event.eventType !== 'workforce.onboarding.approved' || !event.eventId || !event.tenantKey || !event.data?.requestId) { throw new Error('Invalid FlowOps onboarding event envelope'); }\nreturn [{ json: { eventId: event.eventId, tenantKey: event.tenantKey, requestId: event.data.requestId, workEmail: event.data.workEmail, outcome: 'success', detail: 'Simulated account provisioning in n8n; no external identity was created.' } }];"
       },
       "id": "a55fc09c-9249-4168-8d40-025a29a6f57e",
       "name": "Validate and simulate provisioning",
@@ -35,7 +35,7 @@
         "genericAuthType": "httpHeaderAuth",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ { eventId: $json.eventId, outcome: $json.outcome, detail: $json.detail } }}",
+        "jsonBody": "={{ { eventId: $json.eventId, tenantKey: $json.tenantKey, outcome: $json.outcome, detail: $json.detail } }}",
         "options": {"timeout": 10000}
       },
       "id": "766fe148-adef-41eb-b085-2cfb6ebca43f",

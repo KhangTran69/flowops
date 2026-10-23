@@ -39,7 +39,7 @@
 {% elif form == "assets" and row.get("Status") == "ASSIGNED" %}<button class="button small" data-action="return-asset">Return</button><button class="button small" data-action="asset-history">History</button>
 {% elif form == "assets" %}<button class="button small" data-action="asset-available">Mark available</button><button class="button small" data-action="asset-history">History</button>
 {% elif form == "onboarding" %}<a class="button small" href="/workforce/ui/onboarding/{{ row.get('_id') }}">Details</a>
-{% elif form == "automation" and (row.get("Delivery") == "FAILED" or row.get("Workflow") == "FAILED") %}<button class="button small" data-action="retry-event">Retry</button>
+{% elif form == "automation" and (row.get("Delivery") == "FAILED" or row.get("Workflow") == "FAILED" or row.get("Callback overdue") == "Yes") %}<button class="button small" data-action="retry-event">Retry</button>
 {% elif form == "automation" and row.get("Delivery") == "PENDING" %}<button class="button small" data-action="simulate-event">Run simulated provisioning</button>{% endif %}</td>{% endif %}</tr>{% endfor %}</tbody></table>
 {% else %}<div class="empty-state"><h2>Nothing here yet</h2><p>New records will appear in this queue when they are created.</p></div>{% endif %}
 </section>
