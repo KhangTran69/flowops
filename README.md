@@ -118,7 +118,7 @@ flowops/
 ├── scripts/demo_smoke.sh     # Local end-to-end smoke test
 ├── scripts/load_smoke.py     # Small concurrent intake/replay smoke test
 ├── scripts/ai_smoke.py       # Opt-in live AI provider smoke check
-├── .gitignore  .env.example  requirements.txt  README.md
+├── .gitignore  .env.example  requirements.in  requirements.txt  README.md
 ```
 
 ## Installation and running (macOS)
@@ -127,7 +127,7 @@ flowops/
 cd flowops
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # pinned runtime + test dependencies
 
 # CLI (v0.1)
 python -m src.ticket_processor
@@ -137,6 +137,21 @@ uvicorn src.api:app --reload        # http://127.0.0.1:8000
 ```
 
 Key URLs: `/` landing page · `/docs` interactive API docs · `/dashboard` monitoring.
+
+### Dependency management
+
+`requirements.in` and `requirements-dev.in` declare the direct dependencies.
+`requirements.txt` and `requirements-dev.txt` are generated, fully pinned, and
+are what CI, Docker, and Compose install. Never install from the `.in` files
+and never edit the pinned `.txt` files by hand.
+
+```bash
+uv pip compile requirements.in     --universal --python-version 3.10 -o requirements.txt
+uv pip compile requirements-dev.in --universal --python-version 3.10 -o requirements-dev.txt
+```
+
+Run both commands after changing a direct dependency. Dependabot updates the
+pinned files weekly in one grouped pull request.
 
 For a guided five-minute walkthrough, see
 [`docs/portfolio-demo.md`](docs/portfolio-demo.md). Once the API is running,
