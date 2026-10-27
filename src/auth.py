@@ -78,7 +78,13 @@ def validate_auth_configuration(
 ) -> None:
     """Fail fast when protected mode lacks a usable credential source."""
     values = environ if environ is not None else os.environ
-    if values.get("FLOWOPS_AUTH_REQUIRED", "false").lower() != "true":
+    environment = values.get("FLOWOPS_ENVIRONMENT", "development").lower()
+    auth_required = values.get("FLOWOPS_AUTH_REQUIRED", "false").lower() == "true"
+    if environment != "development" and not auth_required:
+        raise AuthenticationError(
+            "FLOWOPS_AUTH_REQUIRED=true is mandatory outside development."
+        )
+    if not auth_required:
         return
     if values.get("FLOWOPS_ENTRA_ISSUER"):
         if not values.get("FLOWOPS_ENTRA_AUDIENCE") or not values.get(
@@ -88,7 +94,6 @@ def validate_auth_configuration(
                 "Entra issuer, audience, and JWKS URL must all be configured."
             )
         return
-    environment = values.get("FLOWOPS_ENVIRONMENT", "development").lower()
     if environment == "development" and values.get("FLOWOPS_DEV_BEARER_TOKEN"):
         return
     raise AuthenticationError(

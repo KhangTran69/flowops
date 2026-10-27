@@ -335,7 +335,7 @@ curl -X POST http://127.0.0.1:8000/onboarding-requests -H 'Content-Type: applica
 
 - No credentials in code; `.env` git-ignored; no dotenv dependency.
 - All input untrusted: strict type validation, ticket IDs must be numeric before any lookup (blocks path traversal), dashboard HTML output escaped (`html.escape`).
-- **Authentication is optional** — local development defaults to no auth; set `FLOWOPS_AUTH_REQUIRED=true` and configure a dev bearer token or Entra JWT before exposing the service. Offboarding completion is admin-only. Bind to localhost for demos.
+- **Authentication is optional in development** — local development defaults to no auth. Every non-development environment must enable `FLOWOPS_AUTH_REQUIRED=true` and `FLOWOPS_UI_AUTH_REQUIRED=true`, provide valid credentials and a 32-character `FLOWOPS_SESSION_SECRET`, and set `FLOWOPS_SESSION_COOKIE_SECURE=true`, or startup fails. Docker Compose binds to localhost by default; set `FLOWOPS_BIND_ADDRESS` only when an intentional network-facing deployment is configured. Offboarding completion is admin-only.
 - Runtime artifacts (`data/*.json`, `data/tickets/`, `data/*.db`) git-ignored.
 
 ### Offboarding completion ledger

@@ -146,6 +146,12 @@ class GraphClientFactory:
     def settings_for(self, tenant_key: str | None) -> TenantSettings:
         if not tenant_key or tenant_key == DEFAULT_TENANT_KEY:
             stored = self.loader(DEFAULT_TENANT_KEY) if tenant_key else None
+            if stored is not None and not stored.active:
+                raise GraphError(
+                    f"tenant {DEFAULT_TENANT_KEY!r} is inactive",
+                    code="TenantInactive",
+                    status_code=409,
+                )
             return stored or default_settings(self.environ)
         settings = self.loader(tenant_key)
         if settings is None:

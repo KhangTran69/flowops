@@ -8,7 +8,7 @@ from typing import Optional
 
 from fastapi import Depends, Form, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from src import ai_agent, chatops, db, definitions, jobs, scheduler, ui_session, web, workflow
@@ -34,18 +34,31 @@ router = APIRouter()
 
 def _site_stats(session: Session) -> dict[str, int]:
     """Small aggregate snapshot used by the landing page."""
-    tickets = session.execute(select(db.TicketRecord)).scalars().all()
-    outbox = session.execute(select(db.NotificationOutboxRecord)).scalars().all()
-    onboarding = session.execute(select(db.OnboardingRequestRecord)).scalars().all()
+    ticket_count, open_tickets, auto_routed = session.execute(
+        select(
+            func.count(),
+            func.count().filter(db.TicketRecord.status == "open"),
+            func.count().filter(
+                db.TicketRecord.queue.is_not(None),
+                db.TicketRecord.queue != "it-service-desk",
+            ),
+        ).select_from(db.TicketRecord)
+    ).one()
+    outbox_counts = dict(
+        session.execute(
+            select(db.NotificationOutboxRecord.status, func.count())
+            .group_by(db.NotificationOutboxRecord.status)
+        ).all()
+    )
     return {
-        "tickets": len(tickets),
-        "open_tickets": sum(1 for ticket in tickets if ticket.status == "open"),
-        "auto_routed": sum(
-            1 for ticket in tickets if ticket.queue and ticket.queue != "it-service-desk"
-        ),
-        "onboarding_requests": len(onboarding),
-        "pending_notifications": sum(1 for item in outbox if item.status == "pending"),
-        "failed_notifications": sum(1 for item in outbox if item.status == "failed"),
+        "tickets": ticket_count,
+        "open_tickets": open_tickets,
+        "auto_routed": auto_routed,
+        "onboarding_requests": session.scalar(
+            select(func.count()).select_from(db.OnboardingRequestRecord)
+        ) or 0,
+        "pending_notifications": outbox_counts.get("pending", 0),
+        "failed_notifications": outbox_counts.get("failed", 0),
     }
 
 
