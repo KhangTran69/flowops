@@ -56,12 +56,19 @@ def _out(record: db.TenantRecord) -> TenantOut:
 
 
 @router.get("/tenants", response_model=list[TenantOut])
-def list_tenants(session: Session = Depends(db.get_session)) -> list[TenantOut]:
+def list_tenants(
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> list[TenantOut]:
     return [_out(r) for r in session.query(db.TenantRecord).order_by(db.TenantRecord.key)]
 
 
 @router.get("/tenants/{key}", response_model=TenantOut)
-def get_tenant(key: str, session: Session = Depends(db.get_session)) -> TenantOut:
+def get_tenant(
+    key: str,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> TenantOut:
     record = session.get(db.TenantRecord, key)
     if record is None:
         raise HTTPException(404, "Tenant not found.")

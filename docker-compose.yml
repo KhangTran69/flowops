@@ -57,7 +57,7 @@ services:
     restart: unless-stopped
     stop_grace_period: 15s
     ports:
-      - "${FLOWOPS_APP_PORT:-8000}:8000"
+      - "${FLOWOPS_BIND_ADDRESS:-127.0.0.1}:${FLOWOPS_APP_PORT:-8000}:8000"
     environment:
       <<: *flowops-env
       FLOWOPS_RUN_MIGRATIONS: "true"

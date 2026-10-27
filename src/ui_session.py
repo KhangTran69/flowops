@@ -80,11 +80,18 @@ def validate_ui_auth_configuration(
     """Fail fast when protected UI mode lacks a secret or auth source."""
     values = _values(environ)
     if not ui_auth_required(values):
+        if values.get("FLOWOPS_ENVIRONMENT", "development").lower() != "development":
+            raise UISessionError(
+                "FLOWOPS_UI_AUTH_REQUIRED=true is mandatory outside development."
+            )
         return
-    if not values.get("FLOWOPS_SESSION_SECRET"):
+    session_secret_value = values.get("FLOWOPS_SESSION_SECRET", "")
+    if len(session_secret_value) < 32:
         raise UISessionError(
-            "FLOWOPS_UI_AUTH_REQUIRED=true requires FLOWOPS_SESSION_SECRET."
+            "FLOWOPS_UI_AUTH_REQUIRED=true requires FLOWOPS_SESSION_SECRET with at least 32 characters."
         )
+    if values.get("FLOWOPS_ENVIRONMENT", "development").lower() != "development" and not cookie_secure(values):
+        raise UISessionError("FLOWOPS_SESSION_COOKIE_SECURE=true is mandatory outside development.")
     if values.get("FLOWOPS_AUTH_REQUIRED", "false").lower() != "true":
         raise UISessionError(
             "FLOWOPS_UI_AUTH_REQUIRED=true requires FLOWOPS_AUTH_REQUIRED=true "
