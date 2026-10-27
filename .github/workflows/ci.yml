@@ -11,14 +11,14 @@ jobs:
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check for merge conflict markers
         run: |
           if git grep -nE '^(<<<<<<<|>>>>>>>|\|\|\|\|\|\|\|)' -- .; then
             echo "Merge conflict markers found in tracked files." >&2
             exit 1
           fi
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
@@ -35,7 +35,7 @@ jobs:
   docker-postgres:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build and start the PostgreSQL demo stack
         run: docker compose up --build --detach --wait --wait-timeout 120
       - name: Show service status
@@ -74,8 +74,8 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
       - name: Install dependencies
