@@ -24,7 +24,7 @@ import uuid
 from typing import Any, Optional
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 
 class FlowOpsToolError(RuntimeError):
@@ -133,8 +133,8 @@ TOOL_NAMES = (
 )
 
 
-def build_server(tools: FlowOpsTools) -> FastMCP:
-    server = FastMCP(
+def build_server(tools: FlowOpsTools) -> MCPServer:
+    server = MCPServer(
         "flowops",
         instructions=(
             "FlowOps is an MSP service-desk automation platform. Use read tools to inspect "
@@ -148,7 +148,7 @@ def build_server(tools: FlowOpsTools) -> FastMCP:
     return server
 
 
-def server_from_environment() -> FastMCP:
+def server_from_environment() -> MCPServer:
     headers = {}
     token = os.environ.get("FLOWOPS_MCP_API_TOKEN")
     if token:
