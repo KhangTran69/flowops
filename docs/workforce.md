@@ -9,7 +9,7 @@ For a quick SQLite run:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 python -m alembic upgrade head
 python -m src.workforce_demo
 uvicorn src.api:app --reload
