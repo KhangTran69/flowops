@@ -41,11 +41,11 @@ retry budget after recovery).
 
 ### Documented-but-open (deliberately not changed here)
 
-1. `workflow_runs`/`step_runs`/`workflow_jobs` carry no `tenant_key` column, so
-   their operator mutations (`POST /workflow-runs/{id}/pause|resume|cancel`,
-   `POST /workflow-jobs/{id}/retry|cancel`) cannot be tenant-fenced without a
-   schema migration. They remain role-gated; fencing needs a migration similar
-   to `0012_workforce_tenant_fencing`.
+1. Workflow runs and jobs have no `tenant_key` column. The follow-up API fix
+   scopes runs through their onboarding request and onboarding jobs through
+   `resource_id`; records without a resolvable request are hidden from tenant
+   actors. Other request, step, and operator surfaces still need a separate
+   endpoint-by-endpoint review.
 2. `notification_outbox`, execution logs, and the analytics/report views are
    operator-plane surfaces; their tenant filter is caller-supplied and
    presentational.
