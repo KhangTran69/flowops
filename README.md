@@ -153,9 +153,18 @@ uv pip compile requirements-dev.in --universal --python-version 3.10 -o requirem
 Run both commands after changing a direct dependency. Dependabot updates the
 pinned files weekly in one grouped pull request.
 
-For a guided five-minute walkthrough, see
-[`docs/portfolio-demo.md`](docs/portfolio-demo.md). Once the API is running,
-the repeatable local smoke test is:
+For the reviewer quick path, first start the local API using the
+[local development setup](#local-development), then run
+[`./scripts/demo_smoke.sh`](scripts/demo_smoke.sh). It checks urgent routing,
+idempotent replay, and dashboard HTTP 200 at `FLOWOPS_DEMO_URL` (default
+`http://127.0.0.1:8000`). It also starts two local tenant-bound API processes
+over a temporary SQLite database and checks that Tenant B gets HTTP 404 for
+Tenant A's ticket while Tenant A's read remains unchanged. The tenant check
+covers this direct-read boundary, not a complete authorization audit; Microsoft
+Graph and external provider behavior remain simulated. See the optional
+[five-minute UI walkthrough](docs/portfolio-demo.md) for follow-on screens.
+
+The local smoke command is:
 
 ```bash
 ./scripts/demo_smoke.sh

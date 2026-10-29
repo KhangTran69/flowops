@@ -64,6 +64,42 @@ def test_tenant_actor_sees_only_its_tenant_tickets(fencing_client):
     assert client.get(f"/tickets/{ticket_id}").status_code == 200
 
 
+def test_foreign_ticket_lookup_is_denied_without_mutation(fencing_client):
+    client, set_actor = fencing_client
+    set_actor(_tenant_actor("tenant-a"))
+    created = client.post("/tickets", json={
+        "id": 1010, "userId": 77, "title": "Tenant A VPN issue",
+        "completed": False,
+    })
+    assert created.status_code == 201, created.text
+    ticket_id = created.json()["ticket_id"]
+    before = client.get(f"/tickets/{ticket_id}")
+    assert before.status_code == 200
+    before_representation = before.json()
+
+    session = db.SessionLocal()
+    try:
+        record = session.get(db.TicketRecord, ticket_id)
+        assert record.tenant_key == "tenant-a"
+        before_row = (record.tenant_key, record.title, record.status, record.priority, record.queue)
+    finally:
+        session.close()
+
+    set_actor(_tenant_actor("tenant-b"))
+    assert client.get(f"/tickets/{ticket_id}").status_code == 404
+
+    set_actor(_tenant_actor("tenant-a"))
+    after = client.get(f"/tickets/{ticket_id}")
+    assert after.status_code == 200
+    assert after.json() == before_representation
+    session = db.SessionLocal()
+    try:
+        record = session.get(db.TicketRecord, ticket_id)
+        assert (record.tenant_key, record.title, record.status, record.priority, record.queue) == before_row
+    finally:
+        session.close()
+
+
 def test_ticket_creation_requires_actor_tenant(fencing_client):
     client, set_actor = fencing_client
     set_actor(_tenant_actor("tenant-b"))
