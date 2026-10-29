@@ -2,7 +2,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from src import api, chatops, db
+from src import api, chatops, connectwise, db
 from src.auth import Actor
 from src.deps import _actor_from_header
 
@@ -153,6 +153,91 @@ def test_workflow_runs_and_jobs_are_fenced_by_request_tenant(fencing_client):
     assert client.get(f"/workflow-jobs/{job_a_id}").status_code == 404
     assert client.get(f"/workflow-jobs/{job_a_id}/history").status_code == 404
     assert client.post(f"/workflow-jobs/{job_a_id}/retry").status_code == 404
+
+
+def test_guessed_foreign_workflow_run_actions_are_fenced(fencing_client):
+    client, set_actor = fencing_client
+    set_actor(_tenant_actor("tenant-a"))
+    request = client.post("/onboarding-requests", json=ONBOARDING)
+    assert request.status_code == 201, request.text
+    session = db.SessionLocal()
+    try:
+        run = db.WorkflowRunRecord(request_id=request.json()["id"], status="running")
+        session.add(run)
+        session.commit()
+        run_id = run.id
+    finally:
+        session.close()
+
+    set_actor(_tenant_actor("tenant-b"))
+    for action in ("pause", "resume", "cancel"):
+        response = client.post(f"/workflow-runs/{run_id}/{action}")
+        assert response.status_code == 404, response.text
+
+    session = db.SessionLocal()
+    try:
+        assert session.get(db.WorkflowRunRecord, run_id).status == "running"
+    finally:
+        session.close()
+
+
+def test_operator_routes_do_not_accept_missing_or_foreign_record_ids(fencing_client):
+    client, set_actor = fencing_client
+    set_actor(_tenant_actor("tenant-a"))
+    request = client.post("/onboarding-requests", json=ONBOARDING)
+    assert request.status_code == 201, request.text
+    request_id = request.json()["id"]
+    session = db.SessionLocal()
+    try:
+        run = db.WorkflowRunRecord(request_id=request_id, status="running")
+        session.add(run)
+        session.flush()
+        job = db.WorkflowJobRecord(
+            job_type="onboarding.item.execute", payload_json="{}", status="failed",
+            resource_type="onboarding", resource_id=str(request_id),
+        )
+        session.add(job)
+        session.commit()
+        run_id, job_id = run.id, job.id
+    finally:
+        session.close()
+
+    set_actor(_tenant_actor("tenant-b"))
+    expected_status = {
+        f"/workflow-runs/{run_id}/cancel": 404,
+        f"/workflow-jobs/{job_id}/retry": 404,
+        f"/workflow-jobs/{job_id}/cancel": 403,  # admin-only operator route
+        "/workflow-runs/999999/pause": 404,
+        "/workflow-jobs/999999/retry": 404,
+    }
+    for url, expected in expected_status.items():
+        response = client.post(url)
+        assert response.status_code == expected, f"{url}: {response.status_code} {response.text}"
+
+
+def test_psa_sync_rejects_unassigned_and_foreign_tickets(fencing_client, monkeypatch):
+    client, set_actor = fencing_client
+    set_actor(_local_actor())
+    unassigned = client.post("/tickets", json={
+        "id": 711, "userId": 7, "title": "Legacy ticket", "completed": False,
+    })
+    set_actor(_tenant_actor("tenant-b"))
+    foreign = client.post("/tickets", json={
+        "id": 712, "userId": 7, "title": "Tenant B ticket", "completed": False,
+    })
+    assert unassigned.status_code == foreign.status_code == 201
+
+    sync_calls = []
+    monkeypatch.setattr(connectwise, "client_from_environment", lambda: object())
+    monkeypatch.setattr(
+        connectwise, "sync_ticket",
+        lambda *_args: sync_calls.append(_args[1].ticket_id) or {"action": "created", "connectwise_id": "1"},
+    )
+    set_actor(_tenant_actor("tenant-a"))
+    for ticket_id in (unassigned.json()["ticket_id"], foreign.json()["ticket_id"]):
+        response = client.post(f"/tickets/{ticket_id}/psa-sync")
+        assert response.status_code == 404, response.text
+    assert sync_calls == []
 
 
 def test_onboarding_requests_are_tenant_scoped(fencing_client):
