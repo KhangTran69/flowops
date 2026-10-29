@@ -1,26 +1,39 @@
 # FlowOps portfolio demo
 
 This is a five-minute walkthrough for showing the project in an interview or
-portfolio review. It demonstrates the complete local workflow without real
-credentials or external automation accounts.
+portfolio review. The short path is `./scripts/demo_smoke.sh`: it checks urgent
+routing, idempotent replay, and the dashboard at `FLOWOPS_DEMO_URL` (default
+`http://127.0.0.1:8000`), then starts two local tenant-bound API processes over
+its own temporary SQLite database. It generates separate development tokens
+for Tenant A and Tenant B, verifies that Tenant B receives HTTP 404 for
+Tenant A's ticket, and confirms Tenant A's response is unchanged afterward.
+The tokens, processes, and temporary files are removed when the command exits.
+
+From a clean checkout, install the dependencies and start the local API using
+the [README setup instructions](../README.md#local-development). Then run:
+
+```bash
+./scripts/demo_smoke.sh
+```
+
+The tenant proof covers the direct ticket-read API boundary only; it is not a
+complete authorization audit. Microsoft Graph and external provider behavior
+remain simulated. The UI walkthrough below is an optional follow-on.
 
 ## Five-minute path
 
 | Time | Show | What the viewer should notice |
 | --- | --- | --- |
-| 0:00–1:00 | Start the API and open `/dashboard` | The app exposes run health and workflow activity. |
-| 1:00–2:30 | Run `./scripts/demo_smoke.sh` | An urgent VPN ticket is routed to `it-network`; an identical request is replayed safely. |
+| 0:00–1:00 | Run `./scripts/demo_smoke.sh` | Routing, replay, dashboard, and tenant-boundary checks pass. |
+| 1:00–1:30 | Open `/dashboard` | The app exposes run health and workflow activity. |
 | 2:30–3:30 | Open `/ui/tickets` and the ticket detail | The saved record and its routing are visible to an operator. |
 | 3:30–4:30 | Open `/ui/onboarding-requests` | Approval-gated checklist work stays pending until an operator acts. |
 | 4:30–5:00 | Return to `/dashboard` | Explain which events are simulated and which state is persisted. |
 
-The smoke script verifies the ticket replay and dashboard response. It does not
-run the onboarding approval, Microsoft Graph, or external providers. Use the
-sections below for a longer technical walkthrough. If the demo key already
-exists with a different payload in a persistent database, use a fresh local
-database before the presentation.
+The smoke command leaves the five-minute UI walkthrough below optional. It
+does not run the onboarding approval, Microsoft Graph, or external providers.
 
-## 1. Start the API
+## Optional UI walkthrough: start the API
 
 From the project root:
 
