@@ -25,7 +25,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from sqlalchemy import Integer, and_, cast, delete, or_, select, text, update
+from sqlalchemy import Integer, String, and_, cast, delete, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -493,15 +493,37 @@ def _actor_tenant(actor: Actor) -> Optional[str]:
 
 def _require_ticket_access(actor: Actor, record: db.TicketRecord) -> None:
     """404 on cross-tenant reads so existence outside the tenant is not leaked."""
-    tenant_key = getattr(actor, "tenant_key", None)
-    if tenant_key and record.tenant_key and record.tenant_key != tenant_key:
+    tenant_key = _actor_tenant(actor)
+    if tenant_key and record.tenant_key != tenant_key:
         raise HTTPException(status_code=404, detail="Ticket not found.")
 
 
 def _require_request_access(actor: Actor, record: db.OnboardingRequestRecord) -> None:
     tenant_key = _actor_tenant(actor)
-    if tenant_key and record.tenant_key and record.tenant_key != tenant_key:
+    if tenant_key and record.tenant_key != tenant_key:
         raise HTTPException(status_code=404, detail="Onboarding request not found.")
+
+
+def _require_workflow_run_access(
+    session: Session, actor: Actor, run: db.WorkflowRunRecord
+) -> None:
+    request = session.get(db.OnboardingRequestRecord, run.request_id)
+    if request is None:
+        raise HTTPException(status_code=404, detail="Workflow run not found.")
+    _require_request_access(actor, request)
+
+
+def _require_workflow_job_access(
+    session: Session, actor: Actor, job: db.WorkflowJobRecord
+) -> None:
+    tenant_key = _actor_tenant(actor)
+    if tenant_key is None:
+        return
+    if job.resource_type != "onboarding" or not job.resource_id or not job.resource_id.isdecimal():
+        raise HTTPException(status_code=404, detail="Workflow job not found.")
+    request = session.get(db.OnboardingRequestRecord, int(job.resource_id))
+    if request is None or request.tenant_key != tenant_key:
+        raise HTTPException(status_code=404, detail="Workflow job not found.")
 
 
 @app.post("/tickets", response_model=Ticket, status_code=http_status.HTTP_201_CREATED)
@@ -1524,8 +1546,13 @@ def start_workflow_run(
 @app.get("/onboarding-requests/{request_id}/run", response_model=WorkflowRunOut)
 def get_workflow_run(
     request_id: int,
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
 ) -> WorkflowRunOut:
+    request = session.get(db.OnboardingRequestRecord, request_id)
+    if request is None:
+        raise HTTPException(404, "Onboarding request not found.")
+    _require_request_access(actor, request)
     run = scheduler.get_run_for_request(session, request_id)
     if run is None:
         raise HTTPException(404, "Workflow run not found.")
@@ -1541,6 +1568,7 @@ def list_workflow_runs(
     created_before: Optional[datetime] = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
 ) -> list[WorkflowRunOut]:
     query = (
@@ -1553,7 +1581,10 @@ def list_workflow_runs(
     )
     if status_filter:
         query = query.where(db.WorkflowRunRecord.status == status_filter)
-    if tenant is not None:
+    actor_tenant = _actor_tenant(actor)
+    if actor_tenant is not None:
+        query = query.where(db.OnboardingRequestRecord.tenant_key == actor_tenant)
+    elif tenant is not None:
         query = query.where(db.OnboardingRequestRecord.tenant_key == tenant)
     if definition is not None:
         query = query.where(db.OnboardingRequestRecord.definition_key == definition)
@@ -1568,6 +1599,10 @@ def list_workflow_runs(
 def _run_action(
     session: Session, run_id: int, actor: Actor, action: str
 ) -> WorkflowRunOut:
+    run = session.get(db.WorkflowRunRecord, run_id)
+    if run is None:
+        raise HTTPException(404, "Workflow run not found.")
+    _require_workflow_run_access(session, actor, run)
     try:
         if action == "pause":
             run = scheduler.pause_run(session, run_id, actor.subject)
@@ -2249,35 +2284,55 @@ def enqueue_onboarding_item_job(
 @app.get("/workflow-jobs", response_model=list[WorkflowJobOut])
 def list_workflow_jobs(
     session: Session = Depends(db.get_session),
+    actor: Actor = Depends(_operator_actor),
     status_filter: Optional[str] = Query(default=None, alias="status"),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> list[WorkflowJobOut]:
     """List durable workflow jobs, newest first."""
+    tenant_key = _actor_tenant(actor)
+    if tenant_key is not None:
+        request_ids = select(cast(db.OnboardingRequestRecord.id, String)).where(
+            db.OnboardingRequestRecord.tenant_key == tenant_key
+        )
+        query = select(db.WorkflowJobRecord).where(
+            db.WorkflowJobRecord.resource_type == "onboarding",
+            db.WorkflowJobRecord.resource_id.in_(request_ids),
+        )
+        if status_filter is not None:
+            query = query.where(db.WorkflowJobRecord.status == status_filter)
+        records = session.scalars(
+            query.order_by(db.WorkflowJobRecord.id.desc()).offset(offset).limit(limit)
+        ).all()
+    else:
+        records = jobs.list_jobs(session, status=status_filter, limit=limit, offset=offset)
     return [
         WorkflowJobOut.model_validate(job)
-        for job in jobs.list_jobs(
-            session, status=status_filter, limit=limit, offset=offset
-        )
+        for job in records
     ]
 
 
 @app.get("/workflow-jobs/{job_id}", response_model=WorkflowJobOut)
 def get_workflow_job(
-    job_id: int, session: Session = Depends(db.get_session)
+    job_id: int, actor: Actor = Depends(_operator_actor), session: Session = Depends(db.get_session)
 ) -> WorkflowJobOut:
     """Return one durable workflow job."""
     job = session.get(db.WorkflowJobRecord, job_id)
     if job is None:
         raise HTTPException(404, "Workflow job not found.")
+    _require_workflow_job_access(session, actor, job)
     return WorkflowJobOut.model_validate(job)
 
 
 @app.get("/workflow-jobs/{job_id}/history", response_model=list[ActionExecutionOut])
 def workflow_job_history(
-    job_id: int, session: Session = Depends(db.get_session)
+    job_id: int, actor: Actor = Depends(_operator_actor), session: Session = Depends(db.get_session)
 ) -> list[ActionExecutionOut]:
     """Return every durable worker attempt for a workflow job."""
+    job = session.get(db.WorkflowJobRecord, job_id)
+    if job is None:
+        raise HTTPException(404, "Workflow job not found.")
+    _require_workflow_job_access(session, actor, job)
     try:
         records = workflow_control.history(session, job_id)
     except LookupError as error:
@@ -2293,6 +2348,7 @@ def retry_workflow_job(
     job = session.get(db.WorkflowJobRecord, job_id)
     if job is None:
         raise HTTPException(404, "Workflow job not found.")
+    _require_workflow_job_access(session, actor, job)
     if job.status != "failed":
         raise HTTPException(
             409, f"Only failed jobs can be retried (current status: '{job.status}')."
@@ -2325,6 +2381,7 @@ def cancel_workflow_job(
     job = session.get(db.WorkflowJobRecord, job_id)
     if job is None:
         raise HTTPException(404, "Workflow job not found.")
+    _require_workflow_job_access(session, actor, job)
     if not jobs.cancel_job(session, job_id):
         raise HTTPException(
             409, "Only queued or retry-scheduled jobs can be cancelled."

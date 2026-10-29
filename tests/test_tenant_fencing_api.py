@@ -101,6 +101,60 @@ def test_local_actor_stays_global(fencing_client):
     assert len(client.get("/tickets").json()) == 1
 
 
+def test_tenant_actor_cannot_read_unassigned_legacy_records(fencing_client):
+    client, set_actor = fencing_client
+    set_actor(_local_actor())
+    ticket = client.post("/tickets", json={
+        "id": 301, "userId": 3, "title": "Legacy unassigned ticket", "completed": False,
+    })
+    request = client.post("/onboarding-requests", json={**ONBOARDING, "employee_email": "legacy@example.com"})
+    assert ticket.status_code == 201, ticket.text
+    assert request.status_code == 201, request.text
+
+    set_actor(_tenant_actor("tenant-a"))
+    assert client.get(f"/tickets/{ticket.json()['ticket_id']}").status_code == 404
+    assert client.get(f"/onboarding-requests/{request.json()['id']}").status_code == 404
+
+
+def test_workflow_runs_and_jobs_are_fenced_by_request_tenant(fencing_client):
+    client, set_actor = fencing_client
+    set_actor(_tenant_actor("tenant-a"))
+    request_a = client.post("/onboarding-requests", json=ONBOARDING)
+    set_actor(_tenant_actor("tenant-b"))
+    request_b = client.post("/onboarding-requests", json={**ONBOARDING, "employee_email": "b@example.com"})
+    assert request_a.status_code == request_b.status_code == 201
+
+    session = db.SessionLocal()
+    try:
+        run_a = db.WorkflowRunRecord(request_id=request_a.json()["id"], status="running")
+        run_b = db.WorkflowRunRecord(request_id=request_b.json()["id"], status="running")
+        session.add_all([run_a, run_b])
+        session.flush()
+        job_a = db.WorkflowJobRecord(
+            job_type="onboarding.item.execute", payload_json="{}", status="failed",
+            resource_type="onboarding", resource_id=str(request_a.json()["id"]),
+        )
+        job_b = db.WorkflowJobRecord(
+            job_type="onboarding.item.execute", payload_json="{}", status="failed",
+            resource_type="onboarding", resource_id=str(request_b.json()["id"]),
+        )
+        session.add_all([job_a, job_b])
+        session.commit()
+        run_a_id, run_b_id, job_a_id, job_b_id = run_a.id, run_b.id, job_a.id, job_b.id
+    finally:
+        session.close()
+
+    set_actor(_tenant_actor("tenant-a"))
+    assert client.get("/workflow-runs").json()[0]["id"] == run_a_id
+    assert client.get("/workflow-jobs").json()[0]["id"] == job_a_id
+    set_actor(_tenant_actor("tenant-b"))
+    assert client.get(f"/onboarding-requests/{request_a.json()['id']}/run").status_code == 404
+    assert client.post(f"/workflow-runs/{run_a_id}/cancel").status_code == 404
+    assert client.get(f"/workflow-jobs/{job_a_id}").status_code == 404
+    assert client.get(f"/workflow-jobs/{job_a_id}/history").status_code == 404
+    assert client.post(f"/workflow-jobs/{job_a_id}/retry").status_code == 404
+
+
 def test_onboarding_requests_are_tenant_scoped(fencing_client):
     client, set_actor = fencing_client
     set_actor(_tenant_actor("tenant-a"))
