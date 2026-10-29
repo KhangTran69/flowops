@@ -486,6 +486,24 @@ def metrics_endpoint(session: Session = Depends(db.get_session)) -> Response:
 # Routes: tickets
 
 
+def _actor_tenant(actor: Actor) -> Optional[str]:
+    """Tenant key enforced for tenant-bearing actors; local actors stay global."""
+    return None if actor.source == "local" else actor.tenant_key
+
+
+def _require_ticket_access(actor: Actor, record: db.TicketRecord) -> None:
+    """404 on cross-tenant reads so existence outside the tenant is not leaked."""
+    tenant_key = getattr(actor, "tenant_key", None)
+    if tenant_key and record.tenant_key and record.tenant_key != tenant_key:
+        raise HTTPException(status_code=404, detail="Ticket not found.")
+
+
+def _require_request_access(actor: Actor, record: db.OnboardingRequestRecord) -> None:
+    tenant_key = _actor_tenant(actor)
+    if tenant_key and record.tenant_key and record.tenant_key != tenant_key:
+        raise HTTPException(status_code=404, detail="Onboarding request not found.")
+
+
 @app.post("/tickets", response_model=Ticket, status_code=http_status.HTTP_201_CREATED)
 def create_ticket(
     request: TicketIntakeRequest,
@@ -500,6 +518,11 @@ def create_ticket(
     200 with an Idempotency-Replayed header when the same Idempotency-Key
     is replayed (without re-executing the request).
     """
+    tenant_key = getattr(actor, "tenant_key", None)
+    if tenant_key:
+        if request.tenant and request.tenant != tenant_key:
+            raise HTTPException(status_code=404, detail="Ticket not found.")
+        request.tenant = tenant_key
     _validate_idempotency_key(idempotency_key)
     request_hash = _request_fingerprint(request)
     owner_token, replay = _reserve_idempotency_key(
@@ -799,13 +822,16 @@ def get_knowledge_base(
 @app.get("/tickets", response_model=list[Ticket])
 def list_tickets(
     session: Session = Depends(db.get_session),
+    actor: Actor = Depends(_actor_from_header),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     tenant: Optional[str] = Query(default=None, max_length=64),
 ) -> list[Ticket]:
     """List stored tickets with bounded database pagination."""
     query = select(db.TicketRecord).order_by(cast(db.TicketRecord.ticket_id, Integer))
-    if tenant is not None:
+    if actor.tenant_key:
+        query = query.where(db.TicketRecord.tenant_key == actor.tenant_key)
+    elif tenant is not None:
         query = query.where(db.TicketRecord.tenant_key == tenant)
     records = session.execute(query.offset(offset).limit(limit)).scalars().all()
     return [Ticket.model_validate(record, from_attributes=True) for record in records]
@@ -813,7 +839,9 @@ def list_tickets(
 
 @app.get("/tickets/{ticket_id}", response_model=Ticket)
 def get_ticket(
-    ticket_id: str, session: Session = Depends(db.get_session)
+    ticket_id: str,
+    session: Session = Depends(db.get_session),
+    actor: Actor = Depends(_actor_from_header),
 ) -> Ticket:
     """Return one stored ticket."""
     if not ticket_id.isdigit():
@@ -821,6 +849,7 @@ def get_ticket(
     record = session.get(db.TicketRecord, ticket_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Ticket not found.")
+    _require_ticket_access(actor, record)
     return Ticket.model_validate(record, from_attributes=True)
 
 
@@ -866,6 +895,9 @@ def _chatops_action(
     record = session.get(db.OnboardingRequestRecord, claims.request_id)
     item = session.get(db.ChecklistItemRecord, claims.item_id)
     if record is None or item is None or item.request_id != record.id:
+        raise HTTPException(status_code=404, detail="Checklist item not found.")
+    if claims.tenant_key and record.tenant_key != claims.tenant_key:
+        # The token binds one tenant; stale or re-signed links cannot cross it.
         raise HTTPException(status_code=404, detail="Checklist item not found.")
     if action == "approve" and item.status != "pending":
         raise HTTPException(
@@ -1314,6 +1346,13 @@ def create_onboarding_request(
     ``POST /tickets``: replays are 200, changed payloads are 409, and a stale
     owner that loses its lease cannot finalize the takeover's reservation.
     """
+    tenant_key = _actor_tenant(actor)
+    if tenant_key:
+        if request.tenant_key and request.tenant_key != tenant_key:
+            raise HTTPException(
+                status_code=404, detail="Onboarding request not found."
+            )
+        request.tenant_key = tenant_key
     _validate_idempotency_key(idempotency_key)
     request_hash = _request_fingerprint(request)
     owner_token, replay = _reserve_idempotency_key(
@@ -1360,9 +1399,13 @@ def create_onboarding_request(
 @app.get("/onboarding-requests", response_model=list[OnboardingRequestOut])
 def list_onboarding_requests(
     session: Session = Depends(db.get_session),
+    actor: Actor = Depends(_actor_from_header),
 ) -> list[OnboardingRequestOut]:
     """List onboarding/offboarding requests with their checklists."""
-    records = session.execute(select(db.OnboardingRequestRecord)).scalars().all()
+    query = select(db.OnboardingRequestRecord)
+    if actor.tenant_key:
+        query = query.where(db.OnboardingRequestRecord.tenant_key == actor.tenant_key)
+    records = session.execute(query).scalars().all()
     results = []
     for record in records:
         _, items = _load_request(session, record.id)
@@ -1372,9 +1415,12 @@ def list_onboarding_requests(
 
 @app.get("/onboarding-requests/{request_id}", response_model=OnboardingRequestOut)
 def get_onboarding_request(
-    request_id: int, session: Session = Depends(db.get_session)
+    request_id: int,
+    session: Session = Depends(db.get_session),
+    actor: Actor = Depends(_actor_from_header),
 ) -> OnboardingRequestOut:
     record, items = _load_request(session, request_id)
+    _require_request_access(actor, record)
     return _request_out(record, items)
 
 
@@ -1383,10 +1429,13 @@ def get_onboarding_request(
     response_model=OnboardingStatusSummaryOut,
 )
 def get_onboarding_request_status(
-    request_id: int, session: Session = Depends(db.get_session)
+    request_id: int,
+    session: Session = Depends(db.get_session),
+    actor: Actor = Depends(_actor_from_header),
 ) -> OnboardingStatusSummaryOut:
     """Return a lightweight summary of request progress for automation polling."""
     record, items = _load_request(session, request_id)
+    _require_request_access(actor, record)
     total = len(items)
     completed = sum(1 for item in items if item.status == "completed")
     pending_approval = sum(

@@ -148,6 +148,8 @@ def psa_sync(
     ticket = session.get(db.TicketRecord, ticket_id)
     if ticket is None:
         raise HTTPException(404, "Ticket not found.")
+    if actor.tenant_key and ticket.tenant_key and ticket.tenant_key != actor.tenant_key:
+        raise HTTPException(404, "Ticket not found.")
     try:
         client = connectwise.client_from_environment()
     except ValueError as error:

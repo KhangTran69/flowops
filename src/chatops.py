@@ -38,6 +38,7 @@ class ChatOpsClaims:
     action: str
     jti: str
     expires_at: int
+    tenant_key: Optional[str] = None
 
 
 def _secret(environ: Optional[Mapping[str, str]] = None) -> str:
@@ -70,6 +71,7 @@ def generate_token(
     *,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     now: Optional[int] = None,
+    tenant_key: Optional[str] = None,
     environ: Optional[Mapping[str, str]] = None,
 ) -> str:
     if action not in VALID_ACTIONS:
@@ -82,6 +84,8 @@ def generate_token(
         "exp": issued + int(ttl_seconds),
         "jti": secrets.token_urlsafe(18),
     }
+    if tenant_key:
+        payload["tenant_key"] = str(tenant_key)
     encoded = _b64(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode())
     return f"{encoded}.{_sign(encoded, _secret(environ))}"
 
@@ -114,6 +118,7 @@ def verify_token(
         action=action,
         jti=str(data["jti"]),
         expires_at=expires_at,
+        tenant_key=str(data["tenant_key"]) if data.get("tenant_key") else None,
     )
 
 
@@ -122,15 +127,18 @@ def approval_urls(
     item_id: int,
     *,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    tenant_key: Optional[str] = None,
     environ: Optional[Mapping[str, str]] = None,
 ) -> dict[str, str]:
     """Return approve/reject token URLs for UI display (empty if unconfigured)."""
     try:
         approve = generate_token(
-            request_id, item_id, "approve", ttl_seconds=ttl_seconds, environ=environ
+            request_id, item_id, "approve", ttl_seconds=ttl_seconds,
+            tenant_key=tenant_key, environ=environ,
         )
         reject = generate_token(
-            request_id, item_id, "reject", ttl_seconds=ttl_seconds, environ=environ
+            request_id, item_id, "reject", ttl_seconds=ttl_seconds,
+            tenant_key=tenant_key, environ=environ,
         )
     except ChatOpsUnavailable:
         return {}

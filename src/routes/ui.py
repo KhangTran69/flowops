@@ -327,7 +327,7 @@ def ui_onboarding_request(
     for item in sorted(items, key=lambda entry: entry.id):
         dependencies = workflow.dependencies_of(item)
         links = (
-            chatops.approval_urls(record.id, item.id)
+            chatops.approval_urls(record.id, item.id, tenant_key=record.tenant_key)
             if item.requires_approval and item.status == "pending"
             else {}
         )
