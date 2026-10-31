@@ -264,11 +264,26 @@ async def connector_webhook(
 # ---------------------------------------------------------------------------
 
 
+def _actor_tenant(actor: Actor) -> Optional[str]:
+    return None if actor.source == "local" else actor.tenant_key
+
+
+def _require_rule_access(actor: Actor, record: db.TriggerRuleRecord) -> None:
+    tenant = _actor_tenant(actor)
+    if tenant and record.tenant_key != tenant:
+        raise HTTPException(status_code=404, detail="Trigger rule not found.")
+
+
 @router.get("/trigger-rules", response_model=list[TriggerRuleOut])
-def list_trigger_rules(session: Session = Depends(db.get_session)) -> list[TriggerRuleOut]:
-    records = session.execute(
-        select(db.TriggerRuleRecord).order_by(db.TriggerRuleRecord.id)
-    ).scalars()
+def list_trigger_rules(
+    actor: Actor = Depends(_admin_actor),
+    session: Session = Depends(db.get_session),
+) -> list[TriggerRuleOut]:
+    tenant = _actor_tenant(actor)
+    query = select(db.TriggerRuleRecord).order_by(db.TriggerRuleRecord.id)
+    if tenant:
+        query = query.where(db.TriggerRuleRecord.tenant_key == tenant)
+    records = session.execute(query).scalars()
     return [_rule_out(r) for r in records]
 
 
@@ -285,6 +300,11 @@ def create_trigger_rule(
         payload.notify_url,
         json.dumps(payload.static_inputs),
     )
+    actor_tenant = _actor_tenant(actor)
+    if actor_tenant:
+        if payload.tenant_key and payload.tenant_key != actor_tenant:
+            raise HTTPException(404, detail="Tenant mismatch.")
+        payload.tenant_key = actor_tenant
     if payload.tenant_key:
         tenant = session.get(db.TenantRecord, payload.tenant_key)
         if tenant is None or not tenant.active:
@@ -333,6 +353,10 @@ def update_trigger_rule(
     record = session.get(db.TriggerRuleRecord, rule_id)
     if record is None:
         raise HTTPException(404, "Trigger rule not found.")
+    _require_rule_access(actor, record)
+    actor_tenant = _actor_tenant(actor)
+    if actor_tenant and payload.tenant_key and payload.tenant_key != actor_tenant:
+        raise HTTPException(404, detail="Tenant mismatch.")
     connector_lib.validate_rule_shape(
         payload.predicate,
         payload.action_type,
@@ -363,6 +387,7 @@ def delete_trigger_rule(
     record = session.get(db.TriggerRuleRecord, rule_id)
     if record is None:
         raise HTTPException(404, "Trigger rule not found.")
+    _require_rule_access(actor, record)
     session.delete(record)
     return {"deleted": True}
 

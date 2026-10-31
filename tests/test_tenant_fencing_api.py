@@ -334,3 +334,40 @@ def test_chatops_token_without_tenant_still_actions(fencing_client, monkeypatch)
     token = chatops.generate_token(record_id, item["id"], "approve", environ=environ)
     response = client.post(f"/webhooks/actions/approve?token={token}")
     assert response.status_code == 200, response.text
+
+
+def test_trigger_rules_are_tenant_fenced(fencing_client):
+    client, set_actor = fencing_client
+    admin_tenant = lambda key: Actor(f"admin-{key}", ("automation.operator", "automation.admin"), source="bearer", tenant_key=key)
+    set_actor(admin_tenant("tenant-a"))
+    rule_payload = {
+        "name": "auto-escalate",
+        "tenant_key": "tenant-a",
+        "source": "webhook",
+        "event_type": "ticket.created",
+        "predicate": "event.priority == \"urgent\"",
+        "action_type": "start_workflow",
+        "request_type": "onboarding",
+        "static_inputs": {},
+        "enabled": True,
+    }
+    created = client.post("/trigger-rules", json=rule_payload)
+    assert created.status_code == 201, created.text
+    rule_id = created.json()["id"]
+    assert created.json()["tenant_key"] == "tenant-a"
+
+    # Cross-tenant actor cannot see, update or delete it
+    set_actor(admin_tenant("tenant-b"))
+    assert client.get("/trigger-rules").json() == []
+    assert client.put(f"/trigger-rules/{rule_id}", json=rule_payload).status_code == 404
+    assert client.delete(f"/trigger-rules/{rule_id}").status_code == 404
+
+    # Foreign tenant payload creation rejected
+    foreign = client.post("/trigger-rules", json={**rule_payload, "tenant_key": "tenant-a"})
+    assert foreign.status_code == 404, foreign.text
+
+    # Own tenant can see and delete it
+    set_actor(admin_tenant("tenant-a"))
+    rules = client.get("/trigger-rules").json()
+    assert len(rules) == 1 and rules[0]["id"] == rule_id
+    assert client.delete(f"/trigger-rules/{rule_id}").status_code == 200
