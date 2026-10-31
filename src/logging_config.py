@@ -52,7 +52,9 @@ def log_exception(
     Never raises: logging must not mask the original failure path.
     """
     try:
-        parts = [context, f"{type(error).__name__}: {error}"]
+        # Exception messages and tracebacks can contain credentials, request
+        # bodies, or provider responses. Keep only reviewed identifiers.
+        parts = [context]
         for name, value in (
             ("run_id", run_id),
             ("ticket_id", ticket_id),
@@ -61,9 +63,6 @@ def log_exception(
         ):
             if value is not None:
                 parts.append(f"{name}={value}")
-        for name, value in fields.items():
-            if value is not None:
-                parts.append(f"{name}={value}")
-        configure().error(" | ".join(str(part) for part in parts), exc_info=True)
+        configure().error(" | ".join(str(part) for part in parts))
     except Exception:  # pragma: no cover - logging must never fail a request
         pass
