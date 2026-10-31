@@ -44,3 +44,14 @@ def test_metrics_exposes_http_jobs_and_outbox(client):
     assert "flowops_notification_outbox" in body
     assert "flowops_uptime_seconds" in body
     assert 'route="/tickets"' in body
+
+
+def test_ready_returns_nonsensitive_503_when_database_connection_fails(client, monkeypatch):
+    def fail_connect():
+        raise RuntimeError("postgres://user:secret@db.internal/flowops")
+
+    monkeypatch.setattr(db.engine, "connect", fail_connect)
+    response = client.get("/ready")
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Database is not ready."}
+    assert "secret" not in response.text
