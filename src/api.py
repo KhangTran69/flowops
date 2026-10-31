@@ -380,6 +380,27 @@ def ready() -> dict:
     return {"status": "ready", "database": "ok"}
 
 
+@app.get("/_internal/database-identity", include_in_schema=False)
+def database_identity() -> dict[str, str]:
+    """Temporary, read-only identity probe for protected Vercel previews."""
+    if os.environ.get("VERCEL_ENV") != "preview":
+        raise HTTPException(status_code=404, detail="Not found.")
+    if db.engine.dialect.name != "postgresql":
+        raise HTTPException(status_code=404, detail="Not found.")
+
+    try:
+        with db.engine.connect() as connection:
+            database_name = connection.scalar(text("SELECT current_database()"))
+    except Exception as error:  # pragma: no cover - exercised by deployment
+        raise HTTPException(
+            status_code=503, detail="Database identity unavailable."
+        ) from error
+
+    if not database_name:
+        raise HTTPException(status_code=503, detail="Database identity unavailable.")
+    return {"environment": "preview", "database": str(database_name)}
+
+
 @app.get("/metrics", include_in_schema=False)
 def metrics_endpoint(session: Session = Depends(db.get_session)) -> Response:
     """Minimal Prometheus-style metrics for jobs, outbox, and HTTP requests."""
