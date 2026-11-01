@@ -370,4 +370,87 @@ def test_trigger_rules_are_tenant_fenced(fencing_client):
     set_actor(admin_tenant("tenant-a"))
     rules = client.get("/trigger-rules").json()
     assert len(rules) == 1 and rules[0]["id"] == rule_id
+    # Omitting the optional tenant in a full replacement must preserve the
+    # authenticated tenant instead of turning the rule into a global rule.
+    unscoped_update = {
+        key: value for key, value in rule_payload.items() if key != "tenant_key"
+    }
+    updated = client.put(f"/trigger-rules/{rule_id}", json=unscoped_update)
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["tenant_key"] == "tenant-a"
     assert client.delete(f"/trigger-rules/{rule_id}").status_code == 200
+
+
+def test_connectors_are_authenticated_tenant_scoped_and_stamp_webhook_events(
+    fencing_client,
+):
+    client, set_actor = fencing_client
+    admin = lambda key: Actor(
+        f"admin-{key}",
+        ("automation.operator", "automation.admin"),
+        source="bearer",
+        tenant_key=key,
+    )
+    set_actor(_tenant_actor("tenant-a"))
+    assert client.get("/connectors").status_code == 403
+
+    set_actor(admin("tenant-a"))
+    payload = {
+        "name": "Tenant A webhook",
+        "connector_type": "generic",
+        "config": {},
+        "tenant_key": "tenant-a",
+    }
+    created = client.post("/connectors", json=payload)
+    assert created.status_code == 201, created.text
+    connector_id = created.json()["id"]
+
+    delivered = client.post(
+        f"/connectors/{connector_id}/webhook",
+        json={"type": "alert", "id": "tenant-event", "tenant": "tenant-b"},
+    )
+    assert delivered.status_code == 201, delivered.text
+    session = db.SessionLocal()
+    try:
+        event = session.query(db.EventRecord).filter_by(external_id="tenant-event").one()
+        assert event.tenant_key == "tenant-a"
+    finally:
+        session.close()
+
+    set_actor(admin("tenant-b"))
+    assert client.get("/connectors").json() == []
+    assert client.put(f"/connectors/{connector_id}", json=payload).status_code == 404
+    assert client.delete(f"/connectors/{connector_id}").status_code == 404
+    cross_tenant = client.post("/connectors", json=payload)
+    assert cross_tenant.status_code == 404
+
+    set_actor(admin("tenant-a"))
+    unscoped_update = {key: value for key, value in payload.items() if key != "tenant_key"}
+    updated = client.put(f"/connectors/{connector_id}", json=unscoped_update)
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["tenant_key"] == "tenant-a"
+    assert client.delete(f"/connectors/{connector_id}").status_code == 200
+
+
+def test_tenant_connector_polling_passes_actor_scope(fencing_client, monkeypatch):
+    from src import connectors
+
+    client, set_actor = fencing_client
+    set_actor(
+        Actor(
+            "admin-tenant-a",
+            ("automation.operator", "automation.admin"),
+            source="bearer",
+            tenant_key="tenant-a",
+        )
+    )
+    tenants = []
+    monkeypatch.setattr(
+        connectors,
+        "poll_all_connectors",
+        lambda **kwargs: tenants.append(kwargs.get("tenant_key")) or 2,
+    )
+    response = client.post("/connectors/poll")
+    assert response.status_code == 200
+    assert response.json() == {"ingested": 2}
+    assert tenants == ["tenant-a"]

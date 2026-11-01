@@ -33,6 +33,8 @@ is false; development keeps its current, global behavior.
 | `GET/POST /onboarding-requests/{id}`(+`/status`) | Bare-id fetch, no tenant check. | List is scoped; detail/status return 404 outside the actor's tenant; creation stamps/enforces the actor tenant before the idempotency reservation. |
 | PSA sync (`POST /tickets/{id}/psa-sync`) | Any operator could sync any tenant's ticket into that ticket's PSA tenant. | Tenant mismatch returns 404 (`src/routes/tenants.py`). |
 | ChatOps approve/reject links | Signed single-use tokens bound only request/item ids, not the tenant. | Tokens now embed `tenant_key`; verification rejects a token whose tenant does not match the request's row with 404 while legacy tenant-less tokens keep working (`src/chatops.py`, `src/api.py`, UI minting passes the record tenant). |
+| Connector administration (`/connectors`) | Connector listing was unauthenticated; tenant admins could inspect or mutate another tenant's connector, and a webhook payload could claim another tenant. | Listing now requires admin access and scopes by actor tenant; create/update stamp the actor tenant, mutations 404 on cross-tenant IDs, polling is tenant-scoped, and webhook events inherit the connector tenant (`src/routes/connectors.py`, `src/connectors.py`). |
+| Trigger-rule updates (`/trigger-rules`) | A tenant admin could omit the optional tenant on PUT and promote a rule to global scope. | Updates now preserve the authenticated tenant; the regression test proves the tenant field cannot be cleared. |
 
 New regression tests: `tests/test_tenant_fencing_api.py`
 (tenant visibility, stamping, 404-on-mismatch, legacy tokens) and
@@ -49,10 +51,11 @@ retry budget after recovery).
 2. `notification_outbox`, execution logs, and the analytics/report views are
    operator-plane surfaces; their tenant filter is caller-supplied and
    presentational.
-3. Triggers (`src/routes/triggers.py`) and connectors
-   (`src/routes/connectors.py`) CRUD fetches are actor-only; rule *matching*
-   honors tenant but record reads do not. Records carry `tenant_key`, so the
-   same 404 pattern applies.
+3. Legacy scheduled/webhook triggers (`src/routes/triggers.py`) still use
+   global event-source and trigger records without `tenant_key`. Their CRUD,
+   delivery payloads, operator pages, and metrics need a separate migration
+   and tenant-scope review. The connector and newer trigger-rule APIs are now
+   fenced as described above.
 4. MCP tools (`src/mcp_server.py`) still trust caller-supplied tenant args.
 5. When `FLOWOPS_AUTH_REQUIRED=false` the local actor intentionally stays
    global — that keeps local development and the portfolio demo unchanged.
