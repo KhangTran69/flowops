@@ -822,9 +822,15 @@ def connector_due(record: "db.ConnectorRecord", now: datetime) -> bool:
     return (now - last).total_seconds() >= interval
 
 
-def poll_all_connectors(now: Optional[datetime] = None, *, only_due: bool = True) -> int:
+def poll_all_connectors(
+    now: Optional[datetime] = None,
+    *,
+    only_due: bool = True,
+    tenant_key: str | None = None,
+) -> int:
     """Poll due connectors once. Returns events ingested.
 
+    When supplied, ``tenant_key`` restricts polling to that tenant's connectors.
     Each connector runs in its own session/transaction so one failing source
     (bad credentials, network outage) never blocks the others; failures are
     recorded in the execution log for the operator console and push the
@@ -835,12 +841,13 @@ def poll_all_connectors(now: Optional[datetime] = None, *, only_due: bool = True
     session = db.SessionLocal()
     try:
         db._ensure_tables()
-        records = session.execute(
-            select(db.ConnectorRecord).where(
-                db.ConnectorRecord.enabled.is_(True),
-                db.ConnectorRecord.kind == "polling",
-            )
-        ).scalars().all()
+        query = select(db.ConnectorRecord).where(
+            db.ConnectorRecord.enabled.is_(True),
+            db.ConnectorRecord.kind == "polling",
+        )
+        if tenant_key is not None:
+            query = query.where(db.ConnectorRecord.tenant_key == tenant_key)
+        records = session.execute(query).scalars().all()
         if only_due:
             records = [record for record in records if connector_due(record, at)]
     finally:
@@ -859,6 +866,19 @@ def poll_all_connectors(now: Optional[datetime] = None, *, only_due: bool = True
                 record.connector_type, json.loads(record.config_json or "{}")
             )
             events = connector.fetch_events(session)
+            if record.tenant_key:
+                events = [
+                    NormalizedEvent(
+                        source=event.source,
+                        event_type=event.event_type,
+                        external_id=event.external_id,
+                        payload=event.payload,
+                        tenant_key=record.tenant_key,
+                        title=event.title,
+                        description=event.description,
+                    )
+                    for event in events
+                ]
             summaries = ingest_events(session, events)
             ingested = sum(
                 1 for s in summaries if not s["duplicate"] and "error" not in s

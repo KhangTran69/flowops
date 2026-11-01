@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from src import connectors as connector_lib
 from src import db
 from src.auth import Actor
-from src.deps import _admin_actor, _operator_actor, _webhook_actor
+from src.deps import _admin_actor, _webhook_actor
 
 router = APIRouter(tags=["connectors"])
 
@@ -123,10 +123,15 @@ def _rule_out(record: db.TriggerRuleRecord) -> TriggerRuleOut:
 
 
 @router.get("/connectors", response_model=list[ConnectorOut])
-def list_connectors(session: Session = Depends(db.get_session)) -> list[ConnectorOut]:
-    records = session.execute(
-        select(db.ConnectorRecord).order_by(db.ConnectorRecord.id)
-    ).scalars()
+def list_connectors(
+    actor: Actor = Depends(_admin_actor),
+    session: Session = Depends(db.get_session),
+) -> list[ConnectorOut]:
+    tenant = _actor_tenant(actor)
+    query = select(db.ConnectorRecord).order_by(db.ConnectorRecord.id)
+    if tenant:
+        query = query.where(db.ConnectorRecord.tenant_key == tenant)
+    records = session.execute(query).scalars()
     return [_connector_out(r) for r in records]
 
 
@@ -138,6 +143,12 @@ def create_connector(
     actor: Actor = Depends(_admin_actor),
     session: Session = Depends(db.get_session),
 ) -> ConnectorOut:
+    actor_tenant = _actor_tenant(actor)
+    if actor_tenant:
+        if payload.tenant_key and payload.tenant_key != actor_tenant:
+            raise HTTPException(404, detail="Tenant mismatch.")
+        payload.tenant_key = actor_tenant
+    _require_active_tenant(session, payload.tenant_key)
     cls = connector_lib.CONNECTOR_REGISTRY.get(payload.connector_type)
     if cls is None:
         raise HTTPException(422, f"Unknown connector type: {payload.connector_type!r}")
@@ -179,6 +190,13 @@ def update_connector(
     record = session.get(db.ConnectorRecord, connector_id)
     if record is None:
         raise HTTPException(404, "Connector not found.")
+    _require_connector_access(actor, record)
+    actor_tenant = _actor_tenant(actor)
+    if actor_tenant:
+        if payload.tenant_key and payload.tenant_key != actor_tenant:
+            raise HTTPException(404, detail="Tenant mismatch.")
+        payload.tenant_key = actor_tenant
+    _require_active_tenant(session, payload.tenant_key)
     cls = connector_lib.CONNECTOR_REGISTRY.get(payload.connector_type)
     if cls is None:
         raise HTTPException(422, f"Unknown connector type: {payload.connector_type!r}")
@@ -201,6 +219,7 @@ def delete_connector(
     record = session.get(db.ConnectorRecord, connector_id)
     if record is None:
         raise HTTPException(404, "Connector not found.")
+    _require_connector_access(actor, record)
     session.delete(record)
     return {"deleted": True}
 
@@ -210,7 +229,7 @@ def poll_now(
     actor: Actor = Depends(_admin_actor),
 ) -> dict[str, int]:
     """Poll every enabled polling connector once, inline."""
-    return {"ingested": connector_lib.poll_all_connectors()}
+    return {"ingested": connector_lib.poll_all_connectors(tenant_key=_actor_tenant(actor))}
 
 
 @router.post("/connectors/{connector_id}/webhook", status_code=201)
@@ -255,6 +274,19 @@ async def connector_webhook(
         raise HTTPException(400, "Request body is not valid JSON.")
 
     events = connector.parse_webhook(payload)
+    if record.tenant_key:
+        events = [
+            connector_lib.NormalizedEvent(
+                source=event.source,
+                event_type=event.event_type,
+                external_id=event.external_id,
+                payload=event.payload,
+                tenant_key=record.tenant_key,
+                title=event.title,
+                description=event.description,
+            )
+            for event in events
+        ]
     results = connector_lib.ingest_events(session, events)
     return {"received": len(results), "results": results}
 
@@ -272,6 +304,20 @@ def _require_rule_access(actor: Actor, record: db.TriggerRuleRecord) -> None:
     tenant = _actor_tenant(actor)
     if tenant and record.tenant_key != tenant:
         raise HTTPException(status_code=404, detail="Trigger rule not found.")
+
+
+def _require_connector_access(actor: Actor, record: db.ConnectorRecord) -> None:
+    tenant = _actor_tenant(actor)
+    if tenant and record.tenant_key != tenant:
+        raise HTTPException(status_code=404, detail="Connector not found.")
+
+
+def _require_active_tenant(session: Session, tenant_key: str | None) -> None:
+    if tenant_key is None:
+        return
+    tenant = session.get(db.TenantRecord, tenant_key)
+    if tenant is None or not tenant.active:
+        raise HTTPException(422, f"Unknown or inactive tenant: {tenant_key}")
 
 
 @router.get("/trigger-rules", response_model=list[TriggerRuleOut])
@@ -355,8 +401,13 @@ def update_trigger_rule(
         raise HTTPException(404, "Trigger rule not found.")
     _require_rule_access(actor, record)
     actor_tenant = _actor_tenant(actor)
-    if actor_tenant and payload.tenant_key and payload.tenant_key != actor_tenant:
-        raise HTTPException(404, detail="Tenant mismatch.")
+    if actor_tenant:
+        if payload.tenant_key and payload.tenant_key != actor_tenant:
+            raise HTTPException(404, detail="Tenant mismatch.")
+        # PUT is a full replacement, but callers may omit this optional field.
+        # Keep the rule scoped to the authenticated tenant so it cannot become
+        # a global rule after a tenant-scoped update.
+        payload.tenant_key = actor_tenant
     connector_lib.validate_rule_shape(
         payload.predicate,
         payload.action_type,
