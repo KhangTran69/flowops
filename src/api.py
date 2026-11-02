@@ -325,7 +325,6 @@ def _process_intake(
     request: TicketIntakeRequest,
     session: Session,
     actor_subject: Optional[str] = None,
-    actor: Optional[Actor] = None,
 ) -> Ticket:
     """Normalize, route, persist, and log one incoming ticket."""
     run_id = _new_run_id()
@@ -338,6 +337,7 @@ def _process_intake(
     ticket["queue"] = decision.queue
 
     record = session.get(db.TicketRecord, ticket["ticket_id"])
+    actor = session.info.get("flowops_ticket_actor")
     if record is not None and actor is not None:
         # Recheck after lookup so a concurrent insert cannot bypass the route's
         # earlier ownership check and turn this upsert into a cross-tenant write.
@@ -533,6 +533,25 @@ def _scope_ticket_or_request_keyed_query(query, key_column, actor: Actor):
     return query.where(key_column.in_(ticket_ids) | key_column.in_(request_ids))
 
 
+def _scope_execution_log_query(query, actor: Actor):
+    """Scope linked logs by tenant and retain only the actor's unlinked audit events."""
+    tenant_key = _actor_tenant(actor)
+    if tenant_key is None:
+        return query
+    linked_scope = _scope_ticket_or_request_keyed_query(
+        select(db.ExecutionLogRecord.id), db.ExecutionLogRecord.ticket_id, actor
+    ).subquery()
+    return query.where(
+        or_(
+            db.ExecutionLogRecord.id.in_(select(linked_scope.c.id)),
+            and_(
+                db.ExecutionLogRecord.ticket_id.is_(None),
+                db.ExecutionLogRecord.actor_subject == actor.subject,
+            ),
+        )
+    )
+
+
 def _require_request_access(actor: Actor, record: db.OnboardingRequestRecord) -> None:
     tenant_key = _actor_tenant(actor)
     if tenant_key and record.tenant_key != tenant_key:
@@ -600,7 +619,11 @@ def create_ticket(
     try:
         if existing is not None:
             response.status_code = http_status.HTTP_200_OK
-        result = _process_intake(request, session, actor.subject, actor=actor)
+        session.info["flowops_ticket_actor"] = actor
+        try:
+            result = _process_intake(request, session, actor.subject)
+        finally:
+            session.info.pop("flowops_ticket_actor", None)
         if idempotency_key and owner_token is not None:
             if not _complete_idempotency_key(
                 session,
@@ -2675,8 +2698,8 @@ def list_execution_logs(
     offset: int = Query(default=0, ge=0),
 ) -> list[ExecutionLogOut]:
     """Recent workflow execution log entries, newest first."""
-    statement = _scope_ticket_or_request_keyed_query(
-        select(db.ExecutionLogRecord), db.ExecutionLogRecord.ticket_id, actor
+    statement = _scope_execution_log_query(
+        select(db.ExecutionLogRecord), actor
     ).order_by(db.ExecutionLogRecord.id.desc())
     if status_filter in ("success", "failure"):
         statement = statement.where(db.ExecutionLogRecord.status == status_filter)
@@ -2684,7 +2707,7 @@ def list_execution_logs(
         statement = statement.where(
             db.ExecutionLogRecord.actor_subject == actor_filter
         )
-    records = session.execute(statement).scalars().all()
+    records = session.execute(statement.offset(offset).limit(limit)).scalars().all()
     return [
         ExecutionLogOut(
             **{c: getattr(record, c) for c in (
@@ -2706,11 +2729,10 @@ def list_audit_trail(
     offset: int = Query(default=0, ge=0),
 ) -> list[ExecutionLogOut]:
     """Recent execution rows that carry an authenticated actor."""
-    query = _scope_ticket_or_request_keyed_query(
+    query = _scope_execution_log_query(
         select(db.ExecutionLogRecord).where(
             db.ExecutionLogRecord.actor_subject.is_not(None)
         ),
-        db.ExecutionLogRecord.ticket_id,
         actor,
     )
     if status_filter in ("success", "failure"):

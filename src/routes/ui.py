@@ -28,6 +28,7 @@ from src.api import (
     _require_request_access,
     _require_ticket_access,
     _require_workflow_job_access,
+    _scope_execution_log_query,
     _scope_ticket_or_request_keyed_query,
     _ticket_history,
     _triage_out,
@@ -545,11 +546,10 @@ def ui_audit(
     page: int = Query(default=1, ge=1),
 ) -> HTMLResponse:
     """Operator audit page for actor-attributed execution rows."""
-    query = _scope_ticket_or_request_keyed_query(
+    query = _scope_execution_log_query(
         select(db.ExecutionLogRecord).where(
             db.ExecutionLogRecord.actor_subject.is_not(None)
         ),
-        db.ExecutionLogRecord.ticket_id,
         actor,
     )
     if status_filter in ("success", "failure"):
@@ -639,8 +639,8 @@ def dashboard(
             db.OnboardingRequestRecord.tenant_key == tenant_key
         )
     tickets = session.execute(ticket_query).scalars().all()
-    log_query = _scope_ticket_or_request_keyed_query(
-        select(db.ExecutionLogRecord), db.ExecutionLogRecord.ticket_id, actor
+    log_query = _scope_execution_log_query(
+        select(db.ExecutionLogRecord), actor
     ).order_by(db.ExecutionLogRecord.id.desc()).limit(200)
     if status_filter in ("success", "failure"):
         log_query = log_query.where(db.ExecutionLogRecord.status == status_filter)
