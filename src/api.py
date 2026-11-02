@@ -51,7 +51,10 @@ from src.deps import (
     _operator_actor,
     _admin_actor,
     _webhook_actor,
+    _actor_tenant as actor_tenant,
+    _global_admin_actor,
     _new_run_id,
+    validate_webhook_configuration,
     _RATE_LIMIT_BUCKETS,  # noqa: F401  (re-exported for tests)
 )
 from src.schemas import (
@@ -150,6 +153,7 @@ async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
     """Validate security configuration when the application starts."""
     validate_auth_configuration()
     ui_session.validate_ui_auth_configuration()
+    validate_webhook_configuration()
     yield
 
 app = FastAPI(
@@ -222,7 +226,7 @@ async def correlation_and_metrics(request: Request, call_next):
         ui_session.actor_from_session(session) if session else _local_ui_actor()
     )
     request.state.csrf_token = session.csrf_token if session else ""
-    protected_ui_path = request.url.path == "/dashboard" or request.url.path.startswith(
+    protected_ui_path = request.url.path in {"/", "/dashboard"} or request.url.path.startswith(
         "/ui/"
     )
     if ui_session.ui_auth_required() and protected_ui_path and session is None:
@@ -333,6 +337,11 @@ def _process_intake(
     ticket["queue"] = decision.queue
 
     record = session.get(db.TicketRecord, ticket["ticket_id"])
+    actor = session.info.get("flowops_ticket_actor")
+    if record is not None and actor is not None:
+        # Recheck after lookup so a concurrent insert cannot bypass the route's
+        # earlier ownership check and turn this upsert into a cross-tenant write.
+        _require_ticket_access(actor, record)
     created = record is None
     if created:
         session.add(db.TicketRecord(**ticket, tenant_key=request.tenant))
@@ -487,8 +496,8 @@ def metrics_endpoint(session: Session = Depends(db.get_session)) -> Response:
 
 
 def _actor_tenant(actor: Actor) -> Optional[str]:
-    """Tenant key enforced for tenant-bearing actors; local actors stay global."""
-    return None if actor.source == "local" else actor.tenant_key
+    """Compatibility wrapper for the shared actor-to-tenant policy."""
+    return actor_tenant(actor)
 
 
 def _require_ticket_access(actor: Actor, record: db.TicketRecord) -> None:
@@ -496,6 +505,51 @@ def _require_ticket_access(actor: Actor, record: db.TicketRecord) -> None:
     tenant_key = _actor_tenant(actor)
     if tenant_key and record.tenant_key != tenant_key:
         raise HTTPException(status_code=404, detail="Ticket not found.")
+
+
+def _scope_ticket_or_request_keyed_query(query, key_column, actor: Actor):
+    """Limit rows keyed by a ticket or onboarding request to the actor's tenant."""
+    tenant_key = _actor_tenant(actor)
+    if tenant_key is None:
+        return query
+    foreign_request_ids = select(cast(db.OnboardingRequestRecord.id, String)).where(
+        or_(
+            db.OnboardingRequestRecord.tenant_key != tenant_key,
+            db.OnboardingRequestRecord.tenant_key.is_(None),
+        )
+    )
+    foreign_ticket_ids = select(db.TicketRecord.ticket_id).where(
+        or_(
+            db.TicketRecord.tenant_key != tenant_key,
+            db.TicketRecord.tenant_key.is_(None),
+        )
+    )
+    ticket_ids = select(db.TicketRecord.ticket_id).where(
+        db.TicketRecord.tenant_key == tenant_key
+    ).where(db.TicketRecord.ticket_id.not_in(foreign_request_ids))
+    request_ids = select(cast(db.OnboardingRequestRecord.id, String)).where(
+        db.OnboardingRequestRecord.tenant_key == tenant_key
+    ).where(cast(db.OnboardingRequestRecord.id, String).not_in(foreign_ticket_ids))
+    return query.where(key_column.in_(ticket_ids) | key_column.in_(request_ids))
+
+
+def _scope_execution_log_query(query, actor: Actor):
+    """Scope linked logs by tenant and retain only the actor's unlinked audit events."""
+    tenant_key = _actor_tenant(actor)
+    if tenant_key is None:
+        return query
+    linked_scope = _scope_ticket_or_request_keyed_query(
+        select(db.ExecutionLogRecord.id), db.ExecutionLogRecord.ticket_id, actor
+    ).subquery()
+    return query.where(
+        or_(
+            db.ExecutionLogRecord.id.in_(select(linked_scope.c.id)),
+            and_(
+                db.ExecutionLogRecord.ticket_id.is_(None),
+                db.ExecutionLogRecord.actor_subject == actor.subject,
+            ),
+        )
+    )
 
 
 def _require_request_access(actor: Actor, record: db.OnboardingRequestRecord) -> None:
@@ -540,11 +594,14 @@ def create_ticket(
     200 with an Idempotency-Replayed header when the same Idempotency-Key
     is replayed (without re-executing the request).
     """
-    tenant_key = getattr(actor, "tenant_key", None)
+    tenant_key = _actor_tenant(actor)
     if tenant_key:
         if request.tenant and request.tenant != tenant_key:
             raise HTTPException(status_code=404, detail="Ticket not found.")
         request.tenant = tenant_key
+    existing = session.get(db.TicketRecord, str(request.id))
+    if existing is not None:
+        _require_ticket_access(actor, existing)
     _validate_idempotency_key(idempotency_key)
     request_hash = _request_fingerprint(request)
     owner_token, replay = _reserve_idempotency_key(
@@ -560,9 +617,13 @@ def create_ticket(
 
     ownership_lost = False
     try:
-        if session.get(db.TicketRecord, str(request.id)) is not None:
+        if existing is not None:
             response.status_code = http_status.HTTP_200_OK
-        result = _process_intake(request, session, actor.subject)
+        session.info["flowops_ticket_actor"] = actor
+        try:
+            result = _process_intake(request, session, actor.subject)
+        finally:
+            session.info.pop("flowops_ticket_actor", None)
         if idempotency_key and owner_token is not None:
             if not _complete_idempotency_key(
                 session,
@@ -716,6 +777,7 @@ def triage_ticket(
 ) -> AITriageOut:
     """Run AI triage and return suggestions without changing ticket state."""
     record = _load_ticket(session, ticket_id)
+    _require_ticket_access(actor, record)
     history = _ticket_history(session, ticket_id)
     started = time.perf_counter()
     result = _analyze_ticket(
@@ -770,6 +832,7 @@ def apply_ai_recommendations(
     submitted. Informational suggestions and status changes are never applied.
     """
     record = _load_ticket(session, ticket_id)
+    _require_ticket_access(actor, record)
     history = _ticket_history(session, ticket_id)
     started = time.perf_counter()
     result = _analyze_ticket(
@@ -844,15 +907,18 @@ def get_knowledge_base(
 @app.get("/tickets", response_model=list[Ticket])
 def list_tickets(
     session: Session = Depends(db.get_session),
-    actor: Actor = Depends(_actor_from_header),
+    actor: Actor = Depends(_operator_actor),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     tenant: Optional[str] = Query(default=None, max_length=64),
 ) -> list[Ticket]:
     """List stored tickets with bounded database pagination."""
     query = select(db.TicketRecord).order_by(cast(db.TicketRecord.ticket_id, Integer))
-    if actor.tenant_key:
-        query = query.where(db.TicketRecord.tenant_key == actor.tenant_key)
+    actor_tenant = _actor_tenant(actor)
+    if actor_tenant is not None:
+        if tenant is not None and tenant != actor_tenant:
+            raise HTTPException(status_code=404, detail="Tenant not found.")
+        query = query.where(db.TicketRecord.tenant_key == actor_tenant)
     elif tenant is not None:
         query = query.where(db.TicketRecord.tenant_key == tenant)
     records = session.execute(query.offset(offset).limit(limit)).scalars().all()
@@ -863,7 +929,7 @@ def list_tickets(
 def get_ticket(
     ticket_id: str,
     session: Session = Depends(db.get_session),
-    actor: Actor = Depends(_actor_from_header),
+    actor: Actor = Depends(_operator_actor),
 ) -> Ticket:
     """Return one stored ticket."""
     if not ticket_id.isdigit():
@@ -1108,7 +1174,7 @@ def _definition_out(
 @app.post("/workflow-definitions", response_model=WorkflowDefinitionOut)
 def create_workflow_definition(
     payload: DefinitionCreateIn,
-    actor: Actor = Depends(_operator_actor),
+    actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
 ) -> WorkflowDefinitionOut:
     try:
@@ -1130,7 +1196,7 @@ def create_workflow_definition(
 def create_workflow_definition_version(
     key: str,
     payload: DefinitionVersionIn,
-    actor: Actor = Depends(_operator_actor),
+    actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
 ) -> WorkflowDefinitionOut:
     try:
@@ -1148,7 +1214,7 @@ def create_workflow_definition_version(
 def publish_workflow_definition(
     key: str,
     payload: DefinitionPublishIn,
-    actor: Actor = Depends(_operator_actor),
+    actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
 ) -> WorkflowDefinitionOut:
     try:
@@ -1170,6 +1236,7 @@ def migrate_definition(
 ) -> dict[str, Any]:
     """Preview or apply a safe move to another definition version."""
     record, items = _load_request(session, request_id)
+    _require_request_access(actor, record)
     if not record.definition_key:
         raise HTTPException(409, "Request is not pinned to a definition.")
     definition = definitions.get_definition(session, record.definition_key)
@@ -1257,6 +1324,7 @@ def migrate_definition(
 
 @app.get("/workflow-definitions", response_model=list[WorkflowDefinitionOut])
 def list_workflow_definitions(
+    actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
 ) -> list[WorkflowDefinitionOut]:
     return [
@@ -1267,7 +1335,9 @@ def list_workflow_definitions(
 
 @app.get("/workflow-definitions/{key}", response_model=WorkflowDefinitionOut)
 def get_workflow_definition(
-    key: str, session: Session = Depends(db.get_session)
+    key: str,
+    actor: Actor = Depends(_global_admin_actor),
+    session: Session = Depends(db.get_session),
 ) -> WorkflowDefinitionOut:
     definition = definitions.get_definition(session, key)
     if definition is None:
@@ -1421,12 +1491,13 @@ def create_onboarding_request(
 @app.get("/onboarding-requests", response_model=list[OnboardingRequestOut])
 def list_onboarding_requests(
     session: Session = Depends(db.get_session),
-    actor: Actor = Depends(_actor_from_header),
+    actor: Actor = Depends(_operator_actor),
 ) -> list[OnboardingRequestOut]:
     """List onboarding/offboarding requests with their checklists."""
     query = select(db.OnboardingRequestRecord)
-    if actor.tenant_key:
-        query = query.where(db.OnboardingRequestRecord.tenant_key == actor.tenant_key)
+    tenant_key = _actor_tenant(actor)
+    if tenant_key is not None:
+        query = query.where(db.OnboardingRequestRecord.tenant_key == tenant_key)
     records = session.execute(query).scalars().all()
     results = []
     for record in records:
@@ -1439,7 +1510,7 @@ def list_onboarding_requests(
 def get_onboarding_request(
     request_id: int,
     session: Session = Depends(db.get_session),
-    actor: Actor = Depends(_actor_from_header),
+    actor: Actor = Depends(_operator_actor),
 ) -> OnboardingRequestOut:
     record, items = _load_request(session, request_id)
     _require_request_access(actor, record)
@@ -1453,7 +1524,7 @@ def get_onboarding_request(
 def get_onboarding_request_status(
     request_id: int,
     session: Session = Depends(db.get_session),
-    actor: Actor = Depends(_actor_from_header),
+    actor: Actor = Depends(_operator_actor),
 ) -> OnboardingStatusSummaryOut:
     """Return a lightweight summary of request progress for automation polling."""
     record, items = _load_request(session, request_id)
@@ -1533,7 +1604,8 @@ def start_workflow_run(
     session: Session = Depends(db.get_session),
 ) -> WorkflowRunOut:
     """Start the DAG orchestrator for a request (idempotent per request)."""
-    _load_request(session, request_id)
+    record, _ = _load_request(session, request_id)
+    _require_request_access(actor, record)
     try:
         run = scheduler.start_run(session, request_id, actor_subject=actor.subject)
     except LookupError as error:
@@ -1726,6 +1798,7 @@ def _execute_item(
 ) -> OnboardingRequestOut:
     """Run one approved checklist action with bounded retries."""
     record, items = _load_request(session, request_id)
+    _require_request_access(actor, record)
     item = _get_item(session, record, item_id)
     missing = workflow.missing_prerequisites(item, items)
     if missing:
@@ -1859,10 +1932,13 @@ def execute_item(
 
 @app.get("/onboarding-requests/{request_id}/action-executions", response_model=list[ActionExecutionOut])
 def list_action_executions(
-    request_id: int, session: Session = Depends(db.get_session)
+    request_id: int,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
 ) -> list[ActionExecutionOut]:
     """List durable action attempts for one onboarding request."""
-    _load_request(session, request_id)
+    record, _ = _load_request(session, request_id)
+    _require_request_access(actor, record)
     records = session.execute(
         select(db.ActionExecutionRecord)
         .where(db.ActionExecutionRecord.request_id == request_id)
@@ -1880,6 +1956,8 @@ def approve_item(
     session: Session = Depends(db.get_session),
 ) -> OnboardingRequestOut:
     """Approve a checklist step that requires human sign-off."""
+    record, _ = _load_request(session, request_id)
+    _require_request_access(actor, record)
     return _transition_item(
         session, request_id, item_id, request, "approve", actor.subject
     )
@@ -1904,6 +1982,7 @@ def complete_item(
     flows are not unified yet).
     """
     record, _ = _load_request(session, request_id)
+    _require_request_access(actor, record)
     if record.request_type == "offboarding":
         raise HTTPException(
             409,
@@ -1961,6 +2040,7 @@ def complete_offboarding_step(
     record = session.get(db.OnboardingRequestRecord, checklist_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Offboarding checklist not found.")
+    _require_request_access(actor, record)
     items = session.execute(
         select(db.ChecklistItemRecord).where(
             db.ChecklistItemRecord.request_id == checklist_id
@@ -2217,7 +2297,10 @@ def complete_offboarding_step(
 
 
 @app.get("/onboarding-requests/m365-status/{user_id}", response_model=M365StatusOut)
-def get_m365_status(user_id: str) -> M365StatusOut:
+def get_m365_status(
+    user_id: str,
+    actor: Actor = Depends(_global_admin_actor),
+) -> M365StatusOut:
     """Look up a *simulated* M365 provisioning status by user id.
 
     This never contacts real Microsoft services; see src/m365_simulator.py.
@@ -2243,6 +2326,7 @@ def enqueue_onboarding_item_job(
 ) -> WorkflowJobOut:
     """Queue one onboarding checklist action for a durable worker."""
     record, items = _load_request(session, request_id)
+    _require_request_access(actor, record)
     item = _get_item(session, record, item_id)
     if item.status == "completed":
         raise HTTPException(409, "Checklist item is already completed.")
@@ -2417,14 +2501,21 @@ def _outbox_out(record: db.NotificationOutboxRecord) -> NotificationOutboxOut:
 
 @app.get("/notifications/pending", response_model=list[NotificationOutboxOut])
 def list_pending_notifications(
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> list[NotificationOutboxOut]:
     """List webhook deliveries that await a manual retry."""
+    query = _scope_ticket_or_request_keyed_query(
+        select(db.NotificationOutboxRecord).where(
+            db.NotificationOutboxRecord.status == "pending"
+        ),
+        db.NotificationOutboxRecord.ticket_id,
+        actor,
+    )
     records = session.execute(
-        select(db.NotificationOutboxRecord)
-        .where(db.NotificationOutboxRecord.status == "pending")
+        query
         .order_by(db.NotificationOutboxRecord.id)
         .offset(offset)
         .limit(limit)
@@ -2434,6 +2525,7 @@ def list_pending_notifications(
 
 @app.get("/notifications/failed", response_model=list[NotificationOutboxOut])
 def list_failed_notifications(
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
@@ -2443,9 +2535,15 @@ def list_failed_notifications(
     Operators can inspect these rows and return one to the pending queue with
     ``POST /notifications/{notification_id}/requeue``.
     """
+    query = _scope_ticket_or_request_keyed_query(
+        select(db.NotificationOutboxRecord).where(
+            db.NotificationOutboxRecord.status == "failed"
+        ),
+        db.NotificationOutboxRecord.ticket_id,
+        actor,
+    )
     records = session.execute(
-        select(db.NotificationOutboxRecord)
-        .where(db.NotificationOutboxRecord.status == "failed")
+        query
         .order_by(db.NotificationOutboxRecord.id)
         .offset(offset)
         .limit(limit)
@@ -2467,9 +2565,15 @@ def retry_failed_notifications(
     ``failed`` (dead-lettered). Every outcome is written to the execution log.
     """
     max_attempts = _notification_max_attempts()
+    query = _scope_ticket_or_request_keyed_query(
+        select(db.NotificationOutboxRecord).where(
+            db.NotificationOutboxRecord.status == "pending"
+        ),
+        db.NotificationOutboxRecord.ticket_id,
+        actor,
+    )
     records = session.execute(
-        select(db.NotificationOutboxRecord)
-        .where(db.NotificationOutboxRecord.status == "pending")
+        query
         .order_by(db.NotificationOutboxRecord.id)
         .limit(limit)
     ).scalars().all()
@@ -2530,7 +2634,15 @@ def requeue_failed_notification(
     operators cannot requeue the same delivery twice. Attempt history and the
     last error are preserved; each requeue grants one more delivery attempt.
     """
-    record = session.get(db.NotificationOutboxRecord, notification_id)
+    record = session.execute(
+        _scope_ticket_or_request_keyed_query(
+            select(db.NotificationOutboxRecord).where(
+                db.NotificationOutboxRecord.id == notification_id
+            ),
+            db.NotificationOutboxRecord.ticket_id,
+            actor,
+        )
+    ).scalar_one_or_none()
     if record is None:
         raise HTTPException(status_code=404, detail="Notification delivery not found.")
     if record.status != "failed":
@@ -2578,6 +2690,7 @@ def requeue_failed_notification(
 
 @app.get("/execution-logs", response_model=list[ExecutionLogOut])
 def list_execution_logs(
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
     status_filter: Optional[str] = Query(default=None, alias="status"),
     actor_filter: Optional[str] = Query(default=None, alias="actor"),
@@ -2585,16 +2698,16 @@ def list_execution_logs(
     offset: int = Query(default=0, ge=0),
 ) -> list[ExecutionLogOut]:
     """Recent workflow execution log entries, newest first."""
-    statement = select(db.ExecutionLogRecord).order_by(
-        db.ExecutionLogRecord.id.desc()
-    ).offset(offset).limit(limit)
+    statement = _scope_execution_log_query(
+        select(db.ExecutionLogRecord), actor
+    ).order_by(db.ExecutionLogRecord.id.desc())
     if status_filter in ("success", "failure"):
         statement = statement.where(db.ExecutionLogRecord.status == status_filter)
     if actor_filter:
         statement = statement.where(
             db.ExecutionLogRecord.actor_subject == actor_filter
         )
-    records = session.execute(statement).scalars().all()
+    records = session.execute(statement.offset(offset).limit(limit)).scalars().all()
     return [
         ExecutionLogOut(
             **{c: getattr(record, c) for c in (
@@ -2608,6 +2721,7 @@ def list_execution_logs(
 
 @app.get("/audit", response_model=list[ExecutionLogOut])
 def list_audit_trail(
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
     status_filter: Optional[str] = Query(default=None, alias="status"),
     actor_filter: Optional[str] = Query(default=None, alias="actor"),
@@ -2615,8 +2729,11 @@ def list_audit_trail(
     offset: int = Query(default=0, ge=0),
 ) -> list[ExecutionLogOut]:
     """Recent execution rows that carry an authenticated actor."""
-    query = select(db.ExecutionLogRecord).where(
-        db.ExecutionLogRecord.actor_subject.is_not(None)
+    query = _scope_execution_log_query(
+        select(db.ExecutionLogRecord).where(
+            db.ExecutionLogRecord.actor_subject.is_not(None)
+        ),
+        actor,
     )
     if status_filter in ("success", "failure"):
         query = query.where(db.ExecutionLogRecord.status == status_filter)

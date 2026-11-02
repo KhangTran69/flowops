@@ -8,7 +8,7 @@ from typing import Optional
 
 from fastapi import Depends, Form, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
-from sqlalchemy import func, select
+from sqlalchemy import String, cast, func, select
 from sqlalchemy.orm import Session
 
 from src import ai_agent, chatops, db, definitions, jobs, scheduler, ui_session, web, workflow
@@ -16,7 +16,8 @@ from src import ai_agent, chatops, db, definitions, jobs, scheduler, ui_session,
 from fastapi import APIRouter
 
 from src import metrics as _metrics
-from src.deps import _new_run_id
+from src.auth import Actor
+from src.deps import _actor_tenant, _global_admin_actor, _new_run_id, _operator_actor
 from src.api import (
     AITriageOut,
     Ticket,
@@ -24,6 +25,11 @@ from src.api import (
     _definition_out,
     _load_request,
     _load_ticket,
+    _require_request_access,
+    _require_ticket_access,
+    _require_workflow_job_access,
+    _scope_execution_log_query,
+    _scope_ticket_or_request_keyed_query,
     _ticket_history,
     _triage_out,
     _workflow_run_out,
@@ -32,10 +38,10 @@ from src.api import (
 router = APIRouter()
 
 
-def _site_stats(session: Session) -> dict[str, int]:
+def _site_stats(session: Session, actor: Actor) -> dict[str, int]:
     """Small aggregate snapshot used by the landing page."""
-    ticket_count, open_tickets, auto_routed = session.execute(
-        select(
+    tenant_key = _actor_tenant(actor)
+    ticket_query = select(
             func.count(),
             func.count().filter(db.TicketRecord.status == "open"),
             func.count().filter(
@@ -43,11 +49,20 @@ def _site_stats(session: Session) -> dict[str, int]:
                 db.TicketRecord.queue != "it-service-desk",
             ),
         ).select_from(db.TicketRecord)
-    ).one()
+    request_query = select(db.OnboardingRequestRecord.id)
+    if tenant_key is not None:
+        ticket_query = ticket_query.where(db.TicketRecord.tenant_key == tenant_key)
+        request_query = request_query.where(
+            db.OnboardingRequestRecord.tenant_key == tenant_key
+        )
+    ticket_count, open_tickets, auto_routed = session.execute(ticket_query).one()
     outbox_counts = dict(
         session.execute(
-            select(db.NotificationOutboxRecord.status, func.count())
-            .group_by(db.NotificationOutboxRecord.status)
+            _scope_ticket_or_request_keyed_query(
+                select(db.NotificationOutboxRecord.status, func.count()),
+                db.NotificationOutboxRecord.ticket_id,
+                actor,
+            ).group_by(db.NotificationOutboxRecord.status)
         ).all()
     )
     return {
@@ -55,7 +70,9 @@ def _site_stats(session: Session) -> dict[str, int]:
         "open_tickets": open_tickets,
         "auto_routed": auto_routed,
         "onboarding_requests": session.scalar(
-            select(func.count()).select_from(db.OnboardingRequestRecord)
+            select(func.count()).select_from(db.OnboardingRequestRecord).where(
+                db.OnboardingRequestRecord.id.in_(request_query)
+            )
         ) or 0,
         "pending_notifications": outbox_counts.get("pending", 0),
         "failed_notifications": outbox_counts.get("failed", 0),
@@ -156,24 +173,30 @@ def logout(
 
 @router.get("/", response_class=HTMLResponse, include_in_schema=False)
 def root(
-    request: Request, session: Session = Depends(db.get_session)
+    request: Request,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
 ) -> HTMLResponse:
     """Landing page with live counts and operator links."""
     return web.render(
         request,
         "landing.html",
-        {"active": "home", "stats": _site_stats(session)},
+        {"active": "home", "stats": _site_stats(session, actor)},
     )
 
 
 @router.get("/ui/tickets", response_class=HTMLResponse, include_in_schema=False)
 def ui_tickets(
-    request: Request, session: Session = Depends(db.get_session)
+    request: Request,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
 ) -> HTMLResponse:
     """Operator ticket list with an AI-triage entry point."""
-    records = session.execute(
-        select(db.TicketRecord).order_by(db.TicketRecord.ticket_id)
-    ).scalars().all()
+    query = select(db.TicketRecord).order_by(db.TicketRecord.ticket_id)
+    tenant_key = _actor_tenant(actor)
+    if tenant_key is not None:
+        query = query.where(db.TicketRecord.tenant_key == tenant_key)
+    records = session.execute(query).scalars().all()
     tickets = [Ticket.model_validate(row, from_attributes=True) for row in records]
     tickets.sort(key=lambda ticket: int(ticket.ticket_id))
     return web.render(
@@ -186,6 +209,7 @@ def ui_tickets(
 @router.get("/ui/knowledge-base", response_class=HTMLResponse, include_in_schema=False)
 def ui_knowledge_base(
     request: Request,
+    actor: Actor = Depends(_operator_actor),
     query: Optional[str] = Query(default=None, max_length=200),
     category: Optional[str] = Query(default=None, max_length=64),
 ) -> HTMLResponse:
@@ -222,10 +246,12 @@ def ui_ticket_detail(
     request: Request,
     ticket_id: str,
     triage: bool = Query(default=False),
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
 ) -> HTMLResponse:
     """Ticket detail page with an optional AI-triage panel."""
     record = _load_ticket(session, ticket_id)
+    _require_ticket_access(actor, record)
     result: Optional[AITriageOut] = None
     if triage:
         history = _ticket_history(session, ticket_id)
@@ -269,10 +295,16 @@ def ui_ticket_detail(
     include_in_schema=False,
 )
 def ui_onboarding_requests(
-    request: Request, session: Session = Depends(db.get_session)
+    request: Request,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
 ) -> HTMLResponse:
     """Operator list of onboarding/offboarding requests."""
-    records = session.execute(select(db.OnboardingRequestRecord)).scalars().all()
+    query = select(db.OnboardingRequestRecord)
+    tenant_key = _actor_tenant(actor)
+    if tenant_key is not None:
+        query = query.where(db.OnboardingRequestRecord.tenant_key == tenant_key)
+    records = session.execute(query).scalars().all()
     rows = []
     for record in records:
         _, items = _load_request(session, record.id)
@@ -305,11 +337,13 @@ def ui_onboarding_requests(
 def ui_onboarding_request(
     request: Request,
     request_id: int,
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
 ) -> HTMLResponse:
     """Operator detail page for one checklist."""
     try:
         record, items = _load_request(session, request_id)
+        _require_request_access(actor, record)
     except HTTPException as error:
         if error.status_code == 404:
             return web.render(
@@ -359,7 +393,9 @@ def ui_onboarding_request(
 
 @router.get("/ui/workflow-definitions", response_class=HTMLResponse, include_in_schema=False)
 def ui_workflow_definitions(
-    request: Request, session: Session = Depends(db.get_session)
+    request: Request,
+    actor: Actor = Depends(_global_admin_actor),
+    session: Session = Depends(db.get_session),
 ) -> HTMLResponse:
     rows = [
         _definition_out(session, definition)
@@ -376,7 +412,10 @@ def ui_workflow_definitions(
     include_in_schema=False,
 )
 def ui_workflow_definition(
-    request: Request, key: str, session: Session = Depends(db.get_session)
+    request: Request,
+    key: str,
+    actor: Actor = Depends(_global_admin_actor),
+    session: Session = Depends(db.get_session),
 ) -> HTMLResponse:
     definition = definitions.get_definition(session, key)
     if definition is None:
@@ -392,10 +431,17 @@ def ui_workflow_definition(
 def ui_workflow_runs(
     request: Request,
     status: Optional[str] = Query(default=None),
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
 ) -> HTMLResponse:
     """Operator view of DAG runs and their step attempts."""
     query = select(db.WorkflowRunRecord).order_by(db.WorkflowRunRecord.id.desc())
+    tenant_key = _actor_tenant(actor)
+    if tenant_key is not None:
+        request_ids = select(db.OnboardingRequestRecord.id).where(
+            db.OnboardingRequestRecord.tenant_key == tenant_key
+        )
+        query = query.where(db.WorkflowRunRecord.request_id.in_(request_ids))
     if status:
         query = query.where(db.WorkflowRunRecord.status == status)
     runs = session.execute(query.limit(100)).scalars().all()
@@ -418,13 +464,19 @@ def ui_workflow_runs(
 @router.get("/ui/notifications", response_class=HTMLResponse, include_in_schema=False)
 def ui_notifications(
     request: Request,
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
     page: int = Query(default=1, ge=1),
 ) -> HTMLResponse:
     """Operator page for pending and dead-letter webhook deliveries."""
     page_size = 25
+    query = _scope_ticket_or_request_keyed_query(
+        select(db.NotificationOutboxRecord),
+        db.NotificationOutboxRecord.ticket_id,
+        actor,
+    )
     records = session.execute(
-        select(db.NotificationOutboxRecord)
+        query
         .order_by(db.NotificationOutboxRecord.id)
         .offset((page - 1) * page_size)
         .limit(page_size)
@@ -446,14 +498,31 @@ def ui_notifications(
 @router.get("/ui/workflow-jobs", response_class=HTMLResponse, include_in_schema=False)
 def ui_workflow_jobs(
     request: Request,
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
     page: int = Query(default=1, ge=1),
 ) -> HTMLResponse:
     """Operator page for the durable workflow queue."""
     page_size = 25
-    records = jobs.list_jobs(
-        session, limit=page_size, offset=(page - 1) * page_size
-    )
+    tenant_key = _actor_tenant(actor)
+    if tenant_key is None:
+        records = jobs.list_jobs(
+            session, limit=page_size, offset=(page - 1) * page_size
+        )
+    else:
+        request_ids = select(cast(db.OnboardingRequestRecord.id, String)).where(
+            db.OnboardingRequestRecord.tenant_key == tenant_key
+        )
+        records = session.scalars(
+            select(db.WorkflowJobRecord)
+            .where(
+                db.WorkflowJobRecord.resource_type == "onboarding",
+                db.WorkflowJobRecord.resource_id.in_(request_ids),
+            )
+            .order_by(db.WorkflowJobRecord.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        ).all()
     return web.render(
         request,
         "jobs.html",
@@ -470,14 +539,18 @@ def ui_workflow_jobs(
 @router.get("/ui/audit", response_class=HTMLResponse, include_in_schema=False)
 def ui_audit(
     request: Request,
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
     status_filter: Optional[str] = Query(default=None, alias="status"),
     actor_filter: Optional[str] = Query(default=None, alias="actor"),
     page: int = Query(default=1, ge=1),
 ) -> HTMLResponse:
     """Operator audit page for actor-attributed execution rows."""
-    query = select(db.ExecutionLogRecord).where(
-        db.ExecutionLogRecord.actor_subject.is_not(None)
+    query = _scope_execution_log_query(
+        select(db.ExecutionLogRecord).where(
+            db.ExecutionLogRecord.actor_subject.is_not(None)
+        ),
+        actor,
     )
     if status_filter in ("success", "failure"):
         query = query.where(db.ExecutionLogRecord.status == status_filter)
@@ -510,12 +583,16 @@ def ui_audit(
     include_in_schema=False,
 )
 def ui_workflow_job_detail(
-    request: Request, job_id: int, session: Session = Depends(db.get_session)
+    request: Request,
+    job_id: int,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
 ) -> HTMLResponse:
     """Operator detail page for one durable workflow job."""
     job = session.get(db.WorkflowJobRecord, job_id)
     if job is None:
         return web.render(request, "404.html", {"active": "jobs"}, status_code=404)
+    _require_workflow_job_access(session, actor, job)
     try:
         payload = json.loads(job.payload_json)
     except json.JSONDecodeError:
@@ -547,21 +624,33 @@ def ui_not_found(request: Request, rest: str) -> HTMLResponse:
 @router.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
 def dashboard(
     request: Request,
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
     status_filter: Optional[str] = Query(default=None, alias="status"),
     auto_refresh: bool = Query(default=False),
 ) -> HTMLResponse:
     """Server-rendered monitoring dashboard over tickets and execution logs."""
-    tickets = session.execute(select(db.TicketRecord)).scalars().all()
-    log_query = select(db.ExecutionLogRecord).order_by(
-        db.ExecutionLogRecord.id.desc()
-    ).limit(200)
+    tenant_key = _actor_tenant(actor)
+    ticket_query = select(db.TicketRecord)
+    request_query = select(db.OnboardingRequestRecord.id)
+    if tenant_key is not None:
+        ticket_query = ticket_query.where(db.TicketRecord.tenant_key == tenant_key)
+        request_query = request_query.where(
+            db.OnboardingRequestRecord.tenant_key == tenant_key
+        )
+    tickets = session.execute(ticket_query).scalars().all()
+    log_query = _scope_execution_log_query(
+        select(db.ExecutionLogRecord), actor
+    ).order_by(db.ExecutionLogRecord.id.desc()).limit(200)
     if status_filter in ("success", "failure"):
         log_query = log_query.where(db.ExecutionLogRecord.status == status_filter)
     logs = session.execute(log_query).scalars().all()
-    outbox_records = session.execute(
-        select(db.NotificationOutboxRecord)
-    ).scalars().all()
+    outbox_query = _scope_ticket_or_request_keyed_query(
+        select(db.NotificationOutboxRecord),
+        db.NotificationOutboxRecord.ticket_id,
+        actor,
+    )
+    outbox_records = session.execute(outbox_query).scalars().all()
     pending_deliveries = [
         item for item in outbox_records if item.status == "pending"
     ]
@@ -624,7 +713,9 @@ def dashboard(
     ]
     offboarding_rows = []
     for onboarding_record in session.execute(
-        select(db.OnboardingRequestRecord)
+        select(db.OnboardingRequestRecord).where(
+            db.OnboardingRequestRecord.id.in_(request_query)
+        )
     ).scalars().all():
         if onboarding_record.request_type != "offboarding":
             continue

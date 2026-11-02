@@ -2,32 +2,44 @@
 
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src import analytics, db, web
+from src.auth import Actor
+from src.deps import _actor_tenant, _operator_actor
 
 router = APIRouter(tags=["analytics"])
+
+
+def _effective_tenant(actor: Actor, requested: Optional[str]) -> Optional[str]:
+    """Prevent a tenant operator from selecting another tenant's analytics."""
+    tenant_key = _actor_tenant(actor)
+    if tenant_key is not None and requested is not None and requested != tenant_key:
+        raise HTTPException(status_code=404, detail="Tenant not found.")
+    return tenant_key if tenant_key is not None else requested
 
 
 @router.get("/analytics/summary")
 def analytics_summary(
     days: int = Query(default=analytics.DEFAULT_DAYS, ge=1, le=analytics.MAX_DAYS),
     tenant: Optional[str] = Query(default=None, max_length=64),
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
 ) -> dict[str, Any]:
-    return analytics.summary(session, days=days, tenant_key=tenant)
+    return analytics.summary(session, days=days, tenant_key=_effective_tenant(actor, tenant))
 
 
 @router.get("/analytics/steps")
 def analytics_steps(
     days: int = Query(default=analytics.DEFAULT_DAYS, ge=1, le=analytics.MAX_DAYS),
     tenant: Optional[str] = Query(default=None, max_length=64),
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
 ) -> list[dict[str, Any]]:
-    return analytics.steps(session, days=days, tenant_key=tenant)
+    return analytics.steps(session, days=days, tenant_key=_effective_tenant(actor, tenant))
 
 
 @router.get("/analytics/health")
@@ -38,9 +50,14 @@ def analytics_health(
         le=analytics.MAX_STUCK_MINUTES,
     ),
     tenant: Optional[str] = Query(default=None, max_length=64),
+    actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
 ) -> dict[str, Any]:
-    return analytics.health(session, stuck_minutes=stuck_minutes, tenant_key=tenant)
+    return analytics.health(
+        session,
+        stuck_minutes=stuck_minutes,
+        tenant_key=_effective_tenant(actor, tenant),
+    )
 
 
 def _bar_width(value: Optional[float], ceiling: float) -> int:
@@ -65,6 +82,7 @@ def _fmt_duration(seconds: Optional[float]) -> str:
 @router.get("/ui/analytics", response_class=HTMLResponse, include_in_schema=False)
 def ui_analytics(
     request: Request,
+    actor: Actor = Depends(_operator_actor),
     days: int = Query(default=analytics.DEFAULT_DAYS, ge=1, le=analytics.MAX_DAYS),
     stuck_minutes: int = Query(
         default=analytics.DEFAULT_STUCK_MINUTES,
@@ -74,11 +92,12 @@ def ui_analytics(
     tenant: Optional[str] = Query(default=None, max_length=64),
     session: Session = Depends(db.get_session),
 ) -> HTMLResponse:
-    data = analytics.summary(session, days=days, tenant_key=tenant)
+    tenant_key = _effective_tenant(actor, tenant)
+    data = analytics.summary(session, days=days, tenant_key=tenant_key)
     health = analytics.health(
-        session, stuck_minutes=stuck_minutes, tenant_key=tenant
+        session, stuck_minutes=stuck_minutes, tenant_key=tenant_key
     )
-    step_rows = analytics.steps(session, days=days, tenant_key=tenant)
+    step_rows = analytics.steps(session, days=days, tenant_key=tenant_key)
 
     status_rows = [
         {"status": status, "count": count}
@@ -108,16 +127,20 @@ def ui_analytics(
         row["heartbeat_label"] = heartbeat.strftime("%Y-%m-%d %H:%M:%S UTC")
         row["age_label"] = _fmt_duration(row["age_seconds"])
 
-    tenants = session.execute(
-        select(db.TenantRecord.key).order_by(db.TenantRecord.key)
-    ).scalars().all()
+    tenants = (
+        session.execute(select(db.TenantRecord.key).order_by(db.TenantRecord.key))
+        .scalars()
+        .all()
+        if tenant_key is None
+        else [tenant_key]
+    )
 
     return web.render(
         request,
         "analytics.html",
         {
             "days": days,
-            "tenant": tenant,
+            "tenant": tenant_key or "",
             "tenants": tenants,
             "summary": data,
             "health": health,

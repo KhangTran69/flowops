@@ -85,14 +85,21 @@ def test_notification_pagination(client):
 def test_audit_pagination_and_actor_filter(client, monkeypatch):
     monkeypatch.setenv("FLOWOPS_AUTH_REQUIRED", "true")
     monkeypatch.setenv("FLOWOPS_DEV_BEARER_TOKEN", "dev-secret")
+    monkeypatch.setenv("FLOWOPS_DEV_TENANT_KEY", "tenant-a")
     headers = {"Authorization": "Bearer dev-secret"}
     for ticket_id in range(1, 3):
         client.post("/tickets", json={**TICKET, "id": ticket_id}, headers=headers)
-    full = client.get("/audit", params={"limit": 50}).json()
-    page = client.get("/audit", params={"limit": 1, "offset": 1}).json()
+    full = client.get("/audit", params={"limit": 50}, headers=headers).json()
+    page = client.get(
+        "/audit", params={"limit": 1, "offset": 1}, headers=headers
+    ).json()
     assert page[0]["id"] == full[1]["id"]
     filtered = client.get(
-        "/audit", params={"actor": "configured-bearer", "status": "success"}
+        "/audit",
+        params={"actor": "configured-bearer", "status": "success"},
+        headers=headers,
     ).json()
     assert filtered and all(row["actor_subject"] == "configured-bearer" for row in filtered)
-    assert client.get("/ui/audit", params={"page": 2}).status_code == 200
+    assert client.get(
+        "/ui/audit", params={"page": 2}, headers=headers
+    ).status_code == 200

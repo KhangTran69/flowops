@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from src import db, definitions, jobs, triggers, web
 from src.auth import Actor
-from src.deps import _new_run_id, _operator_actor
+from src.deps import _global_admin_actor, _new_run_id
 
 router = APIRouter(tags=["triggers"])
 
@@ -34,7 +34,7 @@ class EventSourceOut(BaseModel):
 
 @router.get("/event-sources", response_model=list[EventSourceOut])
 def list_event_sources(
-    actor: Actor = Depends(_operator_actor),
+    actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
 ) -> list[EventSourceOut]:
     sources = session.execute(select(db.EventSourceRecord)).scalars().all()
@@ -52,7 +52,7 @@ def list_event_sources(
 @router.post("/event-sources", response_model=EventSourceOut, status_code=http_status.HTTP_201_CREATED)
 def create_event_source(
     payload: EventSourceCreateIn,
-    actor: Actor = Depends(_operator_actor),
+    actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
 ) -> EventSourceOut:
     if session.get(db.EventSourceRecord, payload.key):
@@ -269,7 +269,7 @@ def trigger_webhook(
 
 @router.get("/triggers", response_model=list[TriggerOut])
 def list_triggers(
-    actor: Actor = Depends(_operator_actor),
+    actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
 ) -> list[TriggerOut]:
     trigger_records = session.execute(select(db.TriggerRecord)).scalars().all()
@@ -297,7 +297,7 @@ def list_triggers(
 @router.post("/triggers", response_model=TriggerOut, status_code=http_status.HTTP_201_CREATED)
 def create_trigger(
     payload: TriggerCreateIn,
-    actor: Actor = Depends(_operator_actor),
+    actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
 ) -> TriggerOut:
     if session.get(db.TriggerRecord, payload.key):
@@ -368,7 +368,7 @@ def create_trigger(
 @router.get("/triggers/{key}", response_model=TriggerOut)
 def get_trigger(
     key: str,
-    actor: Actor = Depends(_operator_actor),
+    actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
 ) -> TriggerOut:
     trigger = session.get(db.TriggerRecord, key)
@@ -396,7 +396,7 @@ def get_trigger(
 def update_trigger(
     key: str,
     payload: TriggerUpdateIn,
-    actor: Actor = Depends(_operator_actor),
+    actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
 ) -> TriggerOut:
     trigger = session.get(db.TriggerRecord, key)
@@ -446,7 +446,7 @@ def update_trigger(
 @router.delete("/triggers/{key}")
 def delete_trigger(
     key: str,
-    actor: Actor = Depends(_operator_actor),
+    actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
 ) -> dict[str, str]:
     trigger = session.get(db.TriggerRecord, key)
@@ -470,7 +470,7 @@ def delete_trigger(
 @router.get("/triggers/{key}/deliveries", response_model=list[TriggerDeliveryOut])
 def list_trigger_deliveries(
     key: str,
-    actor: Actor = Depends(_operator_actor),
+    actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
 ) -> list[TriggerDeliveryOut]:
     trigger = session.get(db.TriggerRecord, key)
@@ -502,7 +502,7 @@ def list_trigger_deliveries(
 def test_trigger(
     key: str,
     payload: dict[str, Any],
-    actor: Actor = Depends(_operator_actor),
+    actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
 ) -> dict[str, Any]:
     """Test a trigger with a synthetic payload (no external calls)."""
@@ -526,7 +526,9 @@ def test_trigger(
 
 @router.get("/ui/triggers", response_class=HTMLResponse, include_in_schema=False)
 def ui_triggers(
-    request: Request, session: Session = Depends(db.get_session)
+    request: Request,
+    actor: Actor = Depends(_global_admin_actor),
+    session: Session = Depends(db.get_session),
 ) -> HTMLResponse:
     trigger_records = session.execute(select(db.TriggerRecord)).scalars().all()
     rows = [
@@ -559,6 +561,7 @@ def ui_triggers(
 def ui_trigger_detail(
     key: str,
     request: Request,
+    actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
 ) -> HTMLResponse:
     trigger = session.get(db.TriggerRecord, key)

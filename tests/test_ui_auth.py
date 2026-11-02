@@ -28,6 +28,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("FLOWOPS_AUTH_REQUIRED", "true")
     monkeypatch.setenv("FLOWOPS_ENVIRONMENT", "development")
     monkeypatch.setenv("FLOWOPS_DEV_BEARER_TOKEN", "dev-secret")
+    monkeypatch.setenv("FLOWOPS_DEV_TENANT_KEY", "tenant-a")
     monkeypatch.setenv("FLOWOPS_DEMO_USERS", __import__("json").dumps({"admin": {
         "password_hash": ui_session.hash_demo_password("admin", salt="test-salt"),
         "roles": ["automation.operator", "automation.admin"]}}))
@@ -53,7 +54,12 @@ def _login(client, password="admin", next_path="/dashboard", username="admin"):
 
 def _operator_cookie(client):
     session = ui_session.create_session(
-        Actor("operator-test", ("automation.operator",), source="session")
+        Actor(
+            "operator-test",
+            ("automation.operator",),
+            source="session",
+            tenant_key="tenant-a",
+        )
     )
     client.cookies.clear()
     client.cookies.set(ui_session.SESSION_COOKIE, ui_session.encode_session(session))
@@ -170,16 +176,27 @@ def test_logout_clears_session_and_writes_audit(client):
     after = client.get("/dashboard", follow_redirects=False)
     assert after.status_code == 303
 
-    logs = client.get(
-        "/execution-logs", headers={"Authorization": "Bearer dev-secret"}
-    ).json()
-    actions = [row["action"] for row in logs]
+    session = db.SessionLocal()
+    try:
+        actions = [
+            row.action
+            for row in session.query(db.ExecutionLogRecord).all()
+        ]
+    finally:
+        session.close()
     assert "ui.login" in actions
     assert "ui.logout" in actions
 
 
 def test_admin_only_controls_are_hidden_from_operators(client):
     _login(client)
+    csrf = _csrf(client.get("/dashboard").text)
+    created = client.post(
+        "/tickets",
+        json={**TICKET, "tenant": "tenant-a"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert created.status_code == 201
     _operator_cookie(client)
     session = db.SessionLocal()
     try:
@@ -187,7 +204,7 @@ def test_admin_only_controls_are_hidden_from_operators(client):
             db.NotificationOutboxRecord(
                 url="https://example.test/hook",
                 payload_json="{}",
-                ticket_id=None,
+                ticket_id=created.json()["ticket_id"],
                 status="failed",
                 attempts=5,
                 last_error="test failure",

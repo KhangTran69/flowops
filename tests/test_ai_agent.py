@@ -13,6 +13,7 @@ TICKET = {
     "id": 42,
     "title": "VPN outage - all users cannot work",
     "completed": False,
+    "tenant": "tenant-a",
 }
 
 
@@ -108,6 +109,7 @@ def test_apply_requires_operator_auth_and_updates_only_queue_priority(client, mo
 
     monkeypatch.setenv("FLOWOPS_AUTH_REQUIRED", "true")
     monkeypatch.setenv("FLOWOPS_DEV_BEARER_TOKEN", "dev-secret")
+    monkeypatch.setenv("FLOWOPS_DEV_TENANT_KEY", "tenant-a")
     path = f"/tickets/{ticket_id}/ai-recommendations/apply"
     payload = {"recommendation_ids": recommendation_ids}
     assert client.post(path, json=payload).status_code == 401
@@ -121,7 +123,9 @@ def test_apply_requires_operator_auth_and_updates_only_queue_priority(client, mo
     assert ticket["priority"] == "urgent"
     assert ticket["status"] == "open"  # AI never changes status
 
-    logs = client.get("/audit").json()
+    logs = client.get(
+        "/audit", headers={"Authorization": "Bearer dev-secret"}
+    ).json()
     applied_logs = [row for row in logs if row["action"] == "ai.recommendation_applied"]
     assert applied_logs
     assert applied_logs[0]["actor_subject"] == "configured-bearer"

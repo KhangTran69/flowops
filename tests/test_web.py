@@ -155,11 +155,14 @@ def test_jobs_page_renders(client):
 def test_audit_page_renders_actor_rows(client, monkeypatch):
     monkeypatch.setenv("FLOWOPS_AUTH_REQUIRED", "true")
     monkeypatch.setenv("FLOWOPS_DEV_BEARER_TOKEN", "dev-secret")
+    monkeypatch.setenv("FLOWOPS_DEV_TENANT_KEY", "tenant-a")
     payload = {"userId": 7, "id": 42, "title": "Laptop will not start", "completed": False}
     assert client.post(
         "/tickets", json=payload, headers={"Authorization": "Bearer dev-secret"}
     ).status_code == 201
-    page = client.get("/ui/audit").text
+    page = client.get(
+        "/ui/audit", headers={"Authorization": "Bearer dev-secret"}
+    ).text
     assert "Audit trail" in page
     assert "configured-bearer" in page
     assert "ticket.created" in page

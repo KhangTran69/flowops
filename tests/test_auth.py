@@ -11,8 +11,16 @@ from src.actions import ActionResult, MicrosoftGraphAdapter, adapter_from_enviro
 
 
 @pytest.fixture
-def client(tmp_path):
+def client(tmp_path, monkeypatch):
+    monkeypatch.setenv("FLOWOPS_DEV_TENANT_KEY", "tenant-a")
     db.use_database(f"sqlite:///{tmp_path}/auth.db")
+    db._ensure_tables()
+    session = db.SessionLocal()
+    try:
+        session.add(db.TenantRecord(key="tenant-a", name="Tenant A", active=True))
+        session.commit()
+    finally:
+        session.close()
     return TestClient(api.app)
 
 
@@ -113,9 +121,12 @@ def test_mutating_ticket_route_requires_bearer_when_enabled(client, monkeypatch)
         "/tickets", json=payload, headers={"Authorization": "Bearer dev-secret"}
     )
     assert created.status_code == 201
-    audit = client.get("/audit").json()
+    headers = {"Authorization": "Bearer dev-secret"}
+    audit = client.get("/audit", headers=headers).json()
     assert any(row["actor_subject"] == "configured-bearer" for row in audit)
-    filtered = client.get("/execution-logs", params={"actor": "configured-bearer"}).json()
+    filtered = client.get(
+        "/execution-logs", params={"actor": "configured-bearer"}, headers=headers
+    ).json()
     assert any(row["action"] == "ticket.created" for row in filtered)
 
 

@@ -70,6 +70,7 @@ def _operator_actor(
 ) -> Actor:
     if not {"automation.operator", "automation.admin"} & set(actor.roles):
         raise HTTPException(status_code=403, detail="Operator role is required.")
+    _actor_tenant(actor)
     _enforce_csrf(request, actor)
     _enforce_rate_limit(f"actor:{actor.subject}")
     return actor
@@ -81,19 +82,60 @@ def _admin_actor(
 ) -> Actor:
     if "automation.admin" not in actor.roles:
         raise HTTPException(status_code=403, detail="Admin role is required.")
+    _actor_tenant(actor)
     _enforce_csrf(request, actor)
     _enforce_rate_limit(f"actor:{actor.subject}")
     return actor
+
+
+def _global_admin_actor(actor: Actor = Depends(_admin_actor)) -> Actor:
+    """Require an unscoped admin for endpoints that expose cross-tenant data."""
+    if actor.source != "local" and actor.tenant_key is not None:
+        raise HTTPException(status_code=403, detail="Global administrator access is required.")
+    return actor
+
+
+def _actor_tenant(actor: Actor) -> Optional[str]:
+    """Return the actor's tenant, allowing global access only in dev or for admins."""
+    if actor.source == "local":
+        return None
+    if actor.tenant_key:
+        return actor.tenant_key
+    if "automation.admin" in actor.roles:
+        return None
+    raise HTTPException(
+        status_code=403,
+        detail="A tenant context or global administrator role is required.",
+    )
 
 
 def _webhook_actor(
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
 ) -> str:
     expected = os.environ.get("FLOWOPS_WEBHOOK_API_KEY")
+    environment = os.environ.get("FLOWOPS_ENVIRONMENT", "development").strip().lower()
+    if not expected and environment != "development":
+        raise HTTPException(status_code=503, detail="Webhook authentication is not configured.")
+    if expected and environment != "development" and len(expected) < 32:
+        raise HTTPException(status_code=503, detail="Webhook authentication is not securely configured.")
     if expected and not secrets.compare_digest(x_api_key or "", expected):
         raise HTTPException(status_code=401, detail="Invalid webhook API key.")
     _enforce_rate_limit("webhook:intake")
     return "webhook-api-key" if expected else "local-development"
+
+
+def validate_webhook_configuration(environ: Optional[dict[str, str]] = None) -> None:
+    """Fail startup when non-development webhook intake has no shared key."""
+    values = environ if environ is not None else os.environ
+    environment = values.get("FLOWOPS_ENVIRONMENT", "development").strip().lower()
+    webhook_key = values.get("FLOWOPS_WEBHOOK_API_KEY", "")
+    if environment != "development":
+        if not webhook_key:
+            raise ValueError("FLOWOPS_WEBHOOK_API_KEY is required outside development.")
+        if len(webhook_key) < 32:
+            raise ValueError(
+                "FLOWOPS_WEBHOOK_API_KEY must contain at least 32 characters outside development."
+            )
 
 
 _RATE_LIMIT_LOCK = threading.Lock()
