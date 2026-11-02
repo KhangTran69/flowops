@@ -496,9 +496,14 @@ carries subject/roles and a per-session CSRF token. UI fetch actions send
 API clients remain CSRF-exempt. Set `FLOWOPS_SESSION_COOKIE_SECURE=true` behind
 HTTPS. This is a prototype token-paste login, not full SSO or user management.
 
-Operator routes
-require `automation.operator` or `automation.admin`. `POST /webhooks/intake`
-can additionally require `X-API-Key` via `FLOWOPS_WEBHOOK_API_KEY`.
+Operator routes require `automation.operator` or `automation.admin`. Webhook
+routes require `X-API-Key` via `FLOWOPS_WEBHOOK_API_KEY` outside development.
+Production startup fails unless the key is configured with at least 32
+characters; local development may leave it empty.
+Tenant-bound actors are limited to their own tenant. Cross-tenant tenant
+registry access, global reports, workflow definitions, event-source records,
+and shared trigger routes require an unscoped global administrator. A
+tenant-bound administrator can update only that tenant's registry entry.
 Authenticated actions write `actor_subject` to execution logs; `GET /audit` and
 `/execution-logs?actor=...` expose the trail, and `/ui/audit` renders it.
 Local development is admin-equivalent; protected deployments can distinguish

@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from src import connectwise, db, tenants
 from src.auth import Actor
-from src.deps import _admin_actor, _operator_actor
+from src.deps import _actor_tenant, _admin_actor, _operator_actor
 
 router = APIRouter(tags=["tenants"])
 
@@ -60,7 +60,11 @@ def list_tenants(
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
 ) -> list[TenantOut]:
-    return [_out(r) for r in session.query(db.TenantRecord).order_by(db.TenantRecord.key)]
+    tenant_key = _actor_tenant(actor)
+    query = session.query(db.TenantRecord).order_by(db.TenantRecord.key)
+    if tenant_key is not None:
+        query = query.filter(db.TenantRecord.key == tenant_key)
+    return [_out(record) for record in query]
 
 
 @router.get("/tenants/{key}", response_model=TenantOut)
@@ -70,7 +74,8 @@ def get_tenant(
     session: Session = Depends(db.get_session),
 ) -> TenantOut:
     record = session.get(db.TenantRecord, key)
-    if record is None:
+    tenant_key = _actor_tenant(actor)
+    if record is None or (tenant_key is not None and record.key != tenant_key):
         raise HTTPException(404, "Tenant not found.")
     return _out(record)
 
@@ -84,6 +89,9 @@ def upsert_tenant(
 ) -> TenantOut:
     import re
 
+    actor_tenant = _actor_tenant(actor)
+    if actor_tenant is not None and actor_tenant != key:
+        raise HTTPException(404, "Tenant not found.")
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", key):
         raise HTTPException(422, "Tenant key must be lowercase letters, digits and dashes.")
     record = session.get(db.TenantRecord, key) or db.TenantRecord(key=key)
@@ -113,7 +121,14 @@ def drift_check(
 ) -> dict[str, Any]:
     """Compare each tenant's licences/security defaults with its baseline."""
     selected = tenants.list_tenants(session, active_only=True)
-    if tenant:
+    actor_tenant = _actor_tenant(actor)
+    if actor_tenant is not None:
+        if tenant is not None and tenant != actor_tenant:
+            raise HTTPException(404, "Tenant not found or inactive.")
+        selected = [item for item in selected if item.key == actor_tenant]
+        if not selected:
+            raise HTTPException(404, "Tenant not found or inactive.")
+    elif tenant:
         selected = [t for t in selected if t.key == tenant]
         if not selected:
             raise HTTPException(404, "Tenant not found or inactive.")

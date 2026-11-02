@@ -6,6 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from src import db, reports
+from src.auth import Actor
+from src.deps import _global_admin_actor
 
 router = APIRouter(prefix="/reports", tags=["reports"])
 
@@ -20,14 +22,19 @@ _REPORTS = {
 
 @router.get("/summary")
 def report_summary(
-    days: int = Query(default=30, ge=1, le=365), session: Session = Depends(db.get_session)
+    days: int = Query(default=30, ge=1, le=365),
+    actor: Actor = Depends(_global_admin_actor),
+    session: Session = Depends(db.get_session),
 ) -> dict[str, Any]:
     return reports.summary(session.connection(), days=days)
 
 
 @router.get("/{name}")
 def report(
-    name: str, days: int = Query(default=30, ge=1, le=365), session: Session = Depends(db.get_session)
+    name: str,
+    days: int = Query(default=30, ge=1, le=365),
+    actor: Actor = Depends(_global_admin_actor),
+    session: Session = Depends(db.get_session),
 ) -> list[dict[str, Any]]:
     if name not in _REPORTS:
         raise HTTPException(404, f"Unknown report. Available: {', '.join(sorted(_REPORTS))}")
