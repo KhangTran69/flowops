@@ -14,6 +14,13 @@ from src.actions import ActionResult, MicrosoftGraphAdapter, adapter_from_enviro
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("FLOWOPS_DEV_TENANT_KEY", "tenant-a")
     db.use_database(f"sqlite:///{tmp_path}/auth.db")
+    db._ensure_tables()
+    session = db.SessionLocal()
+    try:
+        session.add(db.TenantRecord(key="tenant-a", name="Tenant A", active=True))
+        session.commit()
+    finally:
+        session.close()
     return TestClient(api.app)
 
 
