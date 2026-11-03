@@ -171,6 +171,44 @@ def test_auth_me_and_startup_validation(client, monkeypatch):
     assert "automation.operator" in me.json()["roles"]
 
 
+@pytest.mark.parametrize(
+    "short_secret_name",
+    ("FLOWOPS_N8N_API_KEY", "FLOWOPS_AUTOMATION_CALLBACK_SECRET"),
+)
+def test_production_startup_rejects_short_workforce_integration_secrets(
+    monkeypatch, short_secret_name
+):
+    monkeypatch.setenv("FLOWOPS_ENVIRONMENT", "production")
+    monkeypatch.setenv("FLOWOPS_AUTH_REQUIRED", "true")
+    monkeypatch.setenv("FLOWOPS_UI_AUTH_REQUIRED", "true")
+    monkeypatch.setenv("FLOWOPS_SESSION_SECRET", "s" * 32)
+    monkeypatch.setenv("FLOWOPS_SESSION_COOKIE_SECURE", "true")
+    monkeypatch.setenv("FLOWOPS_ENTRA_ISSUER", "https://issuer.example")
+    monkeypatch.setenv("FLOWOPS_ENTRA_AUDIENCE", "flowops")
+    monkeypatch.setenv("FLOWOPS_ENTRA_JWKS_URL", "https://issuer.example/keys")
+    monkeypatch.setenv("FLOWOPS_WEBHOOK_API_KEY", "w" * 32)
+    monkeypatch.setenv("FLOWOPS_N8N_API_KEY", "n" * 32)
+    monkeypatch.setenv("FLOWOPS_AUTOMATION_CALLBACK_SECRET", "c" * 32)
+    monkeypatch.setenv(short_secret_name, "short-secret")
+
+    with pytest.raises(ValueError, match=short_secret_name), TestClient(api.app):
+        pass
+
+
+def test_development_startup_accepts_short_workforce_integration_secrets(
+    monkeypatch,
+):
+    monkeypatch.setenv("FLOWOPS_ENVIRONMENT", "development")
+    monkeypatch.setenv("FLOWOPS_AUTH_REQUIRED", "false")
+    monkeypatch.setenv("FLOWOPS_UI_AUTH_REQUIRED", "false")
+    monkeypatch.setenv("FLOWOPS_N8N_API_KEY", "dev-key")
+    monkeypatch.setenv("FLOWOPS_AUTOMATION_CALLBACK_SECRET", "dev-secret")
+    monkeypatch.delenv("FLOWOPS_WEBHOOK_API_KEY", raising=False)
+
+    with TestClient(api.app):
+        pass
+
+
 def test_admin_only_requeue_rejects_operator(client, monkeypatch):
     client.get("/dashboard")  # ensure tables
     session = db.SessionLocal()

@@ -500,6 +500,10 @@ Operator routes require `automation.operator` or `automation.admin`. Webhook
 routes require `X-API-Key` via `FLOWOPS_WEBHOOK_API_KEY` outside development.
 Production startup fails unless the key is configured with at least 32
 characters; local development may leave it empty.
+Configured workforce integration keys (`FLOWOPS_N8N_API_KEY` and
+`FLOWOPS_AUTOMATION_CALLBACK_SECRET`) must also contain at least 32 characters
+outside development. They may remain empty when the corresponding integration
+is not used.
 Tenant-bound actors are limited to their own tenant. Cross-tenant tenant
 registry access, global reports, workflow definitions, event-source records,
 and shared trigger routes require an unscoped global administrator. A

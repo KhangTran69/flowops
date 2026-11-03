@@ -138,6 +138,26 @@ def validate_webhook_configuration(environ: Optional[dict[str, str]] = None) -> 
             )
 
 
+def validate_workforce_integration_configuration(
+    environ: Optional[dict[str, str]] = None,
+) -> None:
+    """Reject short configured workforce integration secrets outside development."""
+    values = environ if environ is not None else os.environ
+    environment = values.get("FLOWOPS_ENVIRONMENT", "development").strip().lower()
+    if environment == "development":
+        return
+    short_secrets = [
+        name
+        for name in ("FLOWOPS_N8N_API_KEY", "FLOWOPS_AUTOMATION_CALLBACK_SECRET")
+        if (secret := values.get(name, "")) and len(secret) < 32
+    ]
+    if short_secrets:
+        raise ValueError(
+            "Configured workforce integration secrets must contain at least 32 "
+            "characters outside development: " + ", ".join(short_secrets)
+        )
+
+
 _RATE_LIMIT_LOCK = threading.Lock()
 
 

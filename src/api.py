@@ -55,6 +55,7 @@ from src.deps import (
     _global_admin_actor,
     _new_run_id,
     validate_webhook_configuration,
+    validate_workforce_integration_configuration,
     _RATE_LIMIT_BUCKETS,  # noqa: F401  (re-exported for tests)
 )
 from src.schemas import (
@@ -154,6 +155,7 @@ async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
     validate_auth_configuration()
     ui_session.validate_ui_auth_configuration()
     validate_webhook_configuration()
+    validate_workforce_integration_configuration()
     yield
 
 app = FastAPI(
