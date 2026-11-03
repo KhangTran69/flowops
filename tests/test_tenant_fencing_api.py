@@ -64,6 +64,32 @@ def test_tenant_actor_sees_only_its_tenant_tickets(fencing_client):
     assert client.get(f"/tickets/{ticket_id}").status_code == 200
 
 
+def test_blank_tenant_admin_is_not_treated_as_global(fencing_client):
+    client, set_actor = fencing_client
+    for tenant_key, ticket_id in (("tenant-a", 1101), ("tenant-b", 1102)):
+        set_actor(_tenant_actor(tenant_key))
+        response = client.post(
+            "/tickets",
+            json={
+                "id": ticket_id,
+                "userId": 77,
+                "title": f"Ticket for {tenant_key}",
+                "completed": False,
+            },
+        )
+        assert response.status_code == 201, response.text
+
+    set_actor(
+        Actor(
+            "misconfigured-admin",
+            ("automation.operator", "automation.admin"),
+            source="bearer",
+            tenant_key="   ",
+        )
+    )
+    assert client.get("/tickets").status_code == 403
+
+
 def test_foreign_ticket_lookup_is_denied_without_mutation(fencing_client):
     client, set_actor = fencing_client
     set_actor(_tenant_actor("tenant-a"))

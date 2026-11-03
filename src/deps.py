@@ -99,8 +99,14 @@ def _actor_tenant(actor: Actor) -> Optional[str]:
     """Return the actor's tenant, allowing global access only in dev or for admins."""
     if actor.source == "local":
         return None
-    if actor.tenant_key:
-        return actor.tenant_key
+    if actor.tenant_key is not None:
+        tenant_key = actor.tenant_key.strip()
+        if not tenant_key:
+            raise HTTPException(
+                status_code=403,
+                detail="A non-empty tenant context is required.",
+            )
+        return tenant_key
     if "automation.admin" in actor.roles:
         return None
     raise HTTPException(
