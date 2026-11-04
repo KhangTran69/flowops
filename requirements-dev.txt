@@ -114,11 +114,15 @@ pyjwt==2.15.1
     # via
     #   -r requirements.in
     #   mcp
-pytest==9.1.1
+pytest==9.2.0
     # via
     #   -r requirements-dev.in
     #   -r requirements.in
-python-multipart==0.0.32
+python-multipart==0.0.32 ; python_full_version < '3.11'
+    # via
+    #   -r requirements.in
+    #   mcp
+python-multipart==0.0.33 ; python_full_version >= '3.11'
     # via
     #   -r requirements.in
     #   mcp
@@ -138,7 +142,7 @@ rpds-py==2026.9.1 ; python_full_version >= '3.11'
     # via
     #   jsonschema
     #   referencing
-sqlalchemy==2.0.55 ; python_full_version < '3.11'
+sqlalchemy==2.0.57 ; python_full_version < '3.11'
     # via
     #   -r requirements.in
     #   alembic
@@ -193,7 +197,7 @@ typing-inspection==0.4.4
     #   fastapi
     #   mcp
     #   pydantic
-tzdata==2026.5 ; sys_platform == 'win32'
+tzdata==2026.6 ; sys_platform == 'win32'
     # via psycopg
 urllib3==2.8.0
     # via requests
