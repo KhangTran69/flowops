@@ -14,6 +14,7 @@ x-flowops-env: &flowops-env
   FLOWOPS_ENTRA_JWKS_URL: ${FLOWOPS_ENTRA_JWKS_URL:-}
   FLOWOPS_ENTRA_REQUIRED_ROLE: ${FLOWOPS_ENTRA_REQUIRED_ROLE:-automation.operator}
   FLOWOPS_WEBHOOK_API_KEY: ${FLOWOPS_WEBHOOK_API_KEY:-}
+  FLOWOPS_CONNECTOR_ALLOWED_HOSTS_JSON: ${FLOWOPS_CONNECTOR_ALLOWED_HOSTS_JSON:-}
   FLOWOPS_CHATOPS_SECRET: ${FLOWOPS_CHATOPS_SECRET:-}
   FLOWOPS_DAG_MAX_PARALLEL: ${FLOWOPS_DAG_MAX_PARALLEL:-4}
   FLOWOPS_DAG_LEASE_SECONDS: ${FLOWOPS_DAG_LEASE_SECONDS:-60}
@@ -56,6 +57,9 @@ services:
     build: .
     restart: unless-stopped
     stop_grace_period: 15s
+    env_file:
+      - path: ./.connector-secrets.env
+        required: false
     ports:
       - "${FLOWOPS_BIND_ADDRESS:-127.0.0.1}:${FLOWOPS_APP_PORT:-8000}:8000"
     environment:
@@ -96,6 +100,9 @@ services:
     build: .
     restart: unless-stopped
     stop_grace_period: 15s
+    env_file:
+      - path: ./.connector-secrets.env
+        required: false
     command: ["python", "-m", "src.scheduler", "--poll", "--interval", "${FLOWOPS_DAG_SCHEDULER_INTERVAL:-2}"]
     environment:
       <<: *flowops-env
@@ -164,7 +171,7 @@ services:
     image: nginx:1.29-alpine
     restart: unless-stopped
     ports:
-      - "${FLOWOPS_GATEWAY_PORT:-80}:80"
+      - "${FLOWOPS_BIND_ADDRESS:-127.0.0.1}:${FLOWOPS_GATEWAY_PORT:-80}:80"
     volumes:
       - ./docker/nginx/default.conf:/etc/nginx/nginx.conf:ro
     depends_on:
@@ -184,7 +191,7 @@ services:
     build: ./docker/webhook-sink
     restart: unless-stopped
     ports:
-      - "${FLOWOPS_WEBHOOK_SINK_PORT:-8081}:8080"
+      - "${FLOWOPS_BIND_ADDRESS:-127.0.0.1}:${FLOWOPS_WEBHOOK_SINK_PORT:-8081}:8080"
     healthcheck:
       test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/health', timeout=2)"]
       interval: 5s
@@ -195,7 +202,7 @@ services:
     image: prom/prometheus:v3.5.0
     restart: unless-stopped
     ports:
-      - "${FLOWOPS_PROMETHEUS_PORT:-9090}:9090"
+      - "${FLOWOPS_BIND_ADDRESS:-127.0.0.1}:${FLOWOPS_PROMETHEUS_PORT:-9090}:9090"
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     command:
@@ -214,7 +221,7 @@ services:
     image: grafana/grafana:12.1.1
     restart: unless-stopped
     ports:
-      - "${FLOWOPS_GRAFANA_PORT:-3000}:3000"
+      - "${FLOWOPS_BIND_ADDRESS:-127.0.0.1}:${FLOWOPS_GRAFANA_PORT:-3000}:3000"
     environment:
       GF_SECURITY_ADMIN_USER: ${FLOWOPS_GRAFANA_ADMIN_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${FLOWOPS_GRAFANA_ADMIN_PASSWORD:-flowops-admin}
