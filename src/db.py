@@ -5,7 +5,10 @@ The same code runs on PostgreSQL by setting FLOWOPS_DATABASE_URL to a
 postgresql+psycopg:// connection string.
 """
 
+import hashlib
+import json
 import os
+import re
 import threading
 from datetime import datetime, timezone
 from typing import Optional
@@ -446,6 +449,50 @@ def _add_missing_columns() -> None:
                 )
 
 
+def _ensure_event_identity() -> None:
+    """Upgrade legacy local event fingerprints to tenant/connector-scoped IDs."""
+    if engine.dialect.name != "sqlite":
+        return
+    if not inspect(engine).has_table("events"):
+        return
+    with engine.begin() as connection:
+        connection.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_events_connector_id ON events (connector_id)")
+        )
+        select = text(
+            "SELECT id, tenant_key, connector_id, source, event_type, external_id, fingerprint "
+            "FROM events WHERE id > :last_id ORDER BY id LIMIT 1000"
+        )
+        update = text("UPDATE events SET fingerprint = :fingerprint WHERE id = :event_id")
+        last_id = 0
+        while batch := connection.execute(select, {"last_id": last_id}).fetchall():
+            updates = []
+            for row in batch:
+                if re.fullmatch(r"v2:[a-f0-9]{64}", row.fingerprint or ""):
+                    continue
+                identity = json.dumps(
+                    [
+                        2,
+                        row.tenant_key[:64] if row.tenant_key else row.tenant_key,
+                        row.connector_id,
+                        row.source[:40],
+                        row.event_type[:80],
+                        row.external_id[:255],
+                    ],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                updates.append(
+                    {
+                        "event_id": row.id,
+                        "fingerprint": "v2:" + hashlib.sha256(identity.encode("utf-8")).hexdigest(),
+                    }
+                )
+            if updates:
+                connection.execute(update, updates)
+            last_id = batch[-1].id
+
+
 def _ensure_idempotency_owner_token() -> None:
     """Add the fencing column to databases created before it existed.
 
@@ -603,6 +650,7 @@ def _ensure_tables() -> None:
                 connection.execute(text("PRAGMA journal_mode=WAL"))
         Base.metadata.create_all(engine)
         _add_missing_columns()
+        _ensure_event_identity()
         if engine.dialect.name == "sqlite":
             _ensure_workforce_indexes()
         _ensure_idempotency_owner_token()
@@ -802,11 +850,12 @@ class ConnectorRecord(Base):
     """Configured event source (v1.4 connector framework).
 
     ``config_json`` holds connector settings; secret values are stored as
-    environment-variable *names* (like ``TenantRecord.credential_ref``), never
-    as raw credentials. Example Jira config::
+    server-managed environment-variable names, never as raw credentials.
+    Example tenant-scoped Jira config::
 
         {"base_url": "https://acme.atlassian.net", "email": "bot@acme.io",
-         "api_token_env": "FLOWOPS_JIRA_TOKEN", "jql": "project = OPS"}
+         "api_token_env": "FLOWOPS_TENANT_ACME_CONNECTOR_JIRA_API_TOKEN",
+         "jql": "project = OPS"}
     """
 
     __tablename__ = "connectors"
@@ -828,8 +877,8 @@ class ConnectorRecord(Base):
 class EventRecord(Base):
     """Raw normalized external event (v1.4 event-driven triggers).
 
-    ``fingerprint`` is ``source:event_type:external_id`` and enforces at-least-
-    once ingestion: replays from pollers or retried webhooks become no-ops.
+    ``fingerprint`` covers tenant, connector, source, type, and external ID so
+    retries are no-ops without merging events from separate sources.
     """
 
     __tablename__ = "events"
@@ -845,6 +894,7 @@ class EventRecord(Base):
     fingerprint: Mapped[str] = mapped_column(String(400), nullable=False)
     payload_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    connector_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     processed_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True

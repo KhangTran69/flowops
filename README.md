@@ -359,7 +359,7 @@ curl -X POST http://127.0.0.1:8000/onboarding-requests -H 'Content-Type: applica
 
 - No credentials in code; `.env` git-ignored; no dotenv dependency.
 - All input untrusted: strict type validation, ticket IDs must be numeric before any lookup (blocks path traversal), dashboard HTML output escaped (`html.escape`).
-- **Authentication is optional in development** — local development defaults to no auth. Every non-development environment must enable `FLOWOPS_AUTH_REQUIRED=true` and `FLOWOPS_UI_AUTH_REQUIRED=true`, provide valid credentials and a 32-character `FLOWOPS_SESSION_SECRET`, and set `FLOWOPS_SESSION_COOKIE_SECURE=true`, or startup fails. Docker Compose binds to localhost by default; set `FLOWOPS_BIND_ADDRESS` only when an intentional network-facing deployment is configured. Offboarding completion is admin-only.
+- **Authentication is optional in development** — local development defaults to no auth. Every non-development environment must enable `FLOWOPS_AUTH_REQUIRED=true` and `FLOWOPS_UI_AUTH_REQUIRED=true`, provide valid credentials and a 32-character `FLOWOPS_SESSION_SECRET`, and set `FLOWOPS_SESSION_COOKIE_SECURE=true`, or startup fails. The standard `docker-compose.yml` binds the app, gateway, webhook sink, Prometheus, and Grafana to `127.0.0.1` by default. Keep that binding for local development. The gateway also proxies Grafana and the local webhook sink, so place an authenticated reverse proxy or firewall in front before exposing it to an untrusted network; configure app auth, strong Grafana credentials, and webhook authentication as well. Offboarding completion is admin-only.
 - Runtime artifacts (`data/*.json`, `data/tickets/`, `data/*.db`) git-ignored.
 
 ### Offboarding completion ledger

@@ -7,6 +7,7 @@ x-flowops-env: &flowops-env
   FLOWOPS_UI_AUTH_REQUIRED: "false"
   FLOWOPS_SESSION_COOKIE_SECURE: "false"
   FLOWOPS_DEV_TENANT_KEY: ${FLOWOPS_DEV_TENANT_KEY:-}
+  FLOWOPS_CONNECTOR_ALLOWED_HOSTS_JSON: ${FLOWOPS_CONNECTOR_ALLOWED_HOSTS_JSON:-}
   FLOWOPS_DEMO_USERS: ${FLOWOPS_DEMO_USERS:-}
   FLOWOPS_ACTION_ADAPTER: simulated
   FLOWOPS_AUTOMATION_ADAPTER: ${FLOWOPS_AUTOMATION_ADAPTER:-simulated}
@@ -44,8 +45,11 @@ services:
     image: python:3.13-slim
     restart: on-failure
     stop_grace_period: 15s
+    env_file:
+      - path: ./.connector-secrets.env
+        required: false
     ports:
-      - "3000:8000"
+      - "127.0.0.1:3000:8000"
     environment:
       <<: *flowops-env
       FLOWOPS_RUN_MIGRATIONS: "true"
@@ -90,6 +94,9 @@ services:
     image: python:3.13-slim
     restart: on-failure
     stop_grace_period: 15s
+    env_file:
+      - path: ./.connector-secrets.env
+        required: false
     environment:
       <<: *flowops-env
       FLOWOPS_RUN_MIGRATIONS: "false"

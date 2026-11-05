@@ -94,9 +94,23 @@ def upsert_tenant(
         raise HTTPException(404, "Tenant not found.")
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", key):
         raise HTTPException(422, "Tenant key must be lowercase letters, digits and dashes.")
-    record = session.get(db.TenantRecord, key) or db.TenantRecord(key=key)
-    for field in ("name", "entra_tenant_id", "default_domain", "licence_sku", "usage_location",
-                  "psa_company_id", "credential_ref", "active"):
+    existing = session.get(db.TenantRecord, key)
+    record = existing or db.TenantRecord(key=key)
+    protected_fields = ("entra_tenant_id", "credential_ref")
+    if actor_tenant is not None and any(
+        field in body.model_fields_set
+        and getattr(body, field) != (getattr(existing, field) if existing else None)
+        for field in protected_fields
+    ):
+        raise HTTPException(
+            403,
+            "Only a global administrator may change a tenant's Entra identity or Graph credential assignment.",
+        )
+
+    fields = ["name", "default_domain", "licence_sku", "usage_location", "psa_company_id", "active"]
+    if actor_tenant is None:
+        fields.extend(protected_fields)
+    for field in fields:
         setattr(record, field, getattr(body, field))
     record.baseline_json = json.dumps(body.baseline, sort_keys=True)
     session.add(record)

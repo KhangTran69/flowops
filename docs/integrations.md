@@ -53,6 +53,9 @@ failures (retried). It also parses Exchange size strings such as
   and a baseline. Tickets (`tenant`) and onboarding requests (`tenant_key`)
   carry the tenant through the worker into every Graph call, log line and
   error message (`[acme] ...`).
+- A tenant-scoped administrator may update its operational settings, but only
+  an unscoped global administrator may set or change `entra_tenant_id` and
+  `credential_ref`; those fields select the Graph authority and credential.
 - One partner app (GDAP) serves every tenant; a tenant with its own app
   sets `credential_ref` and the secret lives in
   `FLOWOPS_TENANT_<REF>_GRAPH_CLIENT_SECRET`.
@@ -60,6 +63,46 @@ failures (retried). It also parses Exchange size strings such as
   SKUs and free seats, security defaults, unlicensed enabled users). A
   tenant that fails (revoked consent) is reported as `error`, and the check
   carries on with the other tenants.
+
+## Jira, ServiceNow, and webhook connectors (`src/connectors.py`, `/connectors`)
+
+Connector credentials remain in the process environment. A tenant-scoped
+connector must use its fixed references, with hyphens in the tenant key
+replaced by underscores and the key uppercased:
+
+- Jira: `FLOWOPS_TENANT_<KEY>_CONNECTOR_JIRA_API_TOKEN`
+- ServiceNow: `FLOWOPS_TENANT_<KEY>_CONNECTOR_SERVICENOW_USERNAME` and
+  `FLOWOPS_TENANT_<KEY>_CONNECTOR_SERVICENOW_PASSWORD`
+- Slack: `FLOWOPS_TENANT_<KEY>_CONNECTOR_SLACK_SIGNING_SECRET`
+
+Unbound, global connectors use `FLOWOPS_CONNECTOR_...` references. Connector
+config must name the exact reference for its type and tenant; it cannot select
+other application secrets.
+
+For Docker Compose, copy `.connector-secrets.env.example` to the ignored
+`.connector-secrets.env` and put the configured credential values there. Both
+Compose files pass this optional file only to `app` (manual polling and webhook
+signature checks) and `scheduler` (scheduled polling); workflow workers and
+other services do not receive these connector secrets. Keep the host allowlist
+in the normal Compose environment as `FLOWOPS_CONNECTOR_ALLOWED_HOSTS_JSON`.
+For non-Compose runs, export the same exact variable names to the process
+environment.
+
+Jira and ServiceNow polling requires an HTTPS endpoint on the exact host
+allowlist in `FLOWOPS_CONNECTOR_ALLOWED_HOSTS_JSON`. This is a JSON object
+mapping tenant keys to host arrays; the `"*"` key is for unbound connectors.
+For example, `{"acme":["acme.atlassian.net","acme.service-now.com"]}`.
+Hosts are exact (no wildcard), use port 443, and are controlled by the
+deployment environment. No list is configured by default, so a polling
+connector is rejected until its tenant's trusted hosts are configured.
+Redirects are disabled so credentials cannot be forwarded to another host.
+Existing connector rows with custom `*_env` references must be updated to the
+fixed names above and their tenant host allowlist must be configured before
+polling resumes. Event responses return an opaque versioned fingerprint;
+clients should treat it as an identifier rather than parse its contents.
+Historical events did not record connector IDs, so a still-returning event
+from a configured connector may be ingested once after the migration; review
+active trigger side effects during rollout.
 
 ## ConnectWise Manage (`src/connectwise.py`)
 

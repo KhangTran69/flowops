@@ -117,6 +117,27 @@ def _rule_out(record: db.TriggerRuleRecord) -> TriggerRuleOut:
     )
 
 
+def _validate_connector_config(
+    connector_type: str, config: dict[str, Any], tenant_key: str | None
+) -> None:
+    missing = [
+        key
+        for key in connector_lib.REQUIRED_CONFIG_KEYS[connector_type]
+        if not config.get(key)
+    ]
+    if missing:
+        raise HTTPException(422, f"Connector config missing required keys: {missing}")
+    for value in config.values():
+        if not isinstance(value, (str, int, float, bool)) or len(str(value)) > 500:
+            raise HTTPException(422, "Connector config values must be short scalars.")
+    try:
+        connector_lib.validate_connector_config(
+            connector_type, config, tenant_key=tenant_key
+        )
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+
+
 # ---------------------------------------------------------------------------
 # Connectors (admin)
 # ---------------------------------------------------------------------------
@@ -152,14 +173,9 @@ def create_connector(
     cls = connector_lib.CONNECTOR_REGISTRY.get(payload.connector_type)
     if cls is None:
         raise HTTPException(422, f"Unknown connector type: {payload.connector_type!r}")
-    missing = [k for k in connector_lib.REQUIRED_CONFIG_KEYS[payload.connector_type] if not payload.config.get(k)]
-    if missing:
-        raise HTTPException(
-            422, f"Connector config missing required keys: {missing}"
-        )
-    for key, value in payload.config.items():
-        if not isinstance(value, (str, int, float, bool)) or len(str(value)) > 500:
-            raise HTTPException(422, "Connector config values must be short scalars.")
+    _validate_connector_config(
+        payload.connector_type, payload.config, payload.tenant_key
+    )
     record = db.ConnectorRecord(
         name=payload.name,
         connector_type=payload.connector_type,
@@ -200,6 +216,9 @@ def update_connector(
     cls = connector_lib.CONNECTOR_REGISTRY.get(payload.connector_type)
     if cls is None:
         raise HTTPException(422, f"Unknown connector type: {payload.connector_type!r}")
+    _validate_connector_config(
+        payload.connector_type, payload.config, payload.tenant_key
+    )
     record.name = payload.name
     record.connector_type = payload.connector_type
     record.kind = cls.kind
@@ -258,7 +277,9 @@ async def connector_webhook(
 
     try:
         connector = connector_lib.build_connector(
-            record.connector_type, json.loads(record.config_json)
+            record.connector_type,
+            json.loads(record.config_json),
+            tenant_key=record.tenant_key,
         )
     except ValueError as error:
         # Configured but secret env missing -> service unavailable, not a crash.
@@ -274,19 +295,19 @@ async def connector_webhook(
         raise HTTPException(400, "Request body is not valid JSON.")
 
     events = connector.parse_webhook(payload)
-    if record.tenant_key:
-        events = [
-            connector_lib.NormalizedEvent(
-                source=event.source,
-                event_type=event.event_type,
-                external_id=event.external_id,
-                payload=event.payload,
-                tenant_key=record.tenant_key,
-                title=event.title,
-                description=event.description,
-            )
-            for event in events
-        ]
+    events = [
+        connector_lib.NormalizedEvent(
+            source=event.source,
+            event_type=event.event_type,
+            external_id=event.external_id,
+            payload=event.payload,
+            tenant_key=record.tenant_key or event.tenant_key,
+            connector_id=record.id,
+            title=event.title,
+            description=event.description,
+        )
+        for event in events
+    ]
     results = connector_lib.ingest_events(session, events)
     return {"received": len(results), "results": results}
 

@@ -7,9 +7,9 @@ Two capabilities complete the v1.4 roadmap:
   Connectors normalize external events into one canonical shape; downstream
   routing, persistence, notifications, and monitoring are unchanged. Sources
   are configured in the database (``/connectors``), never by code changes.
-  Credentials follow the same rule as ``TenantRecord.credential_ref``: stored
-  configs reference *environment-variable names* (``*_env`` keys), never raw
-  secret values.
+  Credentials use server-managed, connector-and-tenant-specific environment
+  variables; stored configs cannot select arbitrary variables or contain raw
+  secret values. Polling hosts must match a server-side allowlist.
 
 * **Event-driven triggers** — ``TriggerRuleRecord`` rows evaluated whenever an
   event is ingested (from any connector or ``POST /events``). A rule matches
@@ -22,8 +22,8 @@ Two capabilities complete the v1.4 roadmap:
 
 Reliability invariants carried over from earlier milestones:
 
-* At-least-once ingestion with dedupe: ``events.fingerprint``
-  (``source:event_type:external_id``) is unique; replays from pollers or
+* At-least-once ingestion with dedupe: ``events.fingerprint`` hashes tenant,
+  connector, source, event type, and external ID; replays from pollers or
   retried webhooks return ``duplicate: true`` and fire nothing.
 * Trigger firing is idempotent per ``(rule, event)`` pair via a deterministic
   execution-log key ``trigger:event:<rule_id>:<event_id>``, checked under a
@@ -32,16 +32,19 @@ Reliability invariants carried over from earlier milestones:
   (``tenant_key IS NULL``) may only act on tenants listed in its
   ``allowed_tenants`` static input.
 * Offline-first: everything runs against SQLite with no network access; live
-  HTTP calls happen only for connectors explicitly configured with URLs.
+  HTTP calls happen only for connectors configured with allowlisted HTTPS URLs.
 """
 
+import hashlib
 import json
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 import requests
 from fastapi import HTTPException
@@ -70,9 +73,22 @@ class NormalizedEvent:
     tenant_key: Optional[str] = None
     title: str = ""
     description: str = ""
+    connector_id: Optional[int] = None
 
     def fingerprint(self) -> str:
-        return f"{self.source}:{self.event_type}:{self.external_id}"[:400]
+        identity = json.dumps(
+            [
+                2,
+                self.tenant_key[:64] if self.tenant_key else self.tenant_key,
+                self.connector_id,
+                self.source[:40],
+                self.event_type[:80],
+                self.external_id[:255],
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return "v2:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
     def trigger_context(self) -> dict[str, Any]:
         """Scope for predicate evaluation: envelope fields + payload keys."""
@@ -137,6 +153,7 @@ class JiraConnector(SourceConnector):
             auth=(self.email, self.api_token),
             params={"jql": self.jql, "maxResults": 50},
             timeout=15,
+            allow_redirects=False,
         )
         response.raise_for_status()
         events = []
@@ -177,6 +194,7 @@ class ServiceNowConnector(SourceConnector):
             headers={"Accept": "application/json"},
             params={"sysparm_limit": 50, "sysparm_orderby": "sys_updated_on:DESC"},
             timeout=15,
+            allow_redirects=False,
         )
         response.raise_for_status()
         events = []
@@ -336,7 +354,99 @@ REQUIRED_CONFIG_KEYS: dict[str, tuple[str, ...]] = {
 }
 
 
-def build_connector(connector_type: str, config: dict[str, Any]) -> SourceConnector:
+CONNECTOR_ENDPOINT_KEYS = {"jira": "base_url", "servicenow": "instance_url"}
+CONNECTOR_SECRET_SUFFIXES: dict[str, dict[str, str]] = {
+    "jira": {"api_token_env": "API_TOKEN"},
+    "servicenow": {"username_env": "USERNAME", "password_env": "PASSWORD"},
+    "slack": {"signing_secret_env": "SIGNING_SECRET"},
+}
+
+
+def _connector_secret_env_name(connector_type: str, key: str, tenant_key: str | None) -> str:
+    suffix = CONNECTOR_SECRET_SUFFIXES[connector_type][key]
+    if tenant_key is None:
+        scope = "CONNECTOR"
+    else:
+        tenant = tenant_key.upper().replace("-", "_")
+        if not re.fullmatch(r"[A-Z0-9_]{1,64}", tenant):
+            raise ValueError("Connector tenant key is invalid for credential lookup.")
+        scope = f"TENANT_{tenant}_CONNECTOR"
+    return f"FLOWOPS_{scope}_{connector_type.upper()}_{suffix}"
+
+
+def _normalise_host(host: str) -> str:
+    try:
+        normalized = host.encode("idna").decode("ascii").lower().rstrip(".")
+    except UnicodeError as error:
+        raise ValueError("Connector URL has an invalid host.") from error
+    label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    if len(normalized) > 253 or not re.fullmatch(rf"{label}(?:\.{label})*", normalized):
+        raise ValueError("Connector URL must use a valid host.")
+    return normalized
+
+
+def _allowed_connector_hosts(
+    tenant_key: str | None, environ: dict[str, str]
+) -> set[str]:
+    raw = environ.get("FLOWOPS_CONNECTOR_ALLOWED_HOSTS_JSON", "")
+    try:
+        configured = json.loads(raw or "{}")
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError("FLOWOPS_CONNECTOR_ALLOWED_HOSTS_JSON must be a JSON object.") from error
+    if not isinstance(configured, dict):
+        raise ValueError("FLOWOPS_CONNECTOR_ALLOWED_HOSTS_JSON must be a JSON object.")
+    scope = tenant_key if tenant_key is not None else "*"
+    hosts = configured.get(scope, [])
+    if not isinstance(hosts, list) or not all(isinstance(host, str) for host in hosts):
+        raise ValueError(f"No valid connector host allowlist is configured for {scope!r}.")
+    return {_normalise_host(host) for host in hosts}
+
+
+def validate_connector_config(
+    connector_type: str,
+    config: dict[str, Any],
+    *,
+    tenant_key: str | None = None,
+    environ: dict[str, str] | None = None,
+) -> None:
+    """Check server-controlled credential references and outbound host policy."""
+    values = environ if environ is not None else os.environ
+    for key in CONNECTOR_SECRET_SUFFIXES.get(connector_type, {}):
+        expected = _connector_secret_env_name(connector_type, key, tenant_key)
+        if config.get(key) != expected:
+            raise ValueError(
+                f"Connector credential reference {key!r} must use its server-managed variable."
+            )
+
+    endpoint_key = CONNECTOR_ENDPOINT_KEYS.get(connector_type)
+    if endpoint_key is None:
+        return
+    raw_url = config.get(endpoint_key)
+    if not isinstance(raw_url, str):
+        raise ValueError("Connector endpoint must be an HTTPS URL.")
+    try:
+        parsed = urlsplit(raw_url)
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("Connector endpoint must be a valid HTTPS URL.") from error
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("Connector endpoint must be an HTTPS URL without credentials, query, or fragment.")
+    host = _normalise_host(parsed.hostname)
+    if host not in _allowed_connector_hosts(tenant_key, values):
+        raise ValueError("Connector endpoint host is not approved for this tenant.")
+
+
+def build_connector(
+    connector_type: str, config: dict[str, Any], *, tenant_key: str | None = None
+) -> SourceConnector:
     """Instantiate a connector from its stored JSON configuration.
 
     Keys ending in ``_env`` name environment variables holding the secret;
@@ -349,6 +459,7 @@ def build_connector(connector_type: str, config: dict[str, Any]) -> SourceConnec
     missing = [k for k in required if not config.get(k)]
     if missing:
         raise ValueError(f"Connector {connector_type!r} missing config keys: {missing}")
+    validate_connector_config(connector_type, config, tenant_key=tenant_key)
     kwargs: dict[str, Any] = {}
     for key in required:
         if key.endswith("_env"):
@@ -697,6 +808,7 @@ def ingest_event(session: Session, event: NormalizedEvent) -> dict[str, Any]:
         fingerprint=fingerprint,
         payload_json=payload_json,
         tenant_key=event.tenant_key,
+        connector_id=event.connector_id,
     )
     session.add(row)
     session.flush()
@@ -863,22 +975,24 @@ def poll_all_connectors(
             if record is None or not record.enabled:
                 continue
             connector = build_connector(
-                record.connector_type, json.loads(record.config_json or "{}")
+                record.connector_type,
+                json.loads(record.config_json or "{}"),
+                tenant_key=record.tenant_key,
             )
             events = connector.fetch_events(session)
-            if record.tenant_key:
-                events = [
-                    NormalizedEvent(
-                        source=event.source,
-                        event_type=event.event_type,
-                        external_id=event.external_id,
-                        payload=event.payload,
-                        tenant_key=record.tenant_key,
-                        title=event.title,
-                        description=event.description,
-                    )
-                    for event in events
-                ]
+            events = [
+                NormalizedEvent(
+                    source=event.source,
+                    event_type=event.event_type,
+                    external_id=event.external_id,
+                    payload=event.payload,
+                    tenant_key=record.tenant_key or event.tenant_key,
+                    connector_id=record.id,
+                    title=event.title,
+                    description=event.description,
+                )
+                for event in events
+            ]
             summaries = ingest_events(session, events)
             ingested = sum(
                 1 for s in summaries if not s["duplicate"] and "error" not in s
