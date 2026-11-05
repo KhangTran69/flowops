@@ -179,22 +179,24 @@ def test_bad_rule_is_logged_and_never_breaks_ingestion(client):
     assert "trigger.rule_error" in actions or body["triggers_fired"] == []
 
 
-def test_connector_crud_and_webhook_sink(client):
+def test_connector_crud_and_webhook_sink(client, monkeypatch):
+    monkeypatch.setenv("FLOWOPS_CONNECTOR_ALLOWED_HOSTS_JSON", '{"*":["j.example"]}')
     created = client.post(
         "/connectors",
         json={"name": "Acme Jira", "connector_type": "jira",
               "config": {"base_url": "https://j.example", "email": "b@x",
-                         "api_token_env": "FLOWOPS_JIRA_TOKEN", "jql": "project=OPS"}},
+                         "api_token_env": "FLOWOPS_CONNECTOR_JIRA_API_TOKEN", "jql": "project=OPS"}},
         headers=ADMIN,
     )
     assert created.status_code == 201, created.text
     jira = created.json()
     assert jira["kind"] == "polling"
+    assert jira["config"]["api_token_env"] == "FLOWOPS_CONNECTOR_JIRA_API_TOKEN"
 
     slack = client.post(
         "/connectors",
         json={"name": "Ops Slack", "connector_type": "slack",
-              "config": {"signing_secret_env": "FLOWOPS_SLACK_SECRET"}},
+              "config": {"signing_secret_env": "FLOWOPS_CONNECTOR_SLACK_SIGNING_SECRET"}},
         headers=ADMIN,
     ).json()
     assert slack["kind"] == "webhook"
@@ -205,6 +207,26 @@ def test_connector_crud_and_webhook_sink(client):
         headers=ADMIN,
     )
     assert bad.status_code == 422
+
+    # Server-side policy rejects arbitrary credential references and hosts.
+    arbitrary_secret = client.post(
+        "/connectors",
+        json={"name": "Untrusted Jira", "connector_type": "jira",
+              "config": {"base_url": "https://j.example", "email": "b@x",
+                         "api_token_env": "FLOWOPS_JIRA_TOKEN", "jql": "project=OPS"}},
+        headers=ADMIN,
+    )
+    assert arbitrary_secret.status_code == 422
+    assert "server-managed" in arbitrary_secret.text
+    unapproved_host = client.post(
+        "/connectors",
+        json={"name": "Unapproved Jira", "connector_type": "jira",
+              "config": {"base_url": "https://other.example", "email": "b@x",
+                         "api_token_env": "FLOWOPS_CONNECTOR_JIRA_API_TOKEN", "jql": "project=OPS"}},
+        headers=ADMIN,
+    )
+    assert unapproved_host.status_code == 422
+    assert "not approved" in unapproved_host.text
 
     # Polling connectors reject pushed webhooks and vice versa.
     assert client.post(f"/connectors/{jira['id']}/webhook", json={}).status_code == 405
@@ -230,32 +252,36 @@ def test_connector_crud_and_webhook_sink(client):
 
 
 def test_build_connector_resolves_env_secrets(monkeypatch):
-    monkeypatch.setenv("FLOWOPS_JIRA_TOKEN", "tok")
+    monkeypatch.setenv("FLOWOPS_CONNECTOR_ALLOWED_HOSTS_JSON", '{"*":["j.example"]}')
+    monkeypatch.setenv("FLOWOPS_CONNECTOR_JIRA_API_TOKEN", "tok")
     connector = connectors.build_connector(
         "jira",
         {"base_url": "https://j.example", "email": "b@x",
-         "api_token_env": "FLOWOPS_JIRA_TOKEN", "jql": "p=1"},
+         "api_token_env": "FLOWOPS_CONNECTOR_JIRA_API_TOKEN", "jql": "p=1"},
     )
     assert isinstance(connector, connectors.JiraConnector)
     assert connector.api_token == "tok"
 
-    monkeypatch.delenv("FLOWOPS_JIRA_TOKEN", raising=False)
+    monkeypatch.delenv("FLOWOPS_CONNECTOR_JIRA_API_TOKEN", raising=False)
     with pytest.raises(ValueError, match="not set"):
         connectors.build_connector(
             "jira",
             {"base_url": "https://j.example", "email": "b@x",
-             "api_token_env": "FLOWOPS_JIRA_TOKEN", "jql": "p=1"},
+             "api_token_env": "FLOWOPS_CONNECTOR_JIRA_API_TOKEN", "jql": "p=1"},
         )
 
 
 def test_poll_all_connectors_survives_failures(client, monkeypatch):
-    client.post(
+    monkeypatch.setenv("FLOWOPS_CONNECTOR_ALLOWED_HOSTS_JSON", '{"*":["j.example"]}')
+    monkeypatch.delenv("FLOWOPS_CONNECTOR_JIRA_API_TOKEN", raising=False)
+    created = client.post(
         "/connectors",
         json={"name": "Dead Jira", "connector_type": "jira",
-              "config": {"base_url": "http://127.0.0.1:1", "email": "e",
-                         "api_token_env": "NOPE_ENV", "jql": "x"}},
+              "config": {"base_url": "https://j.example", "email": "e",
+                         "api_token_env": "FLOWOPS_CONNECTOR_JIRA_API_TOKEN", "jql": "x"}},
         headers=ADMIN,
     )
+    assert created.status_code == 201, created.text
     ingested = connectors.poll_all_connectors()
     assert ingested == 0
     with db.SessionLocal() as session:
