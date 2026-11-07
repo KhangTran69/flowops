@@ -95,6 +95,7 @@ def deliver_webhook(
     backoff_seconds: float = 0.5,
     sleep: Callable[[float], None] = time.sleep,
     pinned_ip: str | None = None,
+    allow_redirects: bool = True,
 ) -> DeliveryResult:
     """POST the payload to the webhook, retrying with exponential backoff.
 
@@ -119,8 +120,18 @@ def deliver_webhook(
     for attempt in range(1, max_attempts + 1):
         try:
             post = session.post if session is not None else requests.post
-            response = post(url, json=payload, timeout=timeout, allow_redirects=False)
-            if 300 <= response.status_code < 400:
+            response = post(
+                url,
+                json=payload,
+                timeout=timeout,
+                allow_redirects=allow_redirects,
+            )
+            status_code = getattr(response, "status_code", None)
+            if (
+                not allow_redirects
+                and isinstance(status_code, int)
+                and 300 <= status_code < 400
+            ):
                 raise requests.HTTPError(
                     "Webhook redirects are not allowed.", response=response
                 )

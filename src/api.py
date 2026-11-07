@@ -2585,9 +2585,12 @@ def retry_failed_notifications(
         payload = json.loads(record.payload_json)
         started = time.perf_counter()
         # One bounded retry per call; the operator can call again later.
-        delivery = deliver_outbox_notification(
-            record.url, payload, session, max_attempts=1
-        )
+        if payload.get("event") == "trigger.fired" and payload.get("tenant"):
+            delivery = deliver_outbox_notification(
+                record.url, payload, session, max_attempts=1
+            )
+        else:
+            delivery = deliver_webhook(record.url, payload, max_attempts=1)
         duration_ms = int((time.perf_counter() - started) * 1000)
         record.attempts += delivery.attempts
         if delivery.success:

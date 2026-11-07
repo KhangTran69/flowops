@@ -816,18 +816,19 @@ def _fire_notify(
         return FiredAction(
             rule.id, rule.name, rule.action_type, "no notify_url configured", ok=False
         )
-    try:
-        validate_notify_destination(url, event.tenant_key, session)
-    except ValueError as error:
-        db.log_execution(
-            session,
-            run_id=idem_key,
-            action="trigger.notify_failed",
-            status="failure",
-            detail=f"rule={rule.id}: {error}",
-            correlation_id=correlation,
-        )
-        return FiredAction(rule.id, rule.name, rule.action_type, str(error), ok=False)
+    if event.tenant_key is not None:
+        try:
+            validate_notify_destination(url, event.tenant_key, session)
+        except ValueError as error:
+            db.log_execution(
+                session,
+                run_id=idem_key,
+                action="trigger.notify_failed",
+                status="failure",
+                detail=f"rule={rule.id}: {error}",
+                correlation_id=correlation,
+            )
+            return FiredAction(rule.id, rule.name, rule.action_type, str(error), ok=False)
     payload = {
         "event": "trigger.fired",
         "rule_id": rule.id,
@@ -866,7 +867,7 @@ def deliver_outbox_notification(
     url: str, payload: dict[str, Any], session: Session, *, max_attempts: int = 1
 ):
     """Revalidate trigger destinations before each durable outbox delivery."""
-    if payload.get("event") == "trigger.fired":
+    if payload.get("event") == "trigger.fired" and payload.get("tenant"):
         from src.notify import DeliveryResult, deliver_webhook
 
         try:
@@ -879,6 +880,7 @@ def deliver_outbox_notification(
             payload,
             max_attempts=max_attempts,
             pinned_ip=resolved_ips[0],
+            allow_redirects=False,
         )
     from src.notify import deliver_webhook
 
