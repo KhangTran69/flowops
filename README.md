@@ -498,8 +498,19 @@ HTTPS. This is a prototype token-paste login, not full SSO or user management.
 
 Operator routes require `automation.operator` or `automation.admin`. Webhook
 routes require `X-API-Key` via `FLOWOPS_WEBHOOK_API_KEY` outside development.
-Production startup fails unless the key is configured with at least 32
-characters; local development may leave it empty.
+For `/events`, that installation-wide key accepts only unscoped events.
+Tenant-scoped event ingress must send `X-Tenant-Key` and the tenant-bound
+`FLOWOPS_TENANT_<CREDENTIAL_REF>_WEBHOOK_API_KEY`; the tenant key is resolved
+through the server's tenant registry and cannot be selected by the event body.
+Per-connector webhook requests use the same tenant-bound identity and must
+match the connector's tenant. Production startup requires the global key to
+contain at least 32 characters; tenant keys must also contain at least 32
+characters when used outside development.
+Tenant `notify` rules require an explicit exact-host policy in
+`FLOWOPS_TENANT_<CREDENTIAL_REF>_NOTIFY_ALLOWED_HOSTS` (comma-separated
+hostnames). Destinations must use HTTPS on port 443, contain no credentials,
+query, or fragment, resolve only to public addresses, and may not redirect.
+Missing policies fail closed.
 Configured workforce integration keys (`FLOWOPS_N8N_API_KEY` and
 `FLOWOPS_AUTOMATION_CALLBACK_SECRET`) must also contain at least 32 characters
 outside development. They may remain empty when the corresponding integration

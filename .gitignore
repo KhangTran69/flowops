@@ -8,6 +8,7 @@ __pycache__/
 # Environment variables
 .env
 .connector-secrets.env
+.tenant-webhook-secrets.env
 
 # Generated ticket output and local database
 data/*.json

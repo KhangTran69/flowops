@@ -408,7 +408,7 @@ def test_trigger_rules_are_tenant_fenced(fencing_client):
 
 
 def test_connectors_are_authenticated_tenant_scoped_and_stamp_webhook_events(
-    fencing_client,
+    fencing_client, monkeypatch,
 ):
     client, set_actor = fencing_client
     admin = lambda key: Actor(
@@ -421,6 +421,11 @@ def test_connectors_are_authenticated_tenant_scoped_and_stamp_webhook_events(
     assert client.get("/connectors").status_code == 403
 
     set_actor(admin("tenant-a"))
+    with db.SessionLocal() as session:
+        tenant = session.get(db.TenantRecord, "tenant-a")
+        tenant.credential_ref = "TENANT_A"
+        session.commit()
+    monkeypatch.setenv("FLOWOPS_TENANT_TENANT_A_WEBHOOK_API_KEY", "tenant-a-test-key")
     payload = {
         "name": "Tenant A webhook",
         "connector_type": "generic",
@@ -434,6 +439,7 @@ def test_connectors_are_authenticated_tenant_scoped_and_stamp_webhook_events(
     delivered = client.post(
         f"/connectors/{connector_id}/webhook",
         json={"type": "alert", "id": "tenant-event", "tenant": "tenant-b"},
+        headers={"X-Tenant-Key": "tenant-a", "X-API-Key": "tenant-a-test-key"},
     )
     assert delivered.status_code == 201, delivered.text
     session = db.SessionLocal()

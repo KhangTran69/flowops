@@ -75,16 +75,35 @@ replaced by underscores and the key uppercased:
   `FLOWOPS_TENANT_<KEY>_CONNECTOR_SERVICENOW_PASSWORD`
 - Slack: `FLOWOPS_TENANT_<KEY>_CONNECTOR_SLACK_SIGNING_SECRET`
 
+For tenant event ingress, set
+`FLOWOPS_TENANT_<CREDENTIAL_REF>_WEBHOOK_API_KEY` and send it with
+`X-Tenant-Key: <tenant-key>` to `/events`. Tenant identity comes from the
+server's active tenant record and its `credential_ref`; the global
+`FLOWOPS_WEBHOOK_API_KEY` is limited to unscoped events. The same identity
+must match a connector's tenant at
+`/connectors/{connector_id}/webhook`.
+
+Trigger `notify` rules require
+`FLOWOPS_TENANT_<CREDENTIAL_REF>_NOTIFY_ALLOWED_HOSTS`, a comma-separated
+list of exact hostnames (for example `hooks.example.com`). Missing or empty
+policies block delivery. Notify URLs must use HTTPS on port 443, have no user
+credentials, query, or fragment, resolve to public addresses, and redirects
+are rejected at delivery. Configure only webhook hosts approved for that
+tenant.
+
 Unbound, global connectors use `FLOWOPS_CONNECTOR_...` references. Connector
 config must name the exact reference for its type and tenant; it cannot select
 other application secrets.
 
 For Docker Compose, copy `.connector-secrets.env.example` to the ignored
-`.connector-secrets.env` and put the configured credential values there. Both
-Compose files pass this optional file only to `app` (manual polling and webhook
-signature checks) and `scheduler` (scheduled polling); workflow workers and
-other services do not receive these connector secrets. Keep the host allowlist
-in the normal Compose environment as `FLOWOPS_CONNECTOR_ALLOWED_HOSTS_JSON`.
+`.connector-secrets.env` and put the configured connector values there. Both
+Compose files pass this optional file only to `app` and `scheduler`. Put
+tenant webhook keys and notify host policies in the separate ignored
+`.tenant-webhook-secrets.env` (copy
+`.tenant-webhook-secrets.env.example`); Compose passes it only to `app` and
+`outbox`, which need the values for authentication and delivery validation.
+Keep the connector host allowlist in the normal Compose environment as
+`FLOWOPS_CONNECTOR_ALLOWED_HOSTS_JSON`.
 For non-Compose runs, export the same exact variable names to the process
 environment.
 

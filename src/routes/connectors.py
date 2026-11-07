@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from src import connectors as connector_lib
 from src import db
 from src.auth import Actor
-from src.deps import _admin_actor, _webhook_actor
+from src.deps import _admin_actor, _event_webhook_actor
 
 router = APIRouter(tags=["connectors"])
 
@@ -256,7 +256,7 @@ async def connector_webhook(
     connector_id: int,
     request: Request,
     session: Session = Depends(db.get_session),
-    actor_subject: str = Depends(_webhook_actor),
+    webhook_actor: Actor = Depends(_event_webhook_actor),
 ) -> dict[str, Any]:
     """Per-connector webhook sink for pushed (webhook-kind) sources.
 
@@ -267,6 +267,8 @@ async def connector_webhook(
 
     record = session.get(db.ConnectorRecord, connector_id)
     if record is None:
+        raise HTTPException(404, "Connector not found.")
+    if record.tenant_key != webhook_actor.tenant_key:
         raise HTTPException(404, "Connector not found.")
 
     # Delivery-mode check first (kind is stored on the record itself), so a
@@ -301,7 +303,9 @@ async def connector_webhook(
             event_type=event.event_type,
             external_id=event.external_id,
             payload=event.payload,
-            tenant_key=record.tenant_key or event.tenant_key,
+            # Connector identity is authoritative; never derive tenant scope
+            # from the webhook body, especially for a global connector.
+            tenant_key=record.tenant_key,
             connector_id=record.id,
             title=event.title,
             description=event.description,
@@ -360,13 +364,6 @@ def create_trigger_rule(
     actor: Actor = Depends(_admin_actor),
     session: Session = Depends(db.get_session),
 ) -> TriggerRuleOut:
-    connector_lib.validate_rule_shape(
-        payload.predicate,
-        payload.action_type,
-        payload.request_type,
-        payload.notify_url,
-        json.dumps(payload.static_inputs),
-    )
     actor_tenant = _actor_tenant(actor)
     if actor_tenant:
         if payload.tenant_key and payload.tenant_key != actor_tenant:
@@ -376,6 +373,15 @@ def create_trigger_rule(
         tenant = session.get(db.TenantRecord, payload.tenant_key)
         if tenant is None or not tenant.active:
             raise HTTPException(422, f"Unknown or inactive tenant: {payload.tenant_key}")
+    connector_lib.validate_rule_shape(
+        payload.predicate,
+        payload.action_type,
+        payload.request_type,
+        payload.notify_url,
+        json.dumps(payload.static_inputs),
+        tenant_key=payload.tenant_key,
+        session=session,
+    )
     duplicate = session.execute(
         select(db.TriggerRuleRecord).where(
             db.TriggerRuleRecord.name == payload.name,
@@ -435,6 +441,8 @@ def update_trigger_rule(
         payload.request_type,
         payload.notify_url,
         json.dumps(payload.static_inputs),
+        tenant_key=payload.tenant_key,
+        session=session,
     )
     record.name = payload.name
     record.tenant_key = payload.tenant_key
@@ -472,7 +480,7 @@ def delete_trigger_rule(
 @router.post("/events", status_code=201)
 async def ingest_events_api(
     request: Request,
-    actor_subject: str = Depends(_webhook_actor),
+    webhook_actor: Actor = Depends(_event_webhook_actor),
     session: Session = Depends(db.get_session),
 ) -> dict[str, Any]:
     """Ingest one canonical event, a list of them, or an envelope batch.
@@ -494,9 +502,25 @@ async def ingest_events_api(
         items = [payload]
     if items is None:
         raise HTTPException(422, "Provide {'events': [...]} or a single event object.")
-    events = [
-        _to_normalized(EventIn.model_validate(item)) for item in items[:100]
-    ]
+    events = []
+    for item in items[:100]:
+        parsed = EventIn.model_validate(item)
+        if parsed.tenant and parsed.tenant != webhook_actor.tenant_key:
+            raise HTTPException(403, "Event tenant does not match webhook identity.")
+        if webhook_actor.tenant_key is None and parsed.tenant:
+            raise HTTPException(403, "Global webhook credentials cannot submit tenant events.")
+        event = _to_normalized(parsed)
+        events.append(
+            connector_lib.NormalizedEvent(
+                source=event.source,
+                event_type=event.event_type,
+                external_id=event.external_id,
+                payload=event.payload,
+                tenant_key=webhook_actor.tenant_key,
+                title=event.title,
+                description=event.description,
+            )
+        )
     if not events:
         raise HTTPException(422, "No events in payload.")
     summaries = connector_lib.ingest_events(session, events)

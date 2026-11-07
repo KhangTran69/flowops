@@ -60,6 +60,8 @@ services:
     env_file:
       - path: ./.connector-secrets.env
         required: false
+      - path: ./.tenant-webhook-secrets.env
+        required: false
     ports:
       - "${FLOWOPS_BIND_ADDRESS:-127.0.0.1}:${FLOWOPS_APP_PORT:-8000}:8000"
     environment:
@@ -137,6 +139,9 @@ services:
     build: .
     restart: unless-stopped
     stop_grace_period: 15s
+    env_file:
+      - path: ./.tenant-webhook-secrets.env
+        required: false
     command: ["python", "-m", "src.outbox_worker", "--poll-interval", "2"]
     environment:
       <<: *flowops-env

@@ -36,9 +36,11 @@ Reliability invariants carried over from earlier milestones:
 """
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
+import socket
 import time
 import uuid
 from dataclasses import dataclass
@@ -505,6 +507,9 @@ def validate_rule_shape(
     request_type: Optional[str],
     notify_url: Optional[str],
     static_inputs_json: Optional[str],
+    *,
+    tenant_key: str | None = None,
+    session: Session | None = None,
 ) -> None:
     """Fail fast on rules that could never fire correctly (used by the API)."""
     try:
@@ -532,8 +537,79 @@ def validate_rule_shape(
     elif action_type == "notify":
         if not notify_url:
             raise HTTPException(422, "notify rules require a notify_url.")
+        if tenant_key and session is not None:
+            try:
+                validate_notify_destination(notify_url, tenant_key, session)
+            except ValueError as error:
+                raise HTTPException(422, str(error)) from error
     else:
         raise HTTPException(422, f"Unknown action_type: {action_type!r}")
+
+
+def validate_notify_destination(
+    url: str, tenant_key: str | None, session: Session
+) -> str:
+    """Validate static destination policy and return its normalized hostname."""
+    try:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("Notify URL is invalid.") from error
+    if (
+        parsed.scheme.lower() != "https"
+        or not host
+        or port not in (None, 443)
+        or parsed.username is not None
+        or parsed.password is not None
+        or "?" in url
+        or "#" in url
+    ):
+        raise ValueError("Notify URL must use HTTPS on port 443 without credentials, query, or fragment.")
+    if tenant_key:
+        tenant = session.get(db.TenantRecord, tenant_key)
+        if tenant is None or not tenant.active or not tenant.credential_ref:
+            raise ValueError("Notify destinations require an active tenant credential reference.")
+        reference = tenant.credential_ref
+        if not reference.isascii() or not reference.replace("_", "").isalnum():
+            raise ValueError("Tenant credential reference is invalid.")
+        configured = os.environ.get(
+            f"FLOWOPS_TENANT_{reference.upper()}_NOTIFY_ALLOWED_HOSTS", ""
+        )
+        allowed_hosts = {
+            allowed.strip().lower().rstrip(".")
+            for allowed in configured.split(",")
+            if allowed.strip()
+        }
+        if not allowed_hosts:
+            raise ValueError(
+                f"No notify destination hosts are configured for tenant {tenant_key!r}."
+            )
+        if host not in allowed_hosts:
+            raise ValueError("Notify URL host is not allowlisted for this tenant.")
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+        raise ValueError("Private notify destinations are not allowed.")
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None and not literal.is_global:
+        raise ValueError("Private notify destinations are not allowed.")
+    return host
+
+
+def _resolve_public_notify_addresses(host: str) -> list[str]:
+    """Resolve immediately before delivery and retain only public destinations."""
+    try:
+        addresses = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    except OSError as error:
+        raise ValueError("Notify destination host could not be resolved.") from error
+    resolved_ips = list(dict.fromkeys(item[4][0] for item in addresses))
+    if not resolved_ips or any(
+        not ipaddress.ip_address(address).is_global for address in resolved_ips
+    ):
+        raise ValueError("Private notify destinations are not allowed.")
+    return resolved_ips
 
 
 def _rule_allows_tenant(
@@ -740,6 +816,19 @@ def _fire_notify(
         return FiredAction(
             rule.id, rule.name, rule.action_type, "no notify_url configured", ok=False
         )
+    if event.tenant_key is not None:
+        try:
+            validate_notify_destination(url, event.tenant_key, session)
+        except ValueError as error:
+            db.log_execution(
+                session,
+                run_id=idem_key,
+                action="trigger.notify_failed",
+                status="failure",
+                detail=f"rule={rule.id}: {error}",
+                correlation_id=correlation,
+            )
+            return FiredAction(rule.id, rule.name, rule.action_type, str(error), ok=False)
     payload = {
         "event": "trigger.fired",
         "rule_id": rule.id,
@@ -772,6 +861,30 @@ def _fire_notify(
     return FiredAction(
         rule.id, rule.name, rule.action_type, "queued outbox notification", ok=True
     )
+
+
+def deliver_outbox_notification(
+    url: str, payload: dict[str, Any], session: Session, *, max_attempts: int = 1
+):
+    """Revalidate trigger destinations before each durable outbox delivery."""
+    if payload.get("event") == "trigger.fired" and payload.get("tenant"):
+        from src.notify import DeliveryResult, deliver_webhook
+
+        try:
+            host = validate_notify_destination(url, payload.get("tenant"), session)
+            resolved_ips = _resolve_public_notify_addresses(host)
+        except ValueError as error:
+            return DeliveryResult(success=False, attempts=1, last_error=str(error))
+        return deliver_webhook(
+            url,
+            payload,
+            max_attempts=max_attempts,
+            pinned_ip=resolved_ips[0],
+            allow_redirects=False,
+        )
+    from src.notify import deliver_webhook
+
+    return deliver_webhook(url, payload, max_attempts=max_attempts)
 
 
 # ---------------------------------------------------------------------------

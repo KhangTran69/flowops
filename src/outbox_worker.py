@@ -17,6 +17,7 @@ import uuid
 from typing import Optional
 
 from src import db, idempotency, outbox
+from src.connectors import deliver_outbox_notification
 from src.notify import deliver_webhook
 
 
@@ -60,7 +61,12 @@ def run_once(
             return None
         payload = json.loads(record.payload_json)
         started = time.perf_counter()
-        delivery = deliver_webhook(record.url, payload, max_attempts=1)
+        if payload.get("event") == "trigger.fired" and payload.get("tenant"):
+            delivery = deliver_outbox_notification(
+                record.url, payload, session, max_attempts=1
+            )
+        else:
+            delivery = deliver_webhook(record.url, payload, max_attempts=1)
         duration_ms = int((time.perf_counter() - started) * 1000)
         resulting = outbox.finalize_delivery(
             session,

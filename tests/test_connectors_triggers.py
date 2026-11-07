@@ -302,25 +302,35 @@ def test_connector_due_normalizes_naive_time_and_bad_backoff_state():
     assert connectors.connector_due(record, datetime.now()) is True
 
 
-def test_tenant_scoped_rules_only_fire_for_their_tenant(client):
+def test_tenant_scoped_rules_only_fire_for_their_tenant(client, monkeypatch):
     # Tenants must exist before a tenant-scoped rule can be created.
     with db.SessionLocal() as session:
-        session.add(db.TenantRecord(key="acme", name="Acme"))
-        session.add(db.TenantRecord(key="globex", name="Globex"))
+        session.add(db.TenantRecord(key="acme", name="Acme", credential_ref="ACME"))
+        session.add(db.TenantRecord(key="globex", name="Globex", credential_ref="GLOBEX"))
         session.commit()
+    monkeypatch.setenv("FLOWOPS_TENANT_ACME_WEBHOOK_API_KEY", "acme-test-key")
+    monkeypatch.setenv("FLOWOPS_TENANT_GLOBEX_WEBHOOK_API_KEY", "globex-test-key")
+    monkeypatch.setenv("FLOWOPS_TENANT_ACME_NOTIFY_ALLOWED_HOSTS", "hooks.acme.example")
     _make_rule(
-        client, name="acme-only", tenant_key="acme", event_type="*", predicate="1 == 1"
+        client,
+        name="acme-only",
+        tenant_key="acme",
+        event_type="*",
+        predicate="1 == 1",
+        notify_url="https://hooks.acme.example/trigger-hook",
     )
 
     other = client.post(
         "/events",
         json={"source": "generic", "type": "x", "id": "T-1", "tenant": "globex"},
+        headers={"X-Tenant-Key": "globex", "X-API-Key": "globex-test-key"},
     ).json()["results"][0]
     assert other["triggers_fired"] == []
 
     mine = client.post(
         "/events",
         json={"source": "generic", "type": "x", "id": "T-2", "tenant": "acme"},
+        headers={"X-Tenant-Key": "acme", "X-API-Key": "acme-test-key"},
     ).json()["results"][0]
     assert len(mine["triggers_fired"]) == 1
 
