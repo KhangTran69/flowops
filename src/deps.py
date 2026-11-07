@@ -10,7 +10,7 @@ from typing import Optional
 
 from fastapi import Depends, Header, HTTPException, Request
 
-from src import ui_session
+from src import db, ui_session
 from src.auth import (
     AuthenticationError,
     Actor,
@@ -128,6 +128,57 @@ def _webhook_actor(
         raise HTTPException(status_code=401, detail="Invalid webhook API key.")
     _enforce_rate_limit("webhook:intake")
     return "webhook-api-key" if expected else "local-development"
+
+
+def _event_webhook_actor(
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    x_tenant_key: Optional[str] = Header(default=None, alias="X-Tenant-Key"),
+    session=Depends(db.get_session),
+) -> Actor:
+    """Authenticate event ingress as either global or a tenant-bound identity."""
+    environment = os.environ.get("FLOWOPS_ENVIRONMENT", "development").strip().lower()
+    if x_tenant_key:
+        tenant = session.get(db.TenantRecord, x_tenant_key)
+        if tenant is None or not tenant.active or not tenant.credential_ref:
+            raise HTTPException(status_code=401, detail="Invalid tenant webhook identity.")
+        reference = tenant.credential_ref
+        if not reference.isascii() or not reference.replace("_", "").isalnum():
+            raise HTTPException(status_code=503, detail="Tenant webhook credentials are not configured safely.")
+        expected = os.environ.get(f"FLOWOPS_TENANT_{reference.upper()}_WEBHOOK_API_KEY", "")
+        if not expected or (environment != "development" and len(expected) < 32):
+            raise HTTPException(status_code=503, detail="Tenant webhook authentication is not configured.")
+        if not secrets.compare_digest(x_api_key or "", expected):
+            raise HTTPException(status_code=401, detail="Invalid tenant webhook API key.")
+        if secrets.compare_digest(
+            expected, os.environ.get("FLOWOPS_WEBHOOK_API_KEY", "")
+        ):
+            raise HTTPException(status_code=503, detail="Tenant webhook key must be distinct from the global key.")
+        for other in session.query(db.TenantRecord).filter(
+            db.TenantRecord.active.is_(True)
+        ):
+            if other.key == tenant.key or not other.credential_ref:
+                continue
+            other_key = os.environ.get(
+                f"FLOWOPS_TENANT_{other.credential_ref.upper()}_WEBHOOK_API_KEY", ""
+            )
+            if other_key and secrets.compare_digest(expected, other_key):
+                raise HTTPException(status_code=503, detail="Tenant webhook keys must be unique per tenant.")
+        subject = f"tenant-webhook:{tenant.key}"
+        _enforce_rate_limit(f"webhook:{subject}")
+        return Actor(subject=subject, roles=("automation.operator",), source="webhook", tenant_key=tenant.key)
+
+    expected = os.environ.get("FLOWOPS_WEBHOOK_API_KEY", "")
+    if not expected and environment != "development":
+        raise HTTPException(status_code=503, detail="Webhook authentication is not configured.")
+    if expected and environment != "development" and len(expected) < 32:
+        raise HTTPException(status_code=503, detail="Webhook authentication is not securely configured.")
+    if expected and not secrets.compare_digest(x_api_key or "", expected):
+        raise HTTPException(status_code=401, detail="Invalid webhook API key.")
+    if not expected and x_api_key:
+        raise HTTPException(status_code=401, detail="Invalid webhook API key.")
+    _enforce_rate_limit("webhook:events:global")
+    return Actor(subject="webhook-api-key" if expected else "local-development",
+                 roles=("automation.operator", "automation.admin"), source="webhook")
 
 
 def validate_webhook_configuration(environ: Optional[dict[str, str]] = None) -> None:

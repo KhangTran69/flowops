@@ -28,6 +28,12 @@ Bulk payloads use the same item shape:
 Configure `FLOWOPS_WEBHOOK_API_KEY` when the inbound endpoint must require an
 API key. See the API implementation in [`src/api.py`](../../src/api.py).
 
+For tenant-scoped `/events` ingestion, use that tenant's
+`FLOWOPS_TENANT_<CREDENTIAL_REF>_WEBHOOK_API_KEY` with both `X-API-Key` and
+`X-Tenant-Key` headers. The shared key is accepted only for unscoped events.
+Per-connector webhook calls must use credentials bound to the connector's
+tenant.
+
 ## Outbound automation
 
 Set `FLOWOPS_ACTION_ADAPTER=webhook` and configure:

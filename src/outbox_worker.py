@@ -17,7 +17,7 @@ import uuid
 from typing import Optional
 
 from src import db, idempotency, outbox
-from src.notify import deliver_webhook
+from src.connectors import deliver_outbox_notification
 
 
 def _new_run_id() -> str:
@@ -60,7 +60,9 @@ def run_once(
             return None
         payload = json.loads(record.payload_json)
         started = time.perf_counter()
-        delivery = deliver_webhook(record.url, payload, max_attempts=1)
+        delivery = deliver_outbox_notification(
+            record.url, payload, session, max_attempts=1
+        )
         duration_ms = int((time.perf_counter() - started) * 1000)
         resulting = outbox.finalize_delivery(
             session,

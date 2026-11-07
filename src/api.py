@@ -30,6 +30,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src import ai_agent, chatops, db, definitions, idempotency, jobs, logging_config, metrics, scheduler, timers, ui_session, web, workflow, workflow_control
+from src.connectors import deliver_outbox_notification
 from src.actions import (
     ActionAdapter,
     ActionError,
@@ -2584,7 +2585,9 @@ def retry_failed_notifications(
         payload = json.loads(record.payload_json)
         started = time.perf_counter()
         # One bounded retry per call; the operator can call again later.
-        delivery = deliver_webhook(record.url, payload, max_attempts=1)
+        delivery = deliver_outbox_notification(
+            record.url, payload, session, max_attempts=1
+        )
         duration_ms = int((time.perf_counter() - started) * 1000)
         record.attempts += delivery.attempts
         if delivery.success:

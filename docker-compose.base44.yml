@@ -48,6 +48,8 @@ services:
     env_file:
       - path: ./.connector-secrets.env
         required: false
+      - path: ./.tenant-webhook-secrets.env
+        required: false
     ports:
       - "127.0.0.1:3000:8000"
     environment:
@@ -139,6 +141,9 @@ services:
     image: python:3.13-slim
     restart: on-failure
     stop_grace_period: 15s
+    env_file:
+      - path: ./.tenant-webhook-secrets.env
+        required: false
     environment:
       <<: *flowops-env
       FLOWOPS_RUN_MIGRATIONS: "false"
