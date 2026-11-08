@@ -41,6 +41,18 @@ New regression tests: `tests/test_tenant_fencing_api.py`
 `tests/test_worker_recovery.py` (crashed-lease takeover, stale-worker fencing,
 retry budget after recovery).
 
+### Review map for the covered surfaces
+
+| Change area | Owning code | Focused evidence |
+|---|---|---|
+| Ticket tenant reads and creation | [`src/api.py`](../src/api.py) | [tenant reads](../tests/test_tenant_fencing_api.py#L48), [foreign-ID denial](../tests/test_tenant_fencing_api.py#L93), and [tenant stamping](../tests/test_tenant_fencing_api.py#L129) |
+| Onboarding requests and request-owned workflow runs/jobs | [`src/api.py`](../src/api.py), [`src/jobs.py`](../src/jobs.py) | [run/job fencing](../tests/test_tenant_fencing_api.py#L181) and [onboarding scope](../tests/test_tenant_fencing_api.py#L305) |
+| PSA sync and tenant-bound ChatOps links | [`src/routes/tenants.py`](../src/routes/tenants.py), [`src/chatops.py`](../src/chatops.py), [`src/api.py`](../src/api.py) | [PSA sync scope](../tests/test_tenant_fencing_api.py#L280) and [ChatOps tenant binding](../tests/test_tenant_fencing_api.py#L324) |
+| Connector and trigger-rule tenant scope | [`src/routes/connectors.py`](../src/routes/connectors.py), [`src/routes/triggers.py`](../src/routes/triggers.py), [`src/connectors.py`](../src/connectors.py) | [trigger rules](../tests/test_tenant_fencing_api.py#L365), [connector operations](../tests/test_tenant_fencing_api.py#L410), and [tenant-scoped polling](../tests/test_tenant_fencing_api.py#L467) |
+| Worker lease takeover and stale-owner rejection | [`src/jobs.py`](../src/jobs.py), [`src/scheduler.py`](../src/scheduler.py), [`src/workforce_worker.py`](../src/workforce_worker.py) | [recovery after expiry](../tests/test_worker_recovery.py#L54), [stale worker rejection](../tests/test_worker_recovery.py#L91), and [retry after recovery](../tests/test_worker_recovery.py#L129) |
+
+This map covers the closed surfaces above. The documented open surfaces below still need their own endpoint-by-endpoint review; passing these focused tests does not establish tenant isolation for them. `tests/test_tenant_fencing_api.py::test_local_actor_stays_global` also records the deliberate local-development behavior.
+
 ### Documented-but-open (deliberately not changed here)
 
 1. Workflow runs and jobs have no `tenant_key` column. The follow-up API fix
