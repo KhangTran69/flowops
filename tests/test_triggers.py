@@ -42,7 +42,7 @@ def _create_event_source(session, key=None):
     source = db.EventSourceRecord(
         key=key,
         name="Test Source",
-        secret="test-secret-key-12345",
+        secret="test-secret-key-12345-test-secret-key-67890",
         active=True,
         created_at=db.utcnow(),
     )
@@ -164,7 +164,7 @@ def test_mapping_validation_rejects_eval(session):
 
 def test_signature_verification_valid():
     """Valid signature passes verification."""
-    secret = "test-secret"
+    secret = "test-secret-key-12345-test-secret-key-67890"
     payload = b'{"test": "data"}'
     timestamp = int(time.time())
     signature = hmac.new(
@@ -177,7 +177,7 @@ def test_signature_verification_valid():
 
 def test_signature_verification_invalid():
     """Invalid signature fails verification."""
-    secret = "test-secret"
+    secret = "test-secret-key-12345-test-secret-key-67890"
     payload = b'{"test": "data"}'
     timestamp = int(time.time())
     assert not triggers.verify_signature(payload, "sha256=wrong", secret, timestamp)
@@ -185,7 +185,7 @@ def test_signature_verification_invalid():
 
 def test_signature_verification_expired_timestamp():
     """Expired timestamp fails verification."""
-    secret = "test-secret"
+    secret = "test-secret-key-12345-test-secret-key-67890"
     payload = b'{"test": "data"}'
     old_timestamp = int(time.time()) - 400  # > 5 minutes
     signature = hmac.new(
@@ -298,7 +298,7 @@ def test_webhook_endpoint_valid_signature(client, session):
     definition = _create_definition(session)
     trigger = _create_trigger(session, source_key=source.key, definition_key=definition.key)
 
-    secret = "test-secret-key-12345"
+    secret = "test-secret-key-12345-test-secret-key-67890"
     payload_str = '{"event_id":"evt-123","data":{"name":"Alice","email":"alice@example.com","department":"IT"}}'
     timestamp = int(time.time())
     signature = hmac.new(
@@ -343,7 +343,7 @@ def test_webhook_endpoint_replay_returns_previous(client, session):
     definition = _create_definition(session)
     trigger = _create_trigger(session, source_key=source.key, definition_key=definition.key)
 
-    secret = "test-secret-key-12345"
+    secret = "test-secret-key-12345-test-secret-key-67890"
     payload_str = '{"event_id":"evt-123","data":{"name":"Alice"}}'
     timestamp = int(time.time())
     signature = hmac.new(
@@ -549,7 +549,8 @@ def test_event_source_crud_api(client, session):
         json={
             "key": "api-source",
             "name": "API Source",
-            "secret": "api-secret-123",
+            "secret": "api-secret-123-32-byte-test-secret-value",
+            "global_scope": True,
         },
     )
     assert create_resp.status_code == 201

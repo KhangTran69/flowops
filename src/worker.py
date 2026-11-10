@@ -323,6 +323,14 @@ def _complete_trigger_job(
     trigger = session.get(db.TriggerRecord, trigger_key)
     if trigger is None:
         raise _PermanentJobError("Trigger not found.")
+    source = session.get(db.EventSourceRecord, trigger.source_key)
+    if source is None:
+        raise _PermanentJobError("Trigger event source not found.")
+    tenant_key = source.tenant_key
+    if tenant_key is not None:
+        tenant = session.get(db.TenantRecord, tenant_key)
+        if tenant is None or not tenant.active:
+            raise _PermanentJobError("Trigger tenant is missing or inactive.")
 
     try:
         mapped = triggers.apply_mapping(
@@ -357,6 +365,7 @@ def _complete_trigger_job(
             priority=normalized.priority,
             category=category,
             queue=queue,
+            tenant_key=tenant_key,
         )
         session.add(ticket)
         request_id = ticket_id
@@ -378,6 +387,7 @@ def _complete_trigger_job(
             start_date=mapped.get("start_date"),
             definition_key=definition.key,
             definition_version=version.version,
+            tenant_key=tenant_key,
         )
         session.add(record)
         session.flush()

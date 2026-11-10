@@ -270,6 +270,8 @@ async def connector_webhook(
         raise HTTPException(404, "Connector not found.")
     if record.tenant_key != webhook_actor.tenant_key:
         raise HTTPException(404, "Connector not found.")
+    if not record.enabled:
+        raise HTTPException(404, "Connector not found.")
 
     # Delivery-mode check first (kind is stored on the record itself), so a
     # polled connector answers 405 even when its secrets are unavailable.

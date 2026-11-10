@@ -62,6 +62,7 @@ TRIGGER_SCOPE_FIELDS = ("key", "name", "source_key", "event_type")
 MAX_MAPPING_DEPTH = 16
 MAX_MAPPING_NODES = 1000
 MAX_EVENT_ID_LENGTH = 128
+MIN_WEBHOOK_SECRET_BYTES = 32
 _DANGEROUS_WORDS = re.compile(r"\b(import|exec|eval|compile)\b|__", re.IGNORECASE)
 
 
@@ -195,6 +196,14 @@ def verify_signature(
     """
     now = int(time.time())
     if abs(now - timestamp) > 300:  # 5 minutes
+        return False
+
+    if (
+        not isinstance(secret, str)
+        or len(secret.encode("utf-8")) < MIN_WEBHOOK_SECRET_BYTES
+        or not secret.strip()
+        or secret != secret.strip()
+    ):
         return False
 
     if not isinstance(signature, str) or not signature.startswith("sha256="):
