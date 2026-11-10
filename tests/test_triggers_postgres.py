@@ -33,7 +33,7 @@ def _create_event_source(session, key="pg-test-source"):
     source = db.EventSourceRecord(
         key=key,
         name="PG Test Source",
-        secret="pg-secret-key-12345",
+        secret="pg-secret-key-12345-test-secret-key-67890",
         active=True,
         created_at=db.utcnow(),
     )

@@ -2,7 +2,9 @@
 
 How FlowOps connects to the systems an MSP automation team uses. Each
 integration runs offline in tests (mocked HTTP) and needs real credentials
-only in deployment. No secret is stored in the database or the repo.
+only in deployment. Most provider credentials stay in environment settings;
+legacy event-source HMAC secrets are stored in the database and never
+returned by the API.
 
 ## Microsoft Graph (`src/graph.py`, `src/actions.py`)
 
@@ -94,6 +96,32 @@ tenant.
 Unbound, global connectors use `FLOWOPS_CONNECTOR_...` references. Connector
 config must name the exact reference for its type and tenant; it cannot select
 other application secrets.
+
+## Legacy event-source webhooks (`/event-sources`, `/triggers`)
+
+Create source secrets with at least 32 UTF-8 bytes of randomness (for example,
+`python -c 'import secrets; print(secrets.token_urlsafe(32))'`). The secret is
+never returned by the API. `POST /event-sources` accepts an optional
+`tenant_key`; set it for tenant-owned sources. Creating an unscoped source
+requires the explicit `global_scope: true` option and should be reserved for
+trusted central services. Global-admin-only
+`PATCH /event-sources/{key}` can rotate a secret, set or clear the tenant scope,
+or deactivate a source without triggers. A source's tenant scope becomes fixed
+when a trigger uses it. To move an existing global source with triggers to a
+tenant, create a tenant-scoped replacement source and replacement triggers,
+then deactivate the old source and triggers. Existing sources remain global
+until an operator migrates or deactivates them; their tenant ownership cannot
+be inferred automatically.
+
+Webhook bodies must be at most 1 MiB and include an `event_id` in the signed
+JSON object. Sign the exact body bytes as
+`HMAC-SHA256(secret, unix_timestamp + "." + raw_body)` and send the lowercase
+hex digest as `X-FlowOps-Signature: sha256=<digest>` with
+`X-FlowOps-Timestamp: <unix_timestamp>`. An optional `X-FlowOps-Event-ID`
+header must exactly match the signed body's `event_id`; it is not an
+alternative source for the ID. Requests with timestamps outside the five-minute
+window, invalid signatures, or short source secrets are rejected. Work created
+by a tenant-scoped source inherits its tenant key.
 
 For Docker Compose, copy `.connector-secrets.env.example` to the ignored
 `.connector-secrets.env` and put the configured connector values there. Both

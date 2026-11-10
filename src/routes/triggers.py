@@ -18,11 +18,44 @@ from src.auth import Actor
 from src.deps import _global_admin_actor, _new_run_id
 
 router = APIRouter(tags=["triggers"])
+MAX_TRIGGER_WEBHOOK_BYTES = 1_048_576
 
 class EventSourceCreateIn(BaseModel):
     key: StrictStr = Field(description="Unique identifier for the source.")
     name: StrictStr = Field(description="Human-readable name.")
-    secret: StrictStr = Field(description="Shared secret for HMAC signature verification.")
+    secret: StrictStr = Field(
+        min_length=triggers.MIN_WEBHOOK_SECRET_BYTES,
+        max_length=128,
+        description="Random shared secret for HMAC signature verification (at least 32 bytes).",
+    )
+    tenant_key: Optional[StrictStr] = Field(default=None, max_length=64)
+    global_scope: StrictBool = False
+
+    @field_validator("secret")
+    @classmethod
+    def valid_secret(cls, value: str) -> str:
+        if len(value.encode("utf-8")) < triggers.MIN_WEBHOOK_SECRET_BYTES:
+            raise ValueError("secret must contain at least 32 UTF-8 bytes")
+        if value != value.strip():
+            raise ValueError("secret must not have leading or trailing whitespace")
+        return value
+
+
+class EventSourceUpdateIn(BaseModel):
+    secret: Optional[StrictStr] = Field(default=None, min_length=32, max_length=128)
+    tenant_key: Optional[StrictStr] = Field(default=None, max_length=64)
+    active: Optional[StrictBool] = None
+
+    @field_validator("secret")
+    @classmethod
+    def valid_secret(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        if len(value.encode("utf-8")) < triggers.MIN_WEBHOOK_SECRET_BYTES:
+            raise ValueError("secret must contain at least 32 UTF-8 bytes")
+        if value != value.strip():
+            raise ValueError("secret must not have leading or trailing whitespace")
+        return value
 
 
 class EventSourceOut(BaseModel):
@@ -30,6 +63,15 @@ class EventSourceOut(BaseModel):
     name: str
     active: bool
     created_at: datetime
+    tenant_key: Optional[str] = None
+
+
+def _validate_source_tenant(session: Session, tenant_key: Optional[str]) -> None:
+    if tenant_key is None:
+        return
+    tenant = session.get(db.TenantRecord, tenant_key)
+    if tenant is None or not tenant.active:
+        raise HTTPException(status_code=404, detail="Active tenant not found.")
 
 
 @router.get("/event-sources", response_model=list[EventSourceOut])
@@ -42,6 +84,7 @@ def list_event_sources(
         EventSourceOut(
             key=s.key,
             name=s.name,
+            tenant_key=s.tenant_key,
             active=s.active,
             created_at=s.created_at,
         )
@@ -57,10 +100,22 @@ def create_event_source(
 ) -> EventSourceOut:
     if session.get(db.EventSourceRecord, payload.key):
         raise HTTPException(status_code=409, detail="Event source key already exists.")
+    if payload.tenant_key is None and not payload.global_scope:
+        raise HTTPException(
+            status_code=422,
+            detail="Set tenant_key or explicitly opt into global_scope.",
+        )
+    if payload.tenant_key is not None and payload.global_scope:
+        raise HTTPException(
+            status_code=422,
+            detail="A source cannot be both tenant-scoped and global.",
+        )
+    _validate_source_tenant(session, payload.tenant_key)
     source = db.EventSourceRecord(
         key=payload.key,
         name=payload.name,
         secret=payload.secret,
+        tenant_key=payload.tenant_key,
         active=True,
         created_at=db.utcnow(),
     )
@@ -73,13 +128,70 @@ def create_event_source(
         status="success",
         ticket_id=None,
         duration_ms=0,
-        detail=f"key={payload.key}",
+        detail=f"key={payload.key}, tenant_key={payload.tenant_key or 'global'}",
         actor_subject=actor.subject,
     )
     session.commit()
     return EventSourceOut(
         key=source.key,
         name=source.name,
+        tenant_key=source.tenant_key,
+        active=source.active,
+        created_at=source.created_at,
+    )
+
+
+@router.patch("/event-sources/{key}", response_model=EventSourceOut)
+def update_event_source(
+    key: str,
+    payload: EventSourceUpdateIn,
+    actor: Actor = Depends(_global_admin_actor),
+    session: Session = Depends(db.get_session),
+) -> EventSourceOut:
+    source = session.get(db.EventSourceRecord, key)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Event source not found.")
+    if not payload.model_fields_set:
+        raise HTTPException(status_code=422, detail="At least one source field is required.")
+    if "tenant_key" in payload.model_fields_set:
+        if payload.tenant_key != source.tenant_key:
+            existing_trigger = session.execute(
+                select(db.TriggerRecord.key)
+                .where(db.TriggerRecord.source_key == key)
+                .limit(1)
+            ).first()
+            if existing_trigger is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Tenant scope cannot change after triggers use this source; "
+                        "create a replacement source and triggers."
+                    ),
+                )
+        _validate_source_tenant(session, payload.tenant_key)
+        source.tenant_key = payload.tenant_key
+    if payload.secret is not None:
+        source.secret = payload.secret
+    if payload.active is not None:
+        source.active = payload.active
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="event_source.updated",
+        status="success",
+        ticket_id=None,
+        duration_ms=0,
+        detail=(
+            f"key={key}, tenant_key={source.tenant_key or 'global'}, "
+            f"fields={','.join(sorted(payload.model_fields_set))}"
+        ),
+        actor_subject=actor.subject,
+    )
+    session.commit()
+    return EventSourceOut(
+        key=source.key,
+        name=source.name,
+        tenant_key=source.tenant_key,
         active=source.active,
         created_at=source.created_at,
     )
@@ -148,8 +260,24 @@ class TriggerDeliveryOut(BaseModel):
 
 
 async def _read_raw_body(request: Request) -> bytes:
-    """Read the exact webhook bytes on the ASGI event loop."""
-    return await request.body()
+    """Read bounded webhook bytes without buffering an untrusted full body."""
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length.") from error
+        if declared_length < 0:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length.")
+        if declared_length > MAX_TRIGGER_WEBHOOK_BYTES:
+            raise HTTPException(status_code=413, detail="Webhook body exceeds the 1 MiB limit.")
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > MAX_TRIGGER_WEBHOOK_BYTES:
+            raise HTTPException(status_code=413, detail="Webhook body exceeds the 1 MiB limit.")
+        body.extend(chunk)
+    return bytes(body)
 
 
 @router.post("/webhooks/triggers/{trigger_key}")
@@ -167,7 +295,7 @@ def trigger_webhook(
     Headers:
     * X-FlowOps-Timestamp: Unix seconds
     * X-FlowOps-Signature: sha256=<hex HMAC>
-    * X-FlowOps-Event-ID: Optional event ID (can also be in body)
+    * X-FlowOps-Event-ID: Optional mirror of the signed body's event_id
 
     HMAC input: timestamp + "." + raw request body.
     """
@@ -178,6 +306,10 @@ def trigger_webhook(
     source = session.get(db.EventSourceRecord, trigger.source_key)
     if source is None or not source.active:
         raise HTTPException(status_code=404, detail="Event source not found or inactive.")
+    if source.tenant_key is not None:
+        tenant = session.get(db.TenantRecord, source.tenant_key)
+        if tenant is None or not tenant.active:
+            raise HTTPException(status_code=404, detail="Event source not found or inactive.")
 
     # Parse timestamp
     try:
@@ -197,15 +329,18 @@ def trigger_webhook(
     if not isinstance(payload, dict):
         raise HTTPException(status_code=422, detail="Webhook payload must be a JSON object.")
 
-    # Extract event ID from header or body
-    event_id = x_flowops_event_id or payload.get("event_id")
+    # The event ID must be in the signed body. A header may mirror it for
+    # compatibility, but it cannot override the value covered by the HMAC.
+    event_id = payload.get("event_id")
     if not event_id:
-        raise HTTPException(status_code=422, detail="Event ID is required (header or body field).")
+        raise HTTPException(status_code=422, detail="Event ID is required in the signed body.")
     if not isinstance(event_id, str) or len(event_id) > triggers.MAX_EVENT_ID_LENGTH:
         raise HTTPException(
             status_code=422,
             detail=f"Event ID must be a string of at most {triggers.MAX_EVENT_ID_LENGTH} characters.",
         )
+    if x_flowops_event_id is not None and x_flowops_event_id != event_id:
+        raise HTTPException(status_code=422, detail="Event ID header must match the signed body.")
 
     # Check for replay
     existing = session.execute(
@@ -302,6 +437,10 @@ def create_trigger(
 ) -> TriggerOut:
     if session.get(db.TriggerRecord, payload.key):
         raise HTTPException(status_code=409, detail="Trigger key already exists.")
+    source = session.get(db.EventSourceRecord, payload.source_key)
+    if source is None or not source.active:
+        raise HTTPException(status_code=404, detail="Event source not found.")
+    _validate_source_tenant(session, source.tenant_key)
     if payload.target_type in ("onboarding_request", "offboarding_request") and not payload.definition_key:
         raise HTTPException(status_code=422, detail="definition_key is required for onboarding/offboarding targets.")
     if payload.definition_key:

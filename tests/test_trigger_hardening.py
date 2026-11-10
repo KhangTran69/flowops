@@ -18,7 +18,7 @@ from sqlalchemy import select
 
 from src import api, db, jobs, triggers, worker
 
-SECRET = "whsec-LEAKCANARY-7f3a9c1e5b"
+SECRET = "whsec-LEAKCANARY-7f3a9c1e5b-32-byte-test-secret"
 PG_URL = os.environ.get("FLOWOPS_TEST_POSTGRES_URL")
 
 BACKENDS = ["sqlite"] + (["postgres"] if PG_URL else [])
@@ -44,7 +44,9 @@ def _sign(body: bytes, secret: str = SECRET, ts: int | None = None) -> dict[str,
 
 
 def _setup(client, mapping=None):
-    r = client.post("/event-sources", json={"key": "src", "name": "Source", "secret": SECRET})
+    r = client.post("/event-sources", json={
+        "key": "src", "name": "Source", "secret": SECRET, "global_scope": True,
+    })
     assert r.status_code == 201, r.text
     assert SECRET not in r.text
     r = client.post(
@@ -212,7 +214,9 @@ def test_webhook_secret_and_signature_never_leak(client, caplog):
         assert resp.status_code in (200, 404), (path, resp.status_code)
         responses.append(resp)
     responses.append(client.post("/triggers/trg/test", json={"data": {"subject": "x"}}))
-    responses.append(client.post("/event-sources", json={"key": "src", "name": "n", "secret": SECRET}))  # 409
+    responses.append(client.post("/event-sources", json={
+        "key": "src", "name": "n", "secret": SECRET, "global_scope": True,
+    }))  # 409
 
     for resp in responses:
         for needle in needles:
@@ -243,7 +247,7 @@ def test_webhook_secret_and_signature_never_leak(client, caplog):
 
 @pytest.mark.parametrize("missing", ["name", "key"])
 def test_validation_errors_do_not_echo_secret(client, missing):
-    payload = {"key": "s", "name": "n", "secret": SECRET}
+    payload = {"key": "s", "name": "n", "secret": SECRET, "global_scope": True}
     payload.pop(missing)
     r = client.post("/event-sources", json=payload)
     assert r.status_code == 422
@@ -252,6 +256,8 @@ def test_validation_errors_do_not_echo_secret(client, missing):
 
 
 def test_validation_error_on_secret_field_itself_is_redacted(client):
-    r = client.post("/event-sources", json={"key": "s", "name": "n", "secret": [SECRET]})
+    r = client.post("/event-sources", json={
+        "key": "s", "name": "n", "secret": [SECRET], "global_scope": True,
+    })
     assert r.status_code == 422
     assert SECRET not in r.text

@@ -967,6 +967,7 @@ class EventSourceRecord(Base):
     key: Mapped[str] = mapped_column(String(80), primary_key=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     secret: Mapped[str] = mapped_column(String(128), nullable=False)
+    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
