@@ -464,6 +464,73 @@ def test_connectors_are_authenticated_tenant_scoped_and_stamp_webhook_events(
     assert client.delete(f"/connectors/{connector_id}").status_code == 200
 
 
+def test_connector_create_uses_normalized_actor_tenant(fencing_client):
+    client, set_actor = fencing_client
+    set_actor(
+        Actor(
+            "admin-tenant-a",
+            ("automation.operator", "automation.admin"),
+            source="bearer",
+            tenant_key=" tenant-a ",
+        )
+    )
+
+    created = client.post(
+        "/connectors",
+        json={"name": "Tenant A source", "connector_type": "generic", "config": {}},
+    )
+
+    assert created.status_code == 201, created.text
+    assert created.json()["tenant_key"] == "tenant-a"
+
+
+def test_connector_local_and_unscoped_admin_list_all_tenants(fencing_client):
+    client, set_actor = fencing_client
+    connector_ids = set()
+    for tenant_key in ("tenant-a", "tenant-b"):
+        set_actor(
+            Actor(
+                f"admin-{tenant_key}",
+                ("automation.operator", "automation.admin"),
+                source="bearer",
+                tenant_key=tenant_key,
+            )
+        )
+        created = client.post(
+            "/connectors",
+            json={
+                "name": f"{tenant_key} source",
+                "connector_type": "generic",
+                "config": {},
+            },
+        )
+        assert created.status_code == 201, created.text
+        connector_ids.add(created.json()["id"])
+
+    for actor in (
+        Actor("global-admin", ("automation.admin",), source="bearer"),
+        _local_actor(),
+    ):
+        set_actor(actor)
+        listed = client.get("/connectors")
+        assert listed.status_code == 200, listed.text
+        assert {connector["id"] for connector in listed.json()} == connector_ids
+
+
+def test_blank_tenant_admin_cannot_list_connectors(fencing_client):
+    client, set_actor = fencing_client
+    set_actor(
+        Actor(
+            "blank-tenant-admin",
+            ("automation.operator", "automation.admin"),
+            source="bearer",
+            tenant_key="   ",
+        )
+    )
+
+    assert client.get("/connectors").status_code == 403
+
+
 def test_tenant_connector_polling_passes_actor_scope(fencing_client, monkeypatch):
     from src import connectors
 

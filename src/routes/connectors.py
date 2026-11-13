@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from src import connectors as connector_lib
 from src import db
 from src.auth import Actor
-from src.deps import _admin_actor, _event_webhook_actor
+from src.deps import _actor_tenant, _admin_actor, _event_webhook_actor
 
 router = APIRouter(tags=["connectors"])
 
@@ -321,10 +321,6 @@ async def connector_webhook(
 # ---------------------------------------------------------------------------
 # Trigger rules (admin)
 # ---------------------------------------------------------------------------
-
-
-def _actor_tenant(actor: Actor) -> Optional[str]:
-    return None if actor.source == "local" else actor.tenant_key
 
 
 def _require_rule_access(actor: Actor, record: db.TriggerRuleRecord) -> None:
