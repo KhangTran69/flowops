@@ -13,7 +13,7 @@ import json
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -23,6 +23,35 @@ from src.auth import Actor
 from src.deps import _actor_tenant, _admin_actor, _event_webhook_actor
 
 router = APIRouter(tags=["connectors"])
+MAX_EVENT_REQUEST_BYTES = 8 * 1024 * 1024
+MAX_EVENTS_PER_BATCH = 100
+
+
+async def _read_event_request_body(request: Request) -> bytes:
+    """Read a bounded event body without buffering an untrusted full request."""
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError as error:
+            raise HTTPException(
+                status_code=400, detail="Invalid Content-Length."
+            ) from error
+        if declared_length < 0:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length.")
+        if declared_length > MAX_EVENT_REQUEST_BYTES:
+            raise HTTPException(
+                status_code=413, detail="Event request body exceeds the 8 MiB limit."
+            )
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > MAX_EVENT_REQUEST_BYTES:
+            raise HTTPException(
+                status_code=413, detail="Event request body exceeds the 8 MiB limit."
+            )
+        body.extend(chunk)
+    return bytes(body)
 
 
 class ConnectorIn(BaseModel):
@@ -289,16 +318,20 @@ async def connector_webhook(
         # Configured but secret env missing -> service unavailable, not a crash.
         raise HTTPException(503, str(error))
 
-    body = await request.body()
+    body = await _read_event_request_body(request)
     verifier = getattr(connector, "verify_webhook", None)
     if verifier is not None and not verifier(request, body):
         raise HTTPException(401, "Webhook signature verification failed.")
     try:
         payload = _json.loads(body or b"{}")
-    except _json.JSONDecodeError:
+    except (_json.JSONDecodeError, UnicodeDecodeError):
         raise HTTPException(400, "Request body is not valid JSON.")
 
     events = connector.parse_webhook(payload)
+    if len(events) > MAX_EVENTS_PER_BATCH:
+        raise HTTPException(
+            status_code=413, detail="Event batch exceeds the 100-event limit."
+        )
     events = [
         connector_lib.NormalizedEvent(
             source=event.source,
@@ -490,19 +523,31 @@ async def ingest_events_api(
     import json as _json
 
     try:
-        payload = _json.loads(await request.body() or b"{}")
-    except _json.JSONDecodeError:
+        payload = _json.loads(await _read_event_request_body(request) or b"{}")
+    except (_json.JSONDecodeError, UnicodeDecodeError):
         raise HTTPException(400, "Request body is not valid JSON.")
     if isinstance(payload, list):
-        payload = {"events": payload}
-    items = payload.get("events") if isinstance(payload, dict) else None
-    if items is None and isinstance(payload, dict) and "type" in payload:
+        items = payload
+    elif isinstance(payload, dict) and "events" in payload:
+        items = payload["events"]
+        if not isinstance(items, list):
+            raise HTTPException(422, "The events field must be a list.")
+    elif isinstance(payload, dict) and "type" in payload:
         items = [payload]
-    if items is None:
+    else:
         raise HTTPException(422, "Provide {'events': [...]} or a single event object.")
+    if len(items) > MAX_EVENTS_PER_BATCH:
+        raise HTTPException(
+            status_code=413, detail="Event batch exceeds the 100-event limit."
+        )
     events = []
-    for item in items[:100]:
-        parsed = EventIn.model_validate(item)
+    for item in items:
+        try:
+            parsed = EventIn.model_validate(item)
+        except ValidationError as error:
+            raise HTTPException(
+                422, "Each event must match the event schema."
+            ) from error
         if parsed.tenant and parsed.tenant != webhook_actor.tenant_key:
             raise HTTPException(403, "Event tenant does not match webhook identity.")
         if webhook_actor.tenant_key is None and parsed.tenant:

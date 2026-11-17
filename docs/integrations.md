@@ -85,6 +85,11 @@ server's active tenant record and its `credential_ref`; the global
 must match a connector's tenant at
 `/connectors/{connector_id}/webhook`.
 
+`/events` and connector webhooks accept at most 100 events and 8 MiB per
+request; each stored event payload is limited to 64 KiB. Global trigger rules
+can act on tenant-scoped events only when that tenant appears in the rule's
+`static_inputs.allowed_tenants` list.
+
 Trigger `notify` rules require
 `FLOWOPS_TENANT_<CREDENTIAL_REF>_NOTIFY_ALLOWED_HOSTS`, a comma-separated
 list of exact hostnames (for example `hooks.example.com`). Missing or empty

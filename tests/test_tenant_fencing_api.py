@@ -407,6 +407,63 @@ def test_trigger_rules_are_tenant_fenced(fencing_client):
     assert client.delete(f"/trigger-rules/{rule_id}").status_code == 200
 
 
+@pytest.mark.parametrize("allowed_tenants", [None, ["tenant-a"]])
+def test_global_trigger_rules_require_an_explicit_tenant_allowlist(
+    fencing_client, monkeypatch, allowed_tenants
+):
+    client, set_actor = fencing_client
+    with db.SessionLocal() as session:
+        tenant = session.get(db.TenantRecord, "tenant-a")
+        tenant.credential_ref = "TENANT_A"
+        session.commit()
+
+    monkeypatch.delenv("FLOWOPS_WEBHOOK_API_KEY", raising=False)
+    monkeypatch.setenv(
+        "FLOWOPS_TENANT_TENANT_A_WEBHOOK_API_KEY", "tenant-a-webhook-key"
+    )
+    set_actor(_local_actor())
+    connector = client.post(
+        "/connectors",
+        json={
+            "name": "Tenant A events",
+            "connector_type": "generic",
+            "tenant_key": "tenant-a",
+            "config": {},
+        },
+    )
+    assert connector.status_code == 201, connector.text
+
+    static_inputs = {"employee_emails": ["triggered@example.com"]}
+    if allowed_tenants is not None:
+        static_inputs["allowed_tenants"] = allowed_tenants
+    rule = client.post(
+        "/trigger-rules",
+        json={
+            "name": "global-new-hire",
+            "event_type": "new_hire",
+            "predicate": "true",
+            "action_type": "start_workflow",
+            "request_type": "onboarding",
+            "static_inputs": static_inputs,
+        },
+    )
+    assert rule.status_code == 201, rule.text
+
+    event = client.post(
+        f"/connectors/{connector.json()['id']}/webhook",
+        headers={"X-Tenant-Key": "tenant-a", "X-API-Key": "tenant-a-webhook-key"},
+        json={"type": "new_hire", "id": "tenant-a-new-hire"},
+    )
+
+    assert event.status_code == 201, event.text
+    fired = event.json()["results"][0]["triggers_fired"]
+    assert len(fired) == 1
+    assert fired[0]["ok"] is (allowed_tenants is not None)
+    with db.SessionLocal() as session:
+        requests = session.query(db.OnboardingRequestRecord).all()
+    assert bool(requests) is (allowed_tenants is not None)
+
+
 def test_connectors_are_authenticated_tenant_scoped_and_stamp_webhook_events(
     fencing_client, monkeypatch,
 ):

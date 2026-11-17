@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src import api, connectors, db
+from src.routes import connectors as connector_routes
 
 
 @pytest.fixture
@@ -115,6 +116,66 @@ def test_notify_trigger_fires_once_per_event_with_dedupe(client):
               "payload": {"priority": "Low"}},
     ).json()["results"][0]
     assert low["triggers_fired"] == []
+
+
+@pytest.mark.parametrize(
+    "event_batch",
+    [{"type": "ping"}, "not a list", [None]],
+)
+def test_events_api_rejects_malformed_event_batches(client, event_batch):
+    response = client.post("/events", json={"events": event_batch})
+
+    assert response.status_code == 422
+
+
+def test_events_api_rejects_batches_over_limit(client):
+    batch = [{"type": "ping", "id": f"event-{index}"} for index in range(101)]
+
+    response = client.post("/events", json={"events": batch})
+
+    assert response.status_code == 413
+
+
+def test_event_ingress_caps_raw_request_bodies(client):
+    connector = client.post(
+        "/connectors",
+        headers=ADMIN,
+        json={"name": "Generic events", "connector_type": "generic", "config": {}},
+    )
+    assert connector.status_code == 201, connector.text
+    oversized_body = b"{}" + b" " * connector_routes.MAX_EVENT_REQUEST_BYTES
+    endpoints = (
+        "/events",
+        f"/connectors/{connector.json()['id']}/webhook",
+    )
+
+    for endpoint in endpoints:
+        response = client.post(
+            endpoint,
+            content=oversized_body,
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 413, (endpoint, response.text)
+
+
+def test_connector_webhook_rejects_batches_over_limit(client):
+    connector = client.post(
+        "/connectors",
+        headers=ADMIN,
+        json={"name": "Generic events", "connector_type": "generic", "config": {}},
+    )
+    assert connector.status_code == 201, connector.text
+    batch = {
+        "events": [
+            {"type": "ping", "id": f"event-{index}"} for index in range(101)
+        ]
+    }
+
+    response = client.post(
+        f"/connectors/{connector.json()['id']}/webhook", json=batch
+    )
+
+    assert response.status_code == 413
 
 
 def test_start_workflow_trigger_creates_and_starts_request(client):
