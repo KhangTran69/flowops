@@ -239,7 +239,7 @@ def lease_trigger(
     trigger_key: str,
     lease_duration_seconds: int = 60,
 ) -> Optional[str]:
-    """Acquire a lease on a trigger to prevent double-firing.
+    """Atomically acquire a lease on a trigger to prevent double-firing.
 
     Returns the lease token if acquired, None if already leased.
     """
@@ -256,8 +256,23 @@ def lease_trigger(
         return None
 
     token = secrets.token_hex(16)
-    trigger.last_fired_at = now
-    session.flush()
+    last_fired_filter = (
+        db.TriggerRecord.last_fired_at.is_(None)
+        if trigger.last_fired_at is None
+        else db.TriggerRecord.last_fired_at == trigger.last_fired_at
+    )
+    result = session.execute(
+        update(db.TriggerRecord)
+        .where(
+            db.TriggerRecord.key == trigger_key,
+            db.TriggerRecord.active.is_(True),
+            last_fired_filter,
+        )
+        .values(last_fired_at=now, updated_at=now)
+        .execution_options(synchronize_session="fetch")
+    )
+    if result.rowcount != 1:
+        return None
     return token
 
 
@@ -386,11 +401,15 @@ class ScheduledTick:
 def tick_scheduler(
     session: Session,
     now: Optional[datetime] = None,
+    *,
+    commit: bool = True,
 ) -> list[ScheduledTick]:
     """Find due triggers, acquire leases, and return fired events.
 
     This is the core scheduler loop. Two concurrent schedulers will not
-    double-fire because lease_trigger uses last_fired_at as a fence.
+    double-fire because lease_trigger uses last_fired_at as a fence. Set
+    commit=False to group the leases with related work in the caller's
+    transaction.
     """
     if now is None:
         now = db.utcnow()
@@ -417,7 +436,9 @@ def tick_scheduler(
         event_id = schedule_event_id(trigger.key, window_start)
         ticks.append(ScheduledTick(trigger_key=trigger.key, event_id=event_id, window_start=window_start))
 
-    session.commit()
+    session.flush()
+    if commit:
+        session.commit()
     return ticks
 
 

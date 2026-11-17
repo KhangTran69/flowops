@@ -300,7 +300,11 @@ def trigger_webhook(
     HMAC input: timestamp + "." + raw request body.
     """
     trigger = session.get(db.TriggerRecord, trigger_key)
-    if trigger is None or not trigger.active:
+    if (
+        trigger is None
+        or not trigger.active
+        or trigger.schedule_kind != "webhook"
+    ):
         raise HTTPException(status_code=404, detail="Trigger not found or inactive.")
 
     source = session.get(db.EventSourceRecord, trigger.source_key)
