@@ -620,9 +620,9 @@ def _rule_allows_tenant(
     if not event.tenant_key:
         return True
     allowed = inputs.get("allowed_tenants")
-    if isinstance(allowed, list) and allowed:
-        return event.tenant_key in {str(t) for t in allowed}
-    return True
+    if not isinstance(allowed, list):
+        return False
+    return event.tenant_key in {str(tenant) for tenant in allowed}
 
 
 def evaluate_triggers(
