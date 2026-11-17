@@ -401,11 +401,15 @@ class ScheduledTick:
 def tick_scheduler(
     session: Session,
     now: Optional[datetime] = None,
+    *,
+    commit: bool = True,
 ) -> list[ScheduledTick]:
     """Find due triggers, acquire leases, and return fired events.
 
     This is the core scheduler loop. Two concurrent schedulers will not
-    double-fire because lease_trigger uses last_fired_at as a fence.
+    double-fire because lease_trigger uses last_fired_at as a fence. Set
+    commit=False to group the leases with related work in the caller's
+    transaction.
     """
     if now is None:
         now = db.utcnow()
@@ -432,7 +436,9 @@ def tick_scheduler(
         event_id = schedule_event_id(trigger.key, window_start)
         ticks.append(ScheduledTick(trigger_key=trigger.key, event_id=event_id, window_start=window_start))
 
-    session.commit()
+    session.flush()
+    if commit:
+        session.commit()
     return ticks
 
 
