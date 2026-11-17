@@ -435,7 +435,7 @@ def tick_all(*, now: Optional[datetime] = None, worker_id: str = "scheduler") ->
 
         # Tick trigger scheduler
         from src import jobs
-        trigger_ticks = triggers.tick_scheduler(session, now=now)
+        trigger_ticks = triggers.tick_scheduler(session, now=now, commit=False)
         for trigger_tick in trigger_ticks:
             TRIGGER_TICK_COUNTS["fired"] = TRIGGER_TICK_COUNTS.get("fired", 0) + 1
             # Record delivery first so its ID can be included in the job
