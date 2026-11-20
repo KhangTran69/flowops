@@ -321,16 +321,16 @@ def _complete_trigger_job(
     if delivery is None:
         raise _PermanentJobError("Trigger delivery not found.")
     trigger = session.get(db.TriggerRecord, trigger_key)
-    if trigger is None:
+    if trigger is None or not trigger.active:
         raise _PermanentJobError("Trigger not found.")
     source = session.get(db.EventSourceRecord, trigger.source_key)
     if source is None:
         raise _PermanentJobError("Trigger event source not found.")
+    if not triggers.source_is_runnable(session, source):
+        raise _PermanentJobError("Trigger event source is inactive or has invalid scope.")
+    if trigger.schedule_kind == "webhook" and not source.secret_generated:
+        raise _PermanentJobError("Trigger event source secret must be rotated before execution.")
     tenant_key = source.tenant_key
-    if tenant_key is not None:
-        tenant = session.get(db.TenantRecord, tenant_key)
-        if tenant is None or not tenant.active:
-            raise _PermanentJobError("Trigger tenant is missing or inactive.")
 
     try:
         mapped = triggers.apply_mapping(

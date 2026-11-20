@@ -122,11 +122,13 @@ that point.
 
 Migration 0015 marks existing source secrets as requiring rotation and
 tenantless sources as lacking explicit global scope. Webhook delivery rejects
-those records until an operator rotates the key and sets an explicit scope.
-For a tenantless source that already has triggers, create a replacement source
-with `tenant_key` or `global_scope: true`, recreate the triggers, then
-deactivate the old source and triggers; tenant ownership cannot be inferred
-from the old records.
+those records, and scheduled triggers skip them; queued jobs also recheck the
+source before creating work. A source with no triggers can be given an explicit
+scope and a rotated key. Once triggers use a source, its scope is fixed. For a
+tenantless source that already has triggers, create a replacement source with
+`tenant_key` or `global_scope: true`, recreate the triggers, then deactivate
+the old source and triggers; tenant ownership cannot be inferred from the old
+records.
 
 Webhook bodies must be at most 1 MiB and include an `event_id` in the signed
 JSON object. Sign the exact body bytes as

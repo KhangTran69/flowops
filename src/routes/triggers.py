@@ -522,6 +522,16 @@ def create_trigger(
     source = session.get(db.EventSourceRecord, payload.source_key)
     if source is None or not source.active:
         raise HTTPException(status_code=404, detail="Event source not found.")
+    if not triggers.has_valid_source_scope(source):
+        raise HTTPException(
+            status_code=422,
+            detail="Event source must have an explicit tenant or global scope.",
+        )
+    if payload.schedule_kind == "webhook" and not source.secret_generated:
+        raise HTTPException(
+            status_code=422,
+            detail="Rotate the event source secret before creating webhook triggers.",
+        )
     _validate_source_tenant(session, source.tenant_key)
     if payload.target_type in ("onboarding_request", "offboarding_request") and not payload.definition_key:
         raise HTTPException(status_code=422, detail="definition_key is required for onboarding/offboarding targets.")
