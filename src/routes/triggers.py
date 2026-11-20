@@ -6,10 +6,18 @@ import json
 from datetime import datetime
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi import status as http_status
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field, StrictBool, StrictInt, StrictStr, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    field_validator,
+)
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -20,42 +28,22 @@ from src.deps import _global_admin_actor, _new_run_id
 router = APIRouter(tags=["triggers"])
 MAX_TRIGGER_WEBHOOK_BYTES = 1_048_576
 
+
 class EventSourceCreateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     key: StrictStr = Field(description="Unique identifier for the source.")
     name: StrictStr = Field(description="Human-readable name.")
-    secret: StrictStr = Field(
-        min_length=triggers.MIN_WEBHOOK_SECRET_BYTES,
-        max_length=128,
-        description="Random shared secret for HMAC signature verification (at least 32 bytes).",
-    )
     tenant_key: Optional[StrictStr] = Field(default=None, max_length=64)
     global_scope: StrictBool = False
 
-    @field_validator("secret")
-    @classmethod
-    def valid_secret(cls, value: str) -> str:
-        if len(value.encode("utf-8")) < triggers.MIN_WEBHOOK_SECRET_BYTES:
-            raise ValueError("secret must contain at least 32 UTF-8 bytes")
-        if value != value.strip():
-            raise ValueError("secret must not have leading or trailing whitespace")
-        return value
-
 
 class EventSourceUpdateIn(BaseModel):
-    secret: Optional[StrictStr] = Field(default=None, min_length=32, max_length=128)
-    tenant_key: Optional[StrictStr] = Field(default=None, max_length=64)
-    active: Optional[StrictBool] = None
+    model_config = ConfigDict(extra="forbid")
 
-    @field_validator("secret")
-    @classmethod
-    def valid_secret(cls, value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return value
-        if len(value.encode("utf-8")) < triggers.MIN_WEBHOOK_SECRET_BYTES:
-            raise ValueError("secret must contain at least 32 UTF-8 bytes")
-        if value != value.strip():
-            raise ValueError("secret must not have leading or trailing whitespace")
-        return value
+    tenant_key: Optional[StrictStr] = Field(default=None, max_length=64)
+    global_scope: StrictBool = False
+    active: Optional[StrictBool] = None
 
 
 class EventSourceOut(BaseModel):
@@ -64,6 +52,12 @@ class EventSourceOut(BaseModel):
     active: bool
     created_at: datetime
     tenant_key: Optional[str] = None
+    global_scope: bool
+    secret_generated: bool
+
+
+class EventSourceSecretOut(EventSourceOut):
+    secret: str
 
 
 def _validate_source_tenant(session: Session, tenant_key: Optional[str]) -> None:
@@ -87,17 +81,24 @@ def list_event_sources(
             tenant_key=s.tenant_key,
             active=s.active,
             created_at=s.created_at,
+            global_scope=s.global_scope,
+            secret_generated=s.secret_generated,
         )
         for s in sources
     ]
 
 
-@router.post("/event-sources", response_model=EventSourceOut, status_code=http_status.HTTP_201_CREATED)
+@router.post(
+    "/event-sources",
+    response_model=EventSourceSecretOut,
+    status_code=http_status.HTTP_201_CREATED,
+)
 def create_event_source(
     payload: EventSourceCreateIn,
+    response: Response,
     actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
-) -> EventSourceOut:
+) -> EventSourceSecretOut:
     if session.get(db.EventSourceRecord, payload.key):
         raise HTTPException(status_code=409, detail="Event source key already exists.")
     if payload.tenant_key is None and not payload.global_scope:
@@ -111,11 +112,14 @@ def create_event_source(
             detail="A source cannot be both tenant-scoped and global.",
         )
     _validate_source_tenant(session, payload.tenant_key)
+    secret = triggers.generate_webhook_secret()
     source = db.EventSourceRecord(
         key=payload.key,
         name=payload.name,
-        secret=payload.secret,
+        secret=secret,
         tenant_key=payload.tenant_key,
+        global_scope=payload.global_scope,
+        secret_generated=True,
         active=True,
         created_at=db.utcnow(),
     )
@@ -132,12 +136,16 @@ def create_event_source(
         actor_subject=actor.subject,
     )
     session.commit()
-    return EventSourceOut(
+    response.headers["Cache-Control"] = "no-store"
+    return EventSourceSecretOut(
         key=source.key,
         name=source.name,
         tenant_key=source.tenant_key,
         active=source.active,
         created_at=source.created_at,
+        global_scope=source.global_scope,
+        secret_generated=source.secret_generated,
+        secret=secret,
     )
 
 
@@ -153,8 +161,28 @@ def update_event_source(
         raise HTTPException(status_code=404, detail="Event source not found.")
     if not payload.model_fields_set:
         raise HTTPException(status_code=422, detail="At least one source field is required.")
-    if "tenant_key" in payload.model_fields_set:
-        if payload.tenant_key != source.tenant_key:
+    scope_fields = {"tenant_key", "global_scope"} & payload.model_fields_set
+    if scope_fields:
+        next_tenant_key = (
+            payload.tenant_key if "tenant_key" in scope_fields else source.tenant_key
+        )
+        next_global_scope = (
+            payload.global_scope if "global_scope" in scope_fields else source.global_scope
+        )
+        if next_tenant_key is None and not next_global_scope:
+            raise HTTPException(
+                status_code=422,
+                detail="Set tenant_key or explicitly opt into global_scope.",
+            )
+        if next_tenant_key is not None and next_global_scope:
+            raise HTTPException(
+                status_code=422,
+                detail="A source cannot be both tenant-scoped and global.",
+            )
+        if (next_tenant_key, next_global_scope) != (
+            source.tenant_key,
+            source.global_scope,
+        ):
             existing_trigger = session.execute(
                 select(db.TriggerRecord.key)
                 .where(db.TriggerRecord.source_key == key)
@@ -164,14 +192,13 @@ def update_event_source(
                 raise HTTPException(
                     status_code=409,
                     detail=(
-                        "Tenant scope cannot change after triggers use this source; "
+                        "Source scope cannot change after triggers use this source; "
                         "create a replacement source and triggers."
                     ),
                 )
-        _validate_source_tenant(session, payload.tenant_key)
-        source.tenant_key = payload.tenant_key
-    if payload.secret is not None:
-        source.secret = payload.secret
+        _validate_source_tenant(session, next_tenant_key)
+        source.tenant_key = next_tenant_key
+        source.global_scope = next_global_scope
     if payload.active is not None:
         source.active = payload.active
     db.log_execution(
@@ -183,6 +210,7 @@ def update_event_source(
         duration_ms=0,
         detail=(
             f"key={key}, tenant_key={source.tenant_key or 'global'}, "
+            f"global_scope={source.global_scope}, "
             f"fields={','.join(sorted(payload.model_fields_set))}"
         ),
         actor_subject=actor.subject,
@@ -194,6 +222,48 @@ def update_event_source(
         tenant_key=source.tenant_key,
         active=source.active,
         created_at=source.created_at,
+        global_scope=source.global_scope,
+        secret_generated=source.secret_generated,
+    )
+
+
+@router.post(
+    "/event-sources/{key}/rotate-secret",
+    response_model=EventSourceSecretOut,
+)
+def rotate_event_source_secret(
+    key: str,
+    response: Response,
+    actor: Actor = Depends(_global_admin_actor),
+    session: Session = Depends(db.get_session),
+) -> EventSourceSecretOut:
+    source = session.get(db.EventSourceRecord, key)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Event source not found.")
+    secret = triggers.generate_webhook_secret()
+    source.secret = secret
+    source.secret_generated = True
+    db.log_execution(
+        session,
+        run_id=_new_run_id(),
+        action="event_source.secret_rotated",
+        status="success",
+        ticket_id=None,
+        duration_ms=0,
+        detail=f"key={key}",
+        actor_subject=actor.subject,
+    )
+    session.commit()
+    response.headers["Cache-Control"] = "no-store"
+    return EventSourceSecretOut(
+        key=source.key,
+        name=source.name,
+        tenant_key=source.tenant_key,
+        active=source.active,
+        created_at=source.created_at,
+        global_scope=source.global_scope,
+        secret_generated=source.secret_generated,
+        secret=secret,
     )
 
 
@@ -308,9 +378,17 @@ def trigger_webhook(
         raise HTTPException(status_code=404, detail="Trigger not found or inactive.")
 
     source = session.get(db.EventSourceRecord, trigger.source_key)
-    if source is None or not source.active:
-        raise HTTPException(status_code=404, detail="Event source not found or inactive.")
-    if source.tenant_key is not None:
+    if source is None or not source.active or not source.secret_generated:
+        raise HTTPException(
+            status_code=404,
+            detail="Event source not found, inactive, or not ready.",
+        )
+    if source.tenant_key is None:
+        if not source.global_scope:
+            raise HTTPException(status_code=404, detail="Event source not found or not scoped.")
+    else:
+        if source.global_scope:
+            raise HTTPException(status_code=404, detail="Event source has invalid scope.")
         tenant = session.get(db.TenantRecord, source.tenant_key)
         if tenant is None or not tenant.active:
             raise HTTPException(status_code=404, detail="Event source not found or inactive.")
@@ -444,6 +522,16 @@ def create_trigger(
     source = session.get(db.EventSourceRecord, payload.source_key)
     if source is None or not source.active:
         raise HTTPException(status_code=404, detail="Event source not found.")
+    if not triggers.has_valid_source_scope(source):
+        raise HTTPException(
+            status_code=422,
+            detail="Event source must have an explicit tenant or global scope.",
+        )
+    if payload.schedule_kind == "webhook" and not source.secret_generated:
+        raise HTTPException(
+            status_code=422,
+            detail="Rotate the event source secret before creating webhook triggers.",
+        )
     _validate_source_tenant(session, source.tenant_key)
     if payload.target_type in ("onboarding_request", "offboarding_request") and not payload.definition_key:
         raise HTTPException(status_code=422, detail="definition_key is required for onboarding/offboarding targets.")

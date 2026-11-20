@@ -104,19 +104,31 @@ other application secrets.
 
 ## Legacy event-source webhooks (`/event-sources`, `/triggers`)
 
-Create source secrets with at least 32 UTF-8 bytes of randomness (for example,
-`python -c 'import secrets; print(secrets.token_urlsafe(32))'`). The secret is
-never returned by the API. `POST /event-sources` accepts an optional
-`tenant_key`; set it for tenant-owned sources. Creating an unscoped source
-requires the explicit `global_scope: true` option and should be reserved for
-trusted central services. Global-admin-only
-`PATCH /event-sources/{key}` can rotate a secret, set or clear the tenant scope,
-or deactivate a source without triggers. A source's tenant scope becomes fixed
-when a trigger uses it. To move an existing global source with triggers to a
-tenant, create a tenant-scoped replacement source and replacement triggers,
-then deactivate the old source and triggers. Existing sources remain global
-until an operator migrates or deactivates them; their tenant ownership cannot
-be inferred automatically.
+`POST /event-sources` generates a 256-bit random secret and returns it once in
+the response with `Cache-Control: no-store`; request bodies cannot provide a
+caller-chosen secret. Store the returned value in the sending system's secret
+store before closing the response. Listing sources never returns their secret.
+To rotate a key, a global admin calls `POST /event-sources/{key}/rotate-secret`.
+The old value stops working immediately, and the new one is returned once with
+`Cache-Control: no-store`.
+
+Set `tenant_key` for tenant-owned sources. Creating a global source requires
+the explicit `global_scope: true` option and should be reserved for trusted
+central services. `global_scope` is persisted and appears in source listings.
+Global-admin-only `PATCH /event-sources/{key}` can set or clear the tenant
+scope, set `global_scope`, or deactivate a source. Scope is fixed once a trigger
+uses the source; create replacement sources and triggers to change it after
+that point.
+
+Migration 0015 marks existing source secrets as requiring rotation and
+tenantless sources as lacking explicit global scope. Webhook delivery rejects
+those records, and scheduled triggers skip them; queued jobs also recheck the
+source before creating work. A source with no triggers can be given an explicit
+scope and a rotated key. Once triggers use a source, its scope is fixed. For a
+tenantless source that already has triggers, create a replacement source with
+`tenant_key` or `global_scope: true`, recreate the triggers, then deactivate
+the old source and triggers; tenant ownership cannot be inferred from the old
+records.
 
 Webhook bodies must be at most 1 MiB and include an `event_id` in the signed
 JSON object. Sign the exact body bytes as
@@ -125,8 +137,18 @@ hex digest as `X-FlowOps-Signature: sha256=<digest>` with
 `X-FlowOps-Timestamp: <unix_timestamp>`. An optional `X-FlowOps-Event-ID`
 header must exactly match the signed body's `event_id`; it is not an
 alternative source for the ID. Requests with timestamps outside the five-minute
-window, invalid signatures, or short source secrets are rejected. Work created
-by a tenant-scoped source inherits its tenant key.
+window or invalid signatures are rejected. Existing source records are blocked
+until their secret is rotated through the API. Work created by a tenant-scoped
+source inherits its tenant key.
+
+## Metrics access
+
+`GET /metrics` requires a global administrator in protected deployments. The
+standard local Compose setup runs in development mode and binds to loopback by
+default. In a protected deployment, configure Prometheus to send a valid
+global-admin bearer token using a mounted `credentials_file`; do not put an
+Entra token in the repository or a shared Compose file. Keep Prometheus
+reachable only from the monitoring network or an authenticated proxy.
 
 For Docker Compose, copy `.connector-secrets.env.example` to the ignored
 `.connector-secrets.env` and put the configured connector values there. Both

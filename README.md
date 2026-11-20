@@ -532,6 +532,8 @@ No real secrets or Microsoft tenant are included.
 
 - `GET /health` is liveness; `GET /ready` checks database connectivity.
 - `GET /metrics` exposes request counters plus workflow-job and outbox gauges.
+- In protected deployments, `/metrics` requires a global administrator; configure
+  Prometheus with a mounted bearer-token file.
 - Every response carries `X-Correlation-ID` (or echoes the caller's value).
 - Alembic owns the schema: `alembic upgrade head`. The Docker entrypoint runs
   it before starting the app; the worker waits for a healthy app and skips

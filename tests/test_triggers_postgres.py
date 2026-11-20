@@ -34,6 +34,8 @@ def _create_event_source(session, key="pg-test-source"):
         key=key,
         name="PG Test Source",
         secret="pg-secret-key-12345-test-secret-key-67890",
+        global_scope=True,
+        secret_generated=True,
         active=True,
         created_at=db.utcnow(),
     )
@@ -115,6 +117,7 @@ def test_pg_scheduler_tick_fires_due_triggers(pg_session):
     """PostgreSQL scheduler ticks fire due triggers."""
     from datetime import timedelta
 
+    _create_event_source(pg_session)
     trigger = _create_trigger(pg_session)
     trigger.schedule_kind = "interval"
     trigger.interval_seconds = 60
@@ -183,6 +186,7 @@ def test_pg_concurrent_scheduler_prevents_double_fire(pg_session):
     """PostgreSQL concurrent schedulers prevent double-firing."""
     from datetime import timedelta
 
+    _create_event_source(pg_session)
     trigger = _create_trigger(pg_session)
     trigger.schedule_kind = "interval"
     trigger.interval_seconds = 60

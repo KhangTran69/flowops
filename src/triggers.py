@@ -66,6 +66,23 @@ MIN_WEBHOOK_SECRET_BYTES = 32
 _DANGEROUS_WORDS = re.compile(r"\b(import|exec|eval|compile)\b|__", re.IGNORECASE)
 
 
+def has_valid_source_scope(source: db.EventSourceRecord) -> bool:
+    """Return whether a source has exactly one explicit scope."""
+    if source.tenant_key is None:
+        return bool(source.global_scope)
+    return not source.global_scope
+
+
+def source_is_runnable(session: Session, source: db.EventSourceRecord) -> bool:
+    """Check that a source and its tenant can still create trigger work."""
+    if not source.active or not has_valid_source_scope(source):
+        return False
+    if source.tenant_key is None:
+        return True
+    tenant = session.get(db.TenantRecord, source.tenant_key)
+    return tenant is not None and tenant.active
+
+
 def _validate_reference(value: str) -> None:
     """Validate a ``$``-prefixed reference string."""
     if value.startswith("$event."):
@@ -219,6 +236,11 @@ def verify_signature(
         return hmac.compare_digest(expected, provided)
     except TypeError:  # non-ASCII signature text
         return False
+
+
+def generate_webhook_secret() -> str:
+    """Generate a 256-bit URL-safe key for one-time webhook setup/rotation."""
+    return secrets.token_urlsafe(MIN_WEBHOOK_SECRET_BYTES)
 
 
 def generate_event_id() -> str:
@@ -423,6 +445,9 @@ def tick_scheduler(
 
     ticks: list[ScheduledTick] = []
     for trigger in triggers:
+        source = session.get(db.EventSourceRecord, trigger.source_key)
+        if source is None or not source_is_runnable(session, source):
+            continue
         if trigger.schedule_kind == "interval" and not is_due_interval(trigger, now):
             continue
         if trigger.schedule_kind == "daily" and not is_due_daily(trigger, now):

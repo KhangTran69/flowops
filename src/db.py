@@ -569,7 +569,7 @@ def _ensure_outbox_lease_columns() -> None:
 
 
 def _ensure_trigger_tables() -> None:
-    """Add trigger tables to databases created before they existed (v1.4)."""
+    """Add trigger schema compatibility for older local SQLite databases."""
     if engine.dialect.name != "sqlite":
         return
     inspector = inspect(engine)
@@ -584,6 +584,25 @@ def _ensure_trigger_tables() -> None:
                     "secret VARCHAR(128) NOT NULL, "
                     "active BOOLEAN NOT NULL DEFAULT 1, "
                     "created_at DATETIME NOT NULL)"
+                )
+            )
+            source_columns = set()
+        else:
+            source_columns = {
+                column["name"] for column in inspect(connection).get_columns("event_sources")
+            }
+        if "global_scope" not in source_columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE event_sources "
+                    "ADD COLUMN global_scope BOOLEAN NOT NULL DEFAULT 0"
+                )
+            )
+        if "secret_generated" not in source_columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE event_sources "
+                    "ADD COLUMN secret_generated BOOLEAN NOT NULL DEFAULT 0"
                 )
             )
         if "triggers" not in tables:
@@ -968,6 +987,12 @@ class EventSourceRecord(Base):
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     secret: Mapped[str] = mapped_column(String(128), nullable=False)
     tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    global_scope: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    secret_generated: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

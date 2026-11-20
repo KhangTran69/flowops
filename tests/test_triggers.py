@@ -43,6 +43,8 @@ def _create_event_source(session, key=None):
         key=key,
         name="Test Source",
         secret="test-secret-key-12345-test-secret-key-67890",
+        global_scope=True,
+        secret_generated=True,
         active=True,
         created_at=db.utcnow(),
     )
@@ -549,7 +551,6 @@ def test_event_source_crud_api(client, session):
         json={
             "key": "api-source",
             "name": "API Source",
-            "secret": "api-secret-123-32-byte-test-secret-value",
             "global_scope": True,
         },
     )

@@ -45,10 +45,10 @@ def _sign(body: bytes, secret: str = SECRET, ts: int | None = None) -> dict[str,
 
 def _setup(client, mapping=None):
     r = client.post("/event-sources", json={
-        "key": "src", "name": "Source", "secret": SECRET, "global_scope": True,
+        "key": "src", "name": "Source", "global_scope": True,
     })
     assert r.status_code == 201, r.text
-    assert SECRET not in r.text
+    secret = r.json()["secret"]
     r = client.post(
         "/triggers",
         json={
@@ -61,6 +61,7 @@ def _setup(client, mapping=None):
         },
     )
     assert r.status_code == 201, r.text
+    return secret
 
 
 # --------------------------------------------------------------------------
@@ -151,10 +152,10 @@ def test_bad_mapping_rejected_on_create_and_update(client):
 
 
 def test_mapping_cannot_reach_source_secret(client):
-    _setup(client, mapping={"subject": "$event.data.subject", "who": "$trigger.source_key"})
+    secret = _setup(client, mapping={"subject": "$event.data.subject", "who": "$trigger.source_key"})
     r = client.post("/triggers/trg/test", json={"data": {"subject": "hi"}})
     assert r.status_code == 200
-    assert SECRET not in r.text
+    assert secret not in r.text
 
 
 # --------------------------------------------------------------------------
@@ -167,8 +168,8 @@ def test_mapping_cannot_reach_source_secret(client):
      b'{"event_id": "' + b"a" * 129 + b'"}', b'{"event_id": ["x"]}'],
 )
 def test_webhook_rejects_bad_input_with_422(client, body):
-    _setup(client)
-    r = client.post("/webhooks/triggers/trg", content=body, headers=_sign(body))
+    secret = _setup(client)
+    r = client.post("/webhooks/triggers/trg", content=body, headers=_sign(body, secret))
     assert r.status_code == 422, r.text
 
 
@@ -190,12 +191,12 @@ def test_signature_verification_edge_cases():
 
 def test_webhook_secret_and_signature_never_leak(client, caplog):
     caplog.set_level(logging.DEBUG)
-    _setup(client)
+    secret = _setup(client)
     body = json.dumps({"event_id": "evt-1", "data": {"subject": "VPN broken"}}).encode()
-    headers = _sign(body)
+    headers = _sign(body, secret)
     signature = headers["X-FlowOps-Signature"]
     sig_hex = signature[len("sha256="):]
-    needles = (SECRET, sig_hex)
+    needles = (secret, sig_hex)
 
     responses = []
     r = client.post("/webhooks/triggers/trg", content=body, headers=headers)
@@ -215,7 +216,7 @@ def test_webhook_secret_and_signature_never_leak(client, caplog):
         responses.append(resp)
     responses.append(client.post("/triggers/trg/test", json={"data": {"subject": "x"}}))
     responses.append(client.post("/event-sources", json={
-        "key": "src", "name": "n", "secret": SECRET, "global_scope": True,
+        "key": "src", "name": "n", "global_scope": True,
     }))  # 409
 
     for resp in responses:
@@ -240,7 +241,7 @@ def test_webhook_secret_and_signature_never_leak(client, caplog):
             for needle in needles:
                 assert needle not in blob
         source = session.get(db.EventSourceRecord, "src")
-        assert SECRET not in repr(source)
+        assert secret not in repr(source)
     finally:
         session.close()
 
