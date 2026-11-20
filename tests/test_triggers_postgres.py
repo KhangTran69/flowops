@@ -34,6 +34,8 @@ def _create_event_source(session, key="pg-test-source"):
         key=key,
         name="PG Test Source",
         secret="pg-secret-key-12345-test-secret-key-67890",
+        global_scope=True,
+        secret_generated=True,
         active=True,
         created_at=db.utcnow(),
     )

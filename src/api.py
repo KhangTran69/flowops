@@ -393,7 +393,10 @@ def ready() -> dict:
 
 
 @app.get("/metrics", include_in_schema=False)
-def metrics_endpoint(session: Session = Depends(db.get_session)) -> Response:
+def metrics_endpoint(
+    actor: Actor = Depends(_global_admin_actor),
+    session: Session = Depends(db.get_session),
+) -> Response:
     """Minimal Prometheus-style metrics for jobs, outbox, and HTTP requests."""
     lines = [
         "# HELP flowops_http_requests_total HTTP requests by method, route, and status",

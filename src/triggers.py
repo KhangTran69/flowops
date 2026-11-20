@@ -221,6 +221,11 @@ def verify_signature(
         return False
 
 
+def generate_webhook_secret() -> str:
+    """Generate a 256-bit URL-safe key for one-time webhook setup/rotation."""
+    return secrets.token_urlsafe(MIN_WEBHOOK_SECRET_BYTES)
+
+
 def generate_event_id() -> str:
     """Generate a unique event ID for deduplication."""
     return secrets.token_urlsafe(32)
