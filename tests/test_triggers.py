@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from src import api, db, definitions, jobs, triggers, worker
+from src import api, db, definitions, jobs, scheduler, triggers, worker
 from src.actions import ActionResult
 
 
@@ -294,6 +294,78 @@ def test_scheduler_lease_prevents_double_fire(session):
     assert len(ticks2) == 0
 
 
+@pytest.mark.parametrize(
+    ("schedule", "already_fired"),
+    [
+        ({"schedule_kind": "daily", "daily_at_utc": "24:00"}, True),
+        ({"schedule_kind": "daily", "daily_at_utc": "09:60"}, False),
+        ({"schedule_kind": "daily", "daily_at_utc": "noon"}, False),
+        ({"schedule_kind": "interval", "interval_seconds": -60}, False),
+        ({"schedule_kind": "interval", "interval_seconds": 0}, True),
+        ({"schedule_kind": "monthly"}, False),
+    ],
+)
+def test_scheduler_skips_invalid_saved_schedules_and_dispatches_due_trigger(session, monkeypatch, schedule, already_fired):
+    now = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(db, "utcnow", lambda: now)
+    source = _create_event_source(session)
+    invalid = _create_trigger(session, key="invalid-schedule", source_key=source.key)
+    invalid.schedule_kind = schedule["schedule_kind"]
+    invalid.daily_at_utc = schedule.get("daily_at_utc")
+    invalid.interval_seconds = schedule.get("interval_seconds")
+    invalid.created_at = now - timedelta(days=2)
+    invalid.last_fired_at = now - timedelta(days=1) if already_fired else None
+    valid = _create_trigger(session, key="valid-schedule", source_key=source.key)
+    valid.schedule_kind = "daily"
+    valid.daily_at_utc = "7:30"
+    valid.last_fired_at = now - timedelta(days=1)
+    session.commit()
+    invalid_last_fired_at = (
+        invalid.last_fired_at.replace(tzinfo=None) if invalid.last_fired_at else None
+    )
+
+    scheduler.tick_all(now=now)
+
+    delivery = session.execute(select(db.TriggerDeliveryRecord)).scalar_one()
+    assert delivery.trigger_key == "valid-schedule"
+    assert delivery.event_id == "schedule:valid-schedule:2026-06-16T07:30:00+00:00"
+    assert delivery.status == "queued"
+    job = session.execute(select(db.WorkflowJobRecord)).scalar_one()
+    assert job.job_type == jobs.JOB_TRIGGER_EXECUTE
+    assert job.status == "queued"
+    assert json.loads(job.payload_json)["delivery_id"] == delivery.id
+    session.refresh(invalid)
+    assert invalid.last_fired_at == invalid_last_fired_at
+
+
+@pytest.mark.parametrize(
+    ("created_ago", "first_tick_count"),
+    [(timedelta(hours=1), 0), (timedelta(hours=20), 1)],
+    ids=["first-slot-pending", "first-slot-elapsed"],
+)
+def test_new_daily_trigger_requires_a_slot_since_creation(session, monkeypatch, created_ago, first_tick_count):
+    now = datetime(2026, 6, 15, 8, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(db, "utcnow", lambda: now)
+    trigger = _create_trigger(session, key="daily-noon")
+    trigger.schedule_kind = "daily"
+    trigger.daily_at_utc = "12:00"
+    trigger.created_at = now - created_ago
+    session.commit()
+
+    scheduler.tick_all(now=now)
+
+    deliveries = session.execute(select(db.TriggerDeliveryRecord)).scalars().all()
+    assert len(deliveries) == first_tick_count
+
+    now = now.replace(hour=12)
+    scheduler.tick_all(now=now)
+    scheduler.tick_all(now=now)
+
+    deliveries = session.execute(select(db.TriggerDeliveryRecord).order_by(db.TriggerDeliveryRecord.id)).scalars().all()
+    assert len(deliveries) == first_tick_count + 1
+    assert deliveries[-1].event_id == "schedule:daily-noon:2026-06-16T12:00:00+00:00"
+
+
 def test_webhook_endpoint_valid_signature(client, session):
     """Valid webhook signature is accepted."""
     source = _create_event_source(session)
@@ -438,6 +510,37 @@ def test_trigger_crud_api(client, session):
     # Delete
     delete_resp = client.delete(f"/triggers/{trigger_key}")
     assert delete_resp.status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("schedule", "field"),
+    [
+        ({"schedule_kind": "daily", "daily_at_utc": "24:00"}, "daily_at_utc"),
+        ({"schedule_kind": "daily", "daily_at_utc": "09:60"}, "daily_at_utc"),
+        ({"schedule_kind": "daily", "daily_at_utc": "noon"}, "daily_at_utc"),
+        ({"schedule_kind": "daily", "daily_at_utc": "7:30"}, "daily_at_utc"),
+        ({"schedule_kind": "interval", "interval_seconds": -60}, "interval_seconds"),
+        ({"schedule_kind": "interval", "interval_seconds": 2**31}, "interval_seconds"),
+    ],
+)
+def test_create_trigger_rejects_invalid_schedule(client, session, schedule, field):
+    source = _create_event_source(session)
+    response = client.post(
+        "/triggers",
+        json={
+            "key": "invalid-schedule",
+            "name": "Invalid schedule",
+            "source_key": source.key,
+            "event_type": "scheduled",
+            "target_type": "ticket",
+            "mapping_json": {},
+            **schedule,
+        },
+    )
+
+    assert response.status_code == 422
+    assert field in response.json()["detail"]
+    assert client.get("/triggers/invalid-schedule").status_code == 404
 
 
 def test_trigger_worker_creates_onboarding_request(session, monkeypatch):

@@ -541,10 +541,21 @@ def create_trigger(
             raise HTTPException(status_code=404, detail="Definition not found.")
         if definition.status != "published":
             raise HTTPException(status_code=422, detail="Definition must be published.")
-    if payload.schedule_kind == "interval" and not payload.interval_seconds:
-        raise HTTPException(status_code=422, detail="interval_seconds is required for interval schedules.")
-    if payload.schedule_kind == "daily" and not payload.daily_at_utc:
-        raise HTTPException(status_code=422, detail="daily_at_utc is required for daily schedules.")
+    if payload.schedule_kind == "interval":
+        seconds = payload.interval_seconds
+        if seconds is None:
+            raise HTTPException(status_code=422, detail="interval_seconds is required for interval schedules.")
+        if not 1 <= seconds <= triggers.MAX_INTERVAL_SECONDS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"interval_seconds must be between 1 and {triggers.MAX_INTERVAL_SECONDS}.",
+            )
+    if payload.schedule_kind == "daily":
+        if not payload.daily_at_utc:
+            raise HTTPException(status_code=422, detail="daily_at_utc is required for daily schedules.")
+        daily_time = triggers.parse_daily_time(payload.daily_at_utc)
+        if daily_time is None or daily_time.isoformat(timespec="minutes") != payload.daily_at_utc:
+            raise HTTPException(status_code=422, detail="daily_at_utc must be a valid UTC time in HH:MM format.")
     try:
         triggers.validate_mapping(payload.mapping_json)
     except triggers.MappingError as error:

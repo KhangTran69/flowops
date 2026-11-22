@@ -18,6 +18,7 @@ import secrets
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from datetime import time as datetime_time
 from typing import Any, Mapping, Optional
 
 from sqlalchemy import and_, select, update
@@ -27,6 +28,7 @@ from src import db
 
 VALID_TARGET_TYPES = ("onboarding_request", "offboarding_request", "ticket")
 VALID_SCHEDULE_KINDS = ("webhook", "interval", "daily")
+MAX_INTERVAL_SECONDS = 2**31 - 1  # PostgreSQL INTEGER storage limit.
 DELIVERY_STATUSES = ("received", "queued", "succeeded", "failed", "skipped")
 
 _PATH = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*\Z")
@@ -355,38 +357,43 @@ def update_delivery(
 
 def is_due_interval(trigger: db.TriggerRecord, now: datetime) -> bool:
     """Check if an interval trigger is due to fire."""
-    if trigger.schedule_kind != "interval" or trigger.interval_seconds is None:
+    seconds = trigger.interval_seconds
+    if trigger.schedule_kind != "interval" or not isinstance(seconds, int) or not 1 <= seconds <= MAX_INTERVAL_SECONDS:
         return False
     if trigger.last_fired_at is None:
         return True
     if trigger.last_fired_at.tzinfo is None:
         trigger.last_fired_at = trigger.last_fired_at.replace(tzinfo=timezone.utc)
-    return now >= trigger.last_fired_at + timedelta(seconds=trigger.interval_seconds)
+    return now >= trigger.last_fired_at + timedelta(seconds=seconds)
+
+
+def parse_daily_time(value: Optional[str]) -> Optional[datetime_time]:
+    """Parse a daily UTC clock time, including previously accepted unpadded values."""
+    if not isinstance(value, str):
+        return None
+    try:
+        hour, minute = map(int, value.split(":"))
+        return datetime_time(hour, minute)
+    except (OverflowError, ValueError):
+        return None
 
 
 def is_due_daily(trigger: db.TriggerRecord, now: datetime) -> bool:
     """Check if a daily trigger is due to fire."""
-    if trigger.schedule_kind != "daily" or trigger.daily_at_utc is None:
+    if trigger.schedule_kind != "daily":
         return False
-    if trigger.last_fired_at is None:
-        return True
-
-    # Parse HH:MM UTC
-    try:
-        hour, minute = map(int, trigger.daily_at_utc.split(":"))
-    except (ValueError, AttributeError):
+    daily_time = parse_daily_time(trigger.daily_at_utc)
+    if daily_time is None:
         return False
 
-    # Get today's target time in UTC
-    today_target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if trigger.last_fired_at.tzinfo is None:
-        trigger.last_fired_at = trigger.last_fired_at.replace(tzinfo=timezone.utc)
-
-    # Due only when the most recent occurrence of the target time (today's if
-    # it has passed, otherwise yesterday's) has not yet been fired; before the
-    # scheduled hour the trigger must wait, not fire early.
+    today_target = now.replace(hour=daily_time.hour, minute=daily_time.minute, second=0, microsecond=0)
     latest_target = today_target if today_target <= now else today_target - timedelta(days=1)
-    return trigger.last_fired_at < latest_target
+    reference = trigger.last_fired_at or trigger.created_at
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+    if trigger.last_fired_at is None:
+        return reference <= latest_target
+    return reference < latest_target
 
 
 def next_window_start(trigger: db.TriggerRecord, now: datetime) -> datetime:
@@ -398,12 +405,11 @@ def next_window_start(trigger: db.TriggerRecord, now: datetime) -> datetime:
             trigger.last_fired_at = trigger.last_fired_at.replace(tzinfo=timezone.utc)
         return trigger.last_fired_at + timedelta(seconds=trigger.interval_seconds)
 
-    if trigger.schedule_kind == "daily" and trigger.daily_at_utc:
-        try:
-            hour, minute = map(int, trigger.daily_at_utc.split(":"))
-        except (ValueError, AttributeError):
+    if trigger.schedule_kind == "daily":
+        daily_time = parse_daily_time(trigger.daily_at_utc)
+        if daily_time is None:
             return now
-        today_target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        today_target = now.replace(hour=daily_time.hour, minute=daily_time.minute, second=0, microsecond=0)
         if now < today_target:
             return today_target
         return today_target + timedelta(days=1)
@@ -439,7 +445,7 @@ def tick_scheduler(
     triggers = session.execute(
         select(db.TriggerRecord).where(
             db.TriggerRecord.active == True,
-            db.TriggerRecord.schedule_kind != "webhook",
+            db.TriggerRecord.schedule_kind.in_(("interval", "daily")),
         )
     ).scalars().all()
 
