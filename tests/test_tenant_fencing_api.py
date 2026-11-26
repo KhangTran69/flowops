@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from src import api, chatops, connectwise, db
 from src.auth import Actor
 from src.deps import _actor_from_header
+from src.mcp_server import FlowOpsToolError, FlowOpsTools
 
 ONBOARDING = {
     "request_type": "onboarding",
@@ -215,6 +216,52 @@ def test_workflow_runs_and_jobs_are_fenced_by_request_tenant(fencing_client):
     assert client.get(f"/workflow-jobs/{job_a_id}").status_code == 404
     assert client.get(f"/workflow-jobs/{job_a_id}/history").status_code == 404
     assert client.post(f"/workflow-jobs/{job_a_id}/retry").status_code == 404
+
+
+def test_mcp_tools_keep_the_api_actor_tenant_boundary(fencing_client):
+    client, set_actor = fencing_client
+    tools = FlowOpsTools(client, allow_writes=True)
+    set_actor(_tenant_actor("tenant-a"))
+    ticket_a = client.post("/tickets", json={
+        "id": 1201, "userId": 77, "title": "Tenant A VPN issue", "completed": False,
+    }).json()["ticket_id"]
+    request_a = client.post("/onboarding-requests", json=ONBOARDING).json()["id"]
+    set_actor(_tenant_actor("tenant-b"))
+    ticket_b = client.post("/tickets", json={
+        "id": 1202, "userId": 77, "title": "Tenant B VPN issue", "completed": False,
+    }).json()["ticket_id"]
+    request_b = client.post("/onboarding-requests", json={
+        **ONBOARDING, "employee_email": "b@example.com",
+    }).json()["id"]
+    with db.SessionLocal() as session:
+        job_b = db.WorkflowJobRecord(
+            job_type="onboarding.item.execute", payload_json="{}", status="failed",
+            resource_type="onboarding", resource_id=str(request_b),
+        )
+        session.add(job_b)
+        session.commit()
+        job_b_id = job_b.id
+
+    set_actor(_tenant_actor("tenant-a"))
+    assert [ticket["ticket_id"] for ticket in tools.list_tickets()] == [ticket_a]
+    assert tools.get_ticket(ticket_a)["ticket_id"] == ticket_a
+    assert tools.list_failed_jobs() == []
+    assert all(item["tenant_key"] == "tenant-a" for item in tools.list_pending_approvals())
+    for action in (
+        lambda: tools.get_ticket(ticket_b),
+        lambda: tools.triage_ticket(ticket_b),
+        lambda: tools.retry_job(job_b_id),
+        lambda: tools.request_onboarding(
+            "onboarding", "Another Person", "other@example.com", "IT", 1,
+            tenant_key="tenant-b",
+        ),
+        lambda: tools.tenant_drift_report("tenant-b"),
+    ):
+        with pytest.raises(FlowOpsToolError, match="404"):
+            action()
+    with pytest.raises(FlowOpsToolError, match="403"):
+        tools.automation_kpis()
+    assert client.get(f"/onboarding-requests/{request_a}").status_code == 200
 
 
 def test_guessed_foreign_workflow_run_actions_are_fenced(fencing_client):

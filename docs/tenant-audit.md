@@ -6,9 +6,13 @@
 > reserve legacy trigger administration and `/metrics` for global admins.
 > See `src/api.py` (`_scope_execution_log_query`),
 > `src/routes/analytics.py` (`_effective_tenant`), and
-> `src/routes/triggers.py` (`_global_admin_actor`). The MCP adapter still
-> relies on the API bearer actor for tenant enforcement; its caller-supplied
-> tenant arguments should be reviewed with that actor context. This note
+> `src/routes/triggers.py` (`_global_admin_actor`). A focused MCP test now
+> confirms that a tenant actor cannot use tool arguments or guessed record IDs
+> to read another tenant's tickets, triage, retry a job, create an onboarding
+> request, or run a drift check; the global KPI tool returns 403. The MCP
+> adapter passes its configured bearer token through to these API checks. In
+> development with API authentication disabled, the local actor remains global.
+> This note
 > updates the audit status, not a claim that every operator surface is fenced.
 
 Scope: the multi-tenant MSP boundary (tenant fencing) and the durable job/lease
