@@ -1,5 +1,16 @@
 # Tenant Fencing and Worker Recovery Audit (codex/project-improvements)
 
+> Historical audit: the "Documented-but-open" list below describes the state
+> after the original October 2026 pass. On current `main` (2026-11-26), later
+> changes scope execution logs and analytics by the authenticated tenant and
+> reserve legacy trigger administration and `/metrics` for global admins.
+> See `src/api.py` (`_scope_execution_log_query`),
+> `src/routes/analytics.py` (`_effective_tenant`), and
+> `src/routes/triggers.py` (`_global_admin_actor`). The MCP adapter still
+> relies on the API bearer actor for tenant enforcement; its caller-supplied
+> tenant arguments should be reviewed with that actor context. This note
+> updates the audit status, not a claim that every operator surface is fenced.
+
 Scope: the multi-tenant MSP boundary (tenant fencing) and the durable job/lease
 worker recovery paths. The workforce module was already fully fenced; this pass
 closes the comparable gaps in the core ticket/onboarding plane and documents
