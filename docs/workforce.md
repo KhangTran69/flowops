@@ -23,13 +23,13 @@ The seed is safe to run repeatedly and creates synthetic `.test` email records: 
 
 API role checks accept `HR`, `MANAGER`, and `IT_ADMIN` JWT roles or signed UI sessions. Tenant-scoped identities must carry the `flowops_tenant_key` (or `tenant_key`) claim in Entra, or the `tenant_key` field in a development account. The key must name an active FlowOps tenant. Managers can only access records in that tenant and requests for employees whose `manager_subject` equals their authenticated subject. `automation.admin` and local development actors retain explicit global operator access.
 
-To run role-specific UI sessions, enable both auth flags in a development environment and configure `FLOWOPS_SESSION_SECRET`, `FLOWOPS_DEV_BEARER_TOKEN`, and `FLOWOPS_DEMO_USERS`. Generate password hashes with:
+To run role-specific UI sessions, enable both auth flags in a development environment and configure a `FLOWOPS_SESSION_SECRET` with at least 32 characters, `FLOWOPS_DEV_BEARER_TOKEN`, and `FLOWOPS_DEMO_USERS`. Generate password hashes with:
 
 ```bash
 python -m src.demo_users hash
 ```
 
-The command prompts for a username, role, tenant key, and password, then prints a PBKDF2 hash snippet. Create the `demo` tenant with `python -m src.workforce_demo`, then combine snippets in `FLOWOPS_DEMO_USERS` for HR, manager, and IT_ADMIN. Demo accounts work only when `FLOWOPS_ENVIRONMENT=development`; never use them in production. Production should use Entra bearer authentication with the matching application roles, tenant claim, and secure session settings.
+The command prompts for a username, role, tenant key, and password, then prints a PBKDF2 hash snippet. Create the `demo` tenant with `python -m src.workforce_demo`, then combine snippets in `FLOWOPS_DEMO_USERS` for HR, manager, and IT_ADMIN. Demo accounts work only when `FLOWOPS_ENVIRONMENT=development`; never use them in production. Production API clients should use Entra bearer authentication with the matching application roles and tenant claim. This prototype does not provide production browser sign-in.
 
 ## Workflow and states
 
