@@ -486,15 +486,24 @@ retry/requeue endpoints remain available.
 Set `FLOWOPS_AUTH_REQUIRED=true` to protect mutating routes; the default local
 mode is unauthenticated for beginner-friendly development.
 
-The browser console adds a separate session layer. Set
+The browser console adds a separate signed-session layer. Set
 `FLOWOPS_UI_AUTH_REQUIRED=true`, `FLOWOPS_AUTH_REQUIRED=true`, and a random
-`FLOWOPS_SESSION_SECRET`; then
-`/dashboard` and `/ui/*` redirect to `/login`, where an operator pastes a dev
-bearer token or Entra access token. The signed, HttpOnly, SameSite=Lax cookie
-carries subject/roles and a per-session CSRF token. UI fetch actions send
-`X-CSRF-Token`; cookie-authenticated mutations without it return `403`. Bearer
-API clients remain CSRF-exempt. Set `FLOWOPS_SESSION_COOKIE_SECURE=true` behind
-HTTPS. This is a prototype token-paste login, not full SSO or user management.
+`FLOWOPS_SESSION_SECRET` with at least 32 characters; then
+unauthenticated requests to protected browser pages redirect to `/login`. The
+form accepts a development username/password account configured in
+`FLOWOPS_DEMO_USERS`; see the
+[workforce guide](docs/workforce.md) for local account setup. These accounts
+are accepted only when `FLOWOPS_ENVIRONMENT=development`. Protected UI startup
+also requires an auth source: Entra issuer, audience, and JWKS settings, or a
+development-only `FLOWOPS_DEV_BEARER_TOKEN`. The token satisfies startup
+configuration; the username/password form does not accept API bearer tokens or
+Entra access tokens. Those credentials apply to API clients, not
+browser-session login. The signed, HttpOnly, SameSite=Lax
+cookie carries subject/roles and a per-session CSRF token. UI fetch actions
+send `X-CSRF-Token`; cookie-authenticated mutations without it return `403`.
+Bearer API clients remain CSRF-exempt. Set `FLOWOPS_SESSION_COOKIE_SECURE=true`
+behind HTTPS. This development login is not Entra browser sign-in or a full
+user-management system.
 
 Operator routes require `automation.operator` or `automation.admin`. Webhook
 routes require `X-API-Key` via `FLOWOPS_WEBHOOK_API_KEY` outside development.
