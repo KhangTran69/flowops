@@ -12,11 +12,16 @@ import secrets
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import timedelta
+
+from sqlalchemy import delete
+from sqlalchemy.exc import SQLAlchemyError
 from typing import Mapping, Optional
 
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 from src.auth import Actor
+from src import db
 
 SESSION_COOKIE = "flowops_ui_session"
 SESSION_SALT = "flowops-ui-session"
@@ -205,13 +210,39 @@ def decode_session(
     return UISession(subject=subject, roles=roles, csrf_token=csrf, tenant_key=tenant_key)
 
 
+def _revocation_digest(session: UISession) -> str:
+    return hashlib.sha256(session.csrf_token.encode()).hexdigest()
+
+
+def revoke_session(session_db, session: UISession) -> None:
+    # Retain for the maximum supported cookie age, including configuration changes.
+    now = db.utcnow()
+    session_db.execute(delete(db.RevokedUISessionRecord).where(
+        db.RevokedUISessionRecord.expires_at <= now
+    ))
+    digest = _revocation_digest(session)
+    table = db.RevokedUISessionRecord.__table__
+    if session_db.bind.dialect.name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert
+    else:
+        from sqlalchemy.dialects.sqlite import insert
+    session_db.execute(insert(table).values(
+        digest=digest, expires_at=now + timedelta(days=1)
+    ).on_conflict_do_nothing(index_elements=["digest"]))
+
+
 def read_session(request) -> Optional[UISession]:
     value = request.cookies.get(SESSION_COOKIE)
     if not value:
         return None
     try:
-        return decode_session(value)
-    except UISessionError:
+        session = decode_session(value)
+        db._ensure_tables()
+        with db.SessionLocal() as session_db:
+            if session_db.get(db.RevokedUISessionRecord, _revocation_digest(session)) is not None:
+                return None
+        return session
+    except (UISessionError, SQLAlchemyError):
         return None
 
 
