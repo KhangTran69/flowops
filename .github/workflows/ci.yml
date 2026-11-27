@@ -148,6 +148,8 @@ jobs:
           cache-dependency-path: command-center/package-lock.json
       - run: python -m pip install -r requirements-dev.txt playwright==1.51.0
       - run: python -m playwright install --with-deps chromium
+      - name: Install isolated accessibility test dependency
+        run: npm install --prefix /tmp/flowops-axe --no-package-lock --ignore-scripts axe-core@4.10.3
       - run: npm ci && npm run build
         working-directory: command-center
       - name: Exercise isolated browser and backend
@@ -164,6 +166,7 @@ jobs:
           FLOWOPS_COMMAND_CENTER_DEV: 'true'
           DEV_USER_ROLE: admin
           SERVE_STATIC: 'true'
+          FLOWOPS_AXE_PATH: /tmp/flowops-axe/node_modules/axe-core/axe.min.js
         run: |
           alembic upgrade head
           python -m uvicorn src.api:app --host 127.0.0.1 --port 8000 > /tmp/flowops-api.log 2>&1 &
