@@ -13,7 +13,7 @@ import re
 import threading
 import time
 import uuid
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator, Literal, Optional
@@ -1269,38 +1269,46 @@ def _request_out(
     )
 
 
+def _load_checklists(
+    session: Session, request_ids: list[int],
+) -> dict[int, list[db.ChecklistItemRecord]]:
+    grouped: dict[int, list[db.ChecklistItemRecord]] = defaultdict(list)
+    if not request_ids:
+        return grouped
+    now = db.utcnow()
+    # Keep parameter counts bounded for existing unpaginated callers.
+    for offset in range(0, len(request_ids), 500):
+        batch = request_ids[offset:offset + 500]
+        items = session.execute(
+            select(db.ChecklistItemRecord).where(db.ChecklistItemRecord.request_id.in_(batch))
+        ).scalars().all()
+        timers_by_item = {
+            row.item_id: row for row in session.execute(
+                select(db.WorkflowTimerRecord).where(
+                    db.WorkflowTimerRecord.request_id.in_(batch),
+                    db.WorkflowTimerRecord.status == "pending",
+                ).order_by(db.WorkflowTimerRecord.due_at.desc())
+            ).scalars().all()
+        }
+        for item in items:
+            timer = timers_by_item.get(item.id)
+            due = timer.due_at if timer else None
+            if due is not None and due.tzinfo is None:
+                due = due.replace(tzinfo=timezone.utc)
+            item.sla_due_at = due
+            item.overdue = due is not None and due <= now
+            item.sla_remaining_minutes = max(0, int((due - now).total_seconds() // 60)) if due is not None else None
+            grouped[item.request_id].append(item)
+    return grouped
+
+
 def _load_request(
     session: Session, request_id: int
 ) -> tuple[db.OnboardingRequestRecord, list[db.ChecklistItemRecord]]:
     record = session.get(db.OnboardingRequestRecord, request_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Onboarding request not found.")
-    items = session.execute(
-        select(db.ChecklistItemRecord).where(db.ChecklistItemRecord.request_id == request_id)
-    ).scalars().all()
-    timer_rows = session.execute(
-        select(db.WorkflowTimerRecord).where(
-            db.WorkflowTimerRecord.request_id == request_id,
-            db.WorkflowTimerRecord.status == "pending",
-        )
-    ).scalars().all()
-    by_item = {row.item_id: row for row in timer_rows}
-    now = db.utcnow()
-    for item in items:
-        timer = by_item.get(item.id)
-        item.sla_due_at = timer.due_at if timer is not None else None
-        if timer is not None:
-            due = timer.due_at
-            if due.tzinfo is None:
-                due = due.replace(tzinfo=timezone.utc)
-            item.overdue = due <= now
-            item.sla_remaining_minutes = max(
-                0, int((due - now).total_seconds() // 60)
-            )
-        else:
-            item.overdue = False
-            item.sla_remaining_minutes = None
-    return record, list(items)
+    return record, _load_checklists(session, [request_id]).get(request_id, [])
 
 
 def _definition_out(
@@ -1678,11 +1686,8 @@ def list_onboarding_requests(
     if tenant_key is not None:
         query = query.where(db.OnboardingRequestRecord.tenant_key == tenant_key)
     records = session.execute(query).scalars().all()
-    results = []
-    for record in records:
-        _, items = _load_request(session, record.id)
-        results.append(_request_out(record, items))
-    return results
+    grouped = _load_checklists(session, [record.id for record in records])
+    return [_request_out(record, grouped.get(record.id, [])) for record in records]
 
 
 @app.get("/onboarding-requests/{request_id}", response_model=OnboardingRequestOut)
@@ -1727,19 +1732,23 @@ def get_onboarding_request_status(
 
 
 def _workflow_run_out(
-    session: Session, run: db.WorkflowRunRecord
+    session: Session, run: db.WorkflowRunRecord, *,
+    loaded: Optional[tuple] = None,
 ) -> WorkflowRunOut:
-    request, items = _load_request(session, run.request_id)
-    steps = session.execute(
-        select(db.WorkflowStepRunRecord)
-        .where(db.WorkflowStepRunRecord.run_id == run.id)
-        .order_by(db.WorkflowStepRunRecord.id)
-    ).scalars().all()
-    events = session.execute(
-        select(db.WorkflowEventRecord)
-        .where(db.WorkflowEventRecord.run_id == run.id)
-        .order_by(db.WorkflowEventRecord.id)
-    ).scalars().all()
+    if loaded is None:
+        request, items = _load_request(session, run.request_id)
+        steps = session.execute(
+            select(db.WorkflowStepRunRecord)
+            .where(db.WorkflowStepRunRecord.run_id == run.id)
+            .order_by(db.WorkflowStepRunRecord.id)
+        ).scalars().all()
+        events = session.execute(
+            select(db.WorkflowEventRecord)
+            .where(db.WorkflowEventRecord.run_id == run.id)
+            .order_by(db.WorkflowEventRecord.id)
+        ).scalars().all()
+    else:
+        request, items, steps, events = loaded
     return WorkflowRunOut(
         id=run.id,
         request_id=run.request_id,
@@ -1882,7 +1891,28 @@ def list_workflow_runs(
     if created_before is not None:
         query = query.where(db.WorkflowRunRecord.created_at <= created_before)
     runs = session.execute(query.offset(offset).limit(limit)).scalars().all()
-    return [_workflow_run_out(session, run) for run in runs]
+    if not runs:
+        return []
+    request_ids = [run.request_id for run in runs]
+    run_ids = [run.id for run in runs]
+    requests = {row.id: row for row in session.execute(
+        select(db.OnboardingRequestRecord).where(db.OnboardingRequestRecord.id.in_(request_ids))
+    ).scalars().all()}
+    checklist = _load_checklists(session, request_ids)
+    attempts = defaultdict(list)
+    for row in session.execute(select(db.WorkflowStepRunRecord).where(
+        db.WorkflowStepRunRecord.run_id.in_(run_ids)
+    ).order_by(db.WorkflowStepRunRecord.id)).scalars():
+        attempts[row.run_id].append(row)
+    events = defaultdict(list)
+    for row in session.execute(select(db.WorkflowEventRecord).where(
+        db.WorkflowEventRecord.run_id.in_(run_ids)
+    ).order_by(db.WorkflowEventRecord.id)).scalars():
+        events[row.run_id].append(row)
+    return [_workflow_run_out(session, run, loaded=(
+        requests[run.request_id], checklist.get(run.request_id, []),
+        attempts[run.id], events[run.id],
+    )) for run in runs]
 
 
 def _run_action(
