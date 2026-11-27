@@ -37,6 +37,9 @@ class Ticket(BaseModel):
     priority: str
     category: Optional[str] = None
     queue: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    closed_at: Optional[datetime] = None
 
 
 class KnowledgeBaseArticleOut(BaseModel):
@@ -163,6 +166,7 @@ class ChecklistItemOut(BaseModel):
     sla_minutes: Optional[int] = None
     overdue: bool = False
     sla_remaining_minutes: Optional[int] = None
+    sla_due_at: Optional[datetime] = None
 
 
 class DefinitionCreateIn(BaseModel):
@@ -303,6 +307,9 @@ class WorkflowRunOut(BaseModel):
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     steps: list[WorkflowStepRunOut] = []
+    checklist: list[ChecklistItemOut] = Field(default_factory=list)
+    definition_key: Optional[str] = None
+    employee_name: Optional[str] = None
     events: list[WorkflowEventOut] = []
 
 
