@@ -14,7 +14,7 @@ const SEG = '[A-Za-z0-9_.:-]+'
 const rr = (s) => new RegExp(`^${s}$`)
 
 const GET_PATHS = [
-  rr('/health'), rr('/ready'), rr('/tickets'), rr(`/tickets/${SEG}`),
+  rr('/health'), rr('/ready'), rr('/command-center/summary'), rr('/tickets'), rr(`/tickets/${SEG}`),
   rr('/onboarding-requests'), rr(`/onboarding-requests/${SEG}`),
   rr(`/onboarding-requests/${SEG}/run`), rr('/workflow-runs'),
   rr(`/workflow-runs/${SEG}`), rr('/workflow-definitions'),
