@@ -61,6 +61,9 @@ export type WorkflowRun = {
   status: string
   definition_key: string | null
   employee_name: string | null
+  created_at: string
+  started_at: string | null
+  completed_at: string | null
   checklist: ChecklistItem[]
   steps: WorkflowAttempt[]
   events: { id: number; event_type: string; created_at: string; payload: Record<string, unknown> | null }[]
