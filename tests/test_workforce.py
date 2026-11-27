@@ -453,3 +453,14 @@ def test_outbox_retries_temporary_failure_and_retains_exhausted_failure(workforc
     monkeypatch.setattr("src.workforce_worker.requests.post", lambda *a, **kw: Response())
     retried = run_once()
     assert retried["event_id"] == "delivery-fail-1" and retried["status"] == "DELIVERED"
+
+
+def test_workforce_production_browser_gate_does_not_disable_bearer_api(workforce_client, monkeypatch):
+    client, set_actor = workforce_client
+    monkeypatch.setenv("FLOWOPS_ENVIRONMENT", "production")
+    set_actor(Actor("hr-session", ("HR",), source="session", tenant_key="tenant-a"))
+    assert client.get("/workforce/ui").status_code == 403
+    assert client.get("/workforce/employees").status_code == 403
+    set_actor(Actor("hr-bearer", ("HR",), source="bearer", tenant_key="tenant-a"))
+    assert client.get("/workforce/ui").status_code == 403
+    assert client.get("/workforce/employees").status_code == 200
