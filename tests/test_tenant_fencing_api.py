@@ -745,7 +745,7 @@ def test_run_list_batches_related_queries(fencing_client):
     from sqlalchemy import event
     client, set_actor = fencing_client
     set_actor(_tenant_actor("tenant-a"))
-    for i in range(4):
+    for i in range(50):
         request = client.post("/onboarding-requests", json={**ONBOARDING, "employee_email": f"employee{i}@example.test"})
         assert request.status_code in (200, 201), request.text
         assert client.post(f"/onboarding-requests/{request.json()['id']}/run").status_code == 200
@@ -759,7 +759,7 @@ def test_run_list_batches_related_queries(fencing_client):
     try:
         response = client.get("/workflow-runs", params={"limit": 50})
         assert response.status_code == 200, response.text
-        assert len(response.json()) == 4
+        assert len(response.json()) == 50
         assert len(queries) <= 6, queries
     finally:
         event.remove(db.engine, "before_cursor_execute", collect)
@@ -794,3 +794,29 @@ def test_audit_filters_are_applied_with_tenant_scope(fencing_client):
     assert filtered.json()[0]["ticket_id"] == "6000"
     set_actor(_tenant_actor("tenant-b"))
     assert client.get("/audit", params={"ticket_id": "6000"}).json() == []
+
+
+def test_console_large_ticket_page_coverage(fencing_client):
+    client, set_actor = fencing_client
+    set_actor(_tenant_actor("tenant-a"))
+    session = db.SessionLocal()
+    try:
+        session.add_all([
+            db.TicketRecord(ticket_id=str(10000+i), requester_id=7,
+                            title="Pagination test", status="open", priority="normal",
+                            queue="it-hardware", category="hardware", tenant_key="tenant-a")
+            for i in range(257)
+        ])
+        session.add(db.TicketRecord(ticket_id="19999", requester_id=7,
+                                    title="Pagination test", status="open", priority="normal",
+                                    queue="it-hardware", category="hardware", tenant_key="tenant-b"))
+        session.commit()
+    finally:
+        session.close()
+    identifiers = []
+    for offset in range(0, 300, 50):
+        result = client.get("/tickets", params={"search": "Pagination test", "limit": 50, "offset": offset})
+        assert result.status_code == 200, result.text
+        identifiers.extend(row["ticket_id"] for row in result.json())
+    assert identifiers == [str(10000+i) for i in range(257)]
+    assert client.get("/command-center/summary").json()["open_tickets"] == 257
