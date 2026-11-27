@@ -8,16 +8,17 @@ import { DataState } from '../components/DataState'
 import { BackLink, JsonView, PageHeader, ProgressBar } from '../components/Basics'
 import { StatusBadge } from '../components/StatusBadge'
 import { Confirm } from '../components/Confirm'
+import type { WorkflowRun } from '../lib/contracts'
 
 export default function RunDetail() {
   const { id } = useParams()
-  const { data: run, error, status, loading, reload } = usePoll<any>(`/workflow-runs/${id}`)
+  const { data: run, error, status, loading, reload } = usePoll<WorkflowRun>(`/workflow-runs/${id}`)
   const { role } = useSession()
   const [expanded, setExpanded] = useState<string | number | null>(null)
   const [confirm, setConfirm] = useState<null | 'pause' | 'resume' | 'cancel'>(null)
   const [busy, setBusy] = useState(false)
-  const attempts = run?.steps || run?.step_runs || []
-  const steps = run?.checklist ? run.checklist.map((item: any) => { const history = attempts.filter((a: any) => a.checklist_item_id === item.id); const latest = history[history.length - 1]; return { ...item, attempts: history.length, attempts_json: history, error: latest?.error, output: item.output ?? latest?.output } }) : attempts
+  const attempts = run?.steps || []
+  const steps = run?.checklist ? run.checklist.map((item) => { const history = attempts.filter((a) => a.checklist_item_id === item.id); const latest = history[history.length - 1]; return { ...item, attempts: history.length, attempts_json: history, error: latest?.error, output: item.output ?? latest?.output } }) : attempts
   const events = run?.events || []
   const finished = useMemo(() => ['completed', 'failed', 'cancelled'].includes(String(run?.status || '').toLowerCase()), [run])
   async function action() {
