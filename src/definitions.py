@@ -162,7 +162,9 @@ def create_version(
     *,
     actor: Optional[str] = None,
 ) -> db.WorkflowDefinitionVersionRecord:
-    definition = get_definition(session, key)
+    definition = session.execute(select(db.WorkflowDefinitionRecord).where(
+        db.WorkflowDefinitionRecord.key == key
+    ).with_for_update()).scalar_one_or_none()
     if definition is None:
         raise DefinitionError(f"Definition {key!r} not found.")
     normalized = validate_steps(steps, definition.request_type)
@@ -184,7 +186,9 @@ def create_version(
 def publish_version(
     session: Session, key: str, version: int, *, actor: Optional[str] = None
 ) -> db.WorkflowDefinitionRecord:
-    definition = get_definition(session, key)
+    definition = session.execute(select(db.WorkflowDefinitionRecord).where(
+        db.WorkflowDefinitionRecord.key == key
+    ).with_for_update()).scalar_one_or_none()
     row = get_version(session, key, version)
     if definition is None or row is None:
         raise DefinitionError("Definition or version not found.")
