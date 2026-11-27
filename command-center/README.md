@@ -1,110 +1,102 @@
 # FlowOps Command Center
 
-Internal operator console for the FlowOps FastAPI backend. The browser never
-receives the FlowOps API token: all calls go through a small Express proxy.
+Internal React operator console for the FastAPI backend. All console API calls
+use the Express allowlist; the backend remains the authority for authentication,
+role enforcement, tenant isolation and audit attribution.
 
-## Run
+## Local development (simulated integrations)
+
+Use Node.js 22 and a running local FlowOps backend. The .env file is loaded by
+Node, and Vite forwards /api to the loopback proxy.
 
 ```bash
 cd command-center
-npm install
-cp .env.example .env    # edit values
-npm run dev             # proxy :8787 + Vite :5173
+npm ci
+cp .env.example .env
+# Set FLOWOPS_API_URL to your local backend.
+# Explicit local demo only: FLOWOPS_COMMAND_CENTER_DEV=true
+# Set FLOWOPS_API_TOKEN to the configured development token (or a dummy
+# value if using the intentionally unprotected local backend).
+npm run dev
 ```
 
-Production:
+Open the Vite address printed by npm. Do not expose the demo proxy or Vite
+development server to untrusted networks. The demo proxy always binds to
+127.0.0.1 and never accepts identity or role headers. DEV_USER_ROLE is an exact
+local display/allowlist role, not an identity provider. Protected backend
+credentials still determine actual backend access.
+
+## Protected production configuration (release gate)
+
+Production mode disables the demo credential and will fail closed without
+a verified per-user identity. Set FLOWOPS_API_URL to the authenticated
+backend, enable FLOWOPS_AUTH_REQUIRED and the existing Entra configuration,
+and configure secure signed-session cookies if browser sessions are used.
+Use HTTPS and a private trusted upstream connection.
+
+The trusted gateway must supply each caller's own Authorization bearer
+credential, or route existing backend login/session traffic on the same
+origin so the signed flowops_ui_session cookie is available to the console.
+The console itself does not implement an Entra interactive login flow.
+A gateway must strip any client-supplied identity headers; the console ignores
+X-User-Role, X-User-Email and X-Actor-Email and obtains the actor from
+GET /command-center/session. Do not inject a shared service/admin bearer
+token. The API checks the same caller again on every forwarded operation.
+No production workforce browser release is authorized by this change.
 
 ```bash
+npm ci
 npm run build
-NODE_ENV=production npm start   # serves dist + /api on :8787
+node --test server/*.test.mjs
+NODE_ENV=production npm start
 ```
 
-## Environment
+Default proxy bind: 127.0.0.1:8787. HOST can be explicitly set in protected mode.
+PORT overrides the port. SERVE_STATIC=true serves the build in non-production.
+FLOWOPS_API_TOKEN is used only in explicitly enabled local demo mode.
+Do not store credentials in committed files.
 
-| Variable | Required | Description |
-|---|---|---|
-| `FLOWOPS_API_URL` | yes | Base URL of the FlowOps FastAPI service, e.g. `https://flowops.example.com` |
-| `FLOWOPS_API_TOKEN` | yes | Bearer token used by the server-side proxy |
-| `PORT` | no | Proxy port (default `8787`) |
-| `DEV_USER_EMAIL` | no | Fallback identity when no auth proxy header is present |
-| `DEV_USER_ROLE` | no | Fallback role: `admin`, `operator`, or `viewer` |
-| `SERVE_STATIC` | no | Set `true` to serve `dist` from the proxy in non-production mode |
+### Browser request boundary
 
-### User identity and roles
+POST /api/flowops requires application/json and X-FlowOps-Request: 1.
+The proxy does not enable cross-origin requests. Session CSRF tokens are
+obtained from the verified backend session, not caller-supplied headers.
+Only the signed FlowOps cookie (or the caller's bearer) is forwarded.
+The proxy rejects path traversal, refuses redirects, and applies an explicit
+method/path allowlist. Network and identity verification failures are denied.
 
-The proxy reads the signed-in user from:
+## API contracts
 
-- `X-User-Email` or `X-Auth-Request-Email`
-- `X-User-Role` or `X-Auth-Request-Role`
+- Upstream POST /tickets keeps its existing positive ID and requester ID
+  payload. POST /tickets/manual accepts a known numeric requester ID, title,
+  description and optional contact email, and requires Idempotency-Key.
+  Negative numeric ticket IDs are server-assigned and reserved for manual
+  tickets; the contact email is descriptive, not an identity mapping.
+- GET /tickets supports search, status, priority, queue, category, limit,
+  offset and existing tenant enforcement. The console pages through matches.
+- GET /tickets/{id} includes stored timestamps, resolution note, manual
+  metadata, and up to 50 authorized ticket history events.
+- GET /workflow-runs/{id} returns logical checklist items and separate
+  execution attempts. Progress counts successful checklist completions.
+- GET /workflow-definitions/{key}/diff?from=&to= compares immutable versions;
+  definition operations remain global-admin-only.
+- POST /workflow-runs/{id}/steps/{item_id}/approve or /reject requires an
+  administrator, a pending approval, an active run, and a reason.
+- GET /command-center/summary provides tenant-scoped totals independent of
+  list pagination. Recorded closures use the stored closed_at value and UTC
+  day boundaries, rather than guessing from status.
+- Typed frontend contracts live in src/lib/contracts.ts. The FastAPI
+  OpenAPI schema is the authoritative contract.
 
-These headers are expected from an auth proxy or SSO gateway in front of the
-Command Center. If absent, `DEV_USER_EMAIL` / `DEV_USER_ROLE` are used.
-Role matching is substring-based: `admin`, `operator`, `viewer`; unknown roles
-fall back to `operator`.
+## Validation
 
-`GET /api/session` returns `{ role, email, configured }`.
+CI runs the Python test matrix, SQLite migration check, PostgreSQL integration
+and reliability tests, npm ci, the TypeScript/Vite build, proxy syntax check,
+and Node proxy security regressions. Browser keyboard/focus tests and the
+actual production identity gateway must be validated before a release.
+The backend's HTTP latency histogram is process-local; a multi-replica
+deployment needs external scraping/aggregation.
 
-## API token permissions
-
-The token should be allowed to call:
-
-**Read**
-- `/health`, `/ready`
-- `/tickets`, `/tickets/{id}`
-- `/onboarding-requests`, `/onboarding-requests/{id}`
-- `/onboarding-requests/{id}/run`
-- `/workflow-runs`, `/workflow-runs/{id}`
-- `/workflow-definitions`, `/workflow-definitions/{key}`
-- `/workflow-definitions/{key}/diff`
-- `/execution-logs`, `/audit`
-
-**Operator writes**
-- `POST /tickets`
-- `POST /tickets/{id}/ai-triage`
-- `POST /tickets/{id}/ai-recommendations/apply`
-- `POST /onboarding-requests`
-- `POST /onboarding-requests/{id}/run`
-- `POST /workflow-runs/{id}/pause|resume|cancel`
-
-**Admin writes**
-- `POST /workflow-runs/{id}/steps/{stepKey}/approve|reject`
-- `POST /workflow-definitions`
-- `POST /workflow-definitions/{key}/publish`
-- `PUT /workflow-definitions/{key}`
-
-The proxy enforces method/path allowlists and role checks, but the FlowOps API
-remains authoritative. Its 401/403 responses are surfaced to the user.
-
-## Assumed API endpoints
-
-The Command Center assumes these endpoints exist:
-
-- `GET /workflow-definitions/{key}/diff?from=&to=`
-- `POST /workflow-runs/{id}/steps/{stepKey}/approve`
-- `POST /workflow-runs/{id}/steps/{stepKey}/reject`
-- `GET /workflow-runs/{id}` returns steps and events
-- `POST /workflow-runs/{id}/pause|resume|cancel`
-
-If an endpoint differs, adjust the path allowlist in `server/index.mjs` and the
-corresponding page.
-
-## Security
-
-- `FLOWOPS_API_TOKEN` is read only on the server.
-- Requests include `Authorization: Bearer <token>`, `Accept: application/json`,
-  and `X-Actor-Email`.
-- The proxy logs only method, path and upstream status.
-- Allowed paths are regex-allowlisted; arbitrary methods/paths are rejected.
-- All rendered text is plain text; no raw HTML injection.
-- 20-second upstream timeout; network failures become a friendly 503.
-
-## Structure
-
-```text
-server/index.mjs        secure proxy and static server
-src/pages/              dashboard, tickets, requests, runs, approvals, definitions, audit
-src/components/         layout, tables, status badges, confirmations, data states
-src/lib/api.ts          proxy client and defensive field helpers
-src/lib/session.tsx     role/email context
-src/hooks/usePoll.ts    visibility-aware polling with last-good data
-```
+Keep the existing Jinja console available while validating React parity.
+Apply the additive Alembic manual-ticket migration in a non-production
+representative database first. No production deployment is part of this branch.
