@@ -5,12 +5,12 @@ export type ApiResult<T = unknown> = { ok: boolean; status: number; data?: T; er
 export async function api<T = unknown>(
   method: 'GET' | 'POST' | 'PUT',
   path: string,
-  opts: { query?: Record<string, unknown>; body?: unknown } = {},
+  opts: { query?: Record<string, unknown>; body?: unknown; idempotencyKey?: string } = {},
 ): Promise<ApiResult<T>> {
   try {
     const r = await fetch('/api/flowops', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-FlowOps-Request': '1', ...(opts.idempotencyKey ? { 'Idempotency-Key': opts.idempotencyKey } : {}) },
       body: JSON.stringify({ method, path, query: opts.query, body: opts.body }),
     })
     const json = (await r.json()) as ApiResult<T>
@@ -60,12 +60,10 @@ const DONE = new Set(['completed', 'succeeded', 'skipped', 'done', 'cancelled', 
 export const isDone = (status: unknown) => DONE.has(String(status || '').toLowerCase())
 
 export function progressOf(run: any): number {
-  const p = Number(run?.progress)
-  if (Number.isFinite(p)) return Math.max(0, Math.min(100, p <= 1 ? p * 100 : p))
   const steps = run?.steps || run?.step_runs || []
   const total = Number(run?.total_steps ?? run?.step_count ?? steps.length)
-  const completed = Number(run?.completed_steps ?? steps.filter((s: any) => isDone(s?.status)).length)
-  return total > 0 ? Math.round((completed / total) * 100) : 0
+  const completed = steps.filter((s: any) => ['completed', 'succeeded', 'done'].includes(String(s?.status).toLowerCase())).length
+  return total > 0 ? Math.min(100, Math.round((completed / total) * 100)) : 0
 }
 
 export function isOverdue(step: any): boolean {
