@@ -16,7 +16,8 @@ export default function RunDetail() {
   const [expanded, setExpanded] = useState<string | number | null>(null)
   const [confirm, setConfirm] = useState<null | 'pause' | 'resume' | 'cancel'>(null)
   const [busy, setBusy] = useState(false)
-  const steps = run?.steps || run?.step_runs || []
+  const attempts = run?.steps || run?.step_runs || []
+  const steps = run?.checklist ? run.checklist.map((item: any) => { const history = attempts.filter((a: any) => a.checklist_item_id === item.id); const latest = history[history.length - 1]; return { ...item, attempts: history.length, attempts_json: history, error: latest?.error, output: item.output ?? latest?.output } }) : attempts
   const events = run?.events || []
   const finished = useMemo(() => ['completed', 'failed', 'cancelled'].includes(String(run?.status || '').toLowerCase()), [run])
   async function action() {
@@ -29,7 +30,7 @@ export default function RunDetail() {
     <PageHeader title={`Run #${id}`} description={`${workflowOf(run)} · request ${requestOf(run)} · ${run?.employee_name || '—'}`} actions={<StatusBadge status={run?.status} />} />
     <DataState loading={loading} error={error} status={status} onRetry={reload}>
       <div className="card mb-5 p-4">
-        <div className="mb-3 flex flex-wrap items-center justify-between gap-2"><div><div className="label">Progress</div><div className="text-2xl font-semibold">{Math.round(progressOf(run))}%</div></div><div className="text-right text-sm"><div className="muted">Steps running in parallel</div><div className="text-xl font-medium">{(steps.filter((s: any) => String(s.status) === 'running')).length}</div></div></div>
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2"><div><div className="label">Successfully completed steps</div><div className="text-2xl font-semibold">{Math.round(progressOf(run))}%</div></div><div className="text-right text-sm"><div className="muted">Execution attempts running</div><div className="text-xl font-medium">{(attempts.filter((s: any) => String(s.status) === 'running')).length}</div></div></div>
         <ProgressBar value={progressOf(run)} />
         <div className="mt-3 flex flex-wrap gap-2">
           <Link className="btn" to={`/requests/${requestOf(run)}`}>Parent request</Link>
