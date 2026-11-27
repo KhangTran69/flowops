@@ -136,6 +136,11 @@ python -m src.ticket_processor
 uvicorn src.api:app --reload        # http://127.0.0.1:8000
 ```
 
+> **After pulling new commits, re-run `pip install -r requirements-dev.txt`.**
+> The pinned files move weekly (Dependabot), and a stale local venv can fail
+> test collection with import errors that do not exist in CI — CI installs
+> the pinned files fresh on every run and is the authoritative signal.
+
 Key URLs: `/` landing page · `/docs` interactive API docs · `/dashboard` monitoring.
 
 ### Dependency management
