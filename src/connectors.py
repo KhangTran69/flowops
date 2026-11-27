@@ -55,6 +55,7 @@ from sqlalchemy.orm import Session
 
 from src import db, expressions, scheduler
 from src.deps import _new_run_id
+from src.schemas import OnboardingRequestIn
 
 
 # ---------------------------------------------------------------------------
@@ -731,11 +732,11 @@ def _fire_start_workflow(
 ) -> FiredAction:
     """Create onboarding request(s) from the rule template and start runs.
 
-    Reuses ``api._create_onboarding_request`` so triggers get the exact same
+    Reuses ``routes.onboarding._create_onboarding_request`` so triggers get the same
     validation, checklist generation, definition pinning, timers, and audit
     trail as the operator console. Late import avoids the api->routes cycle.
     """
-    from src import api
+    from src.routes.onboarding import _create_onboarding_request
 
     request_type = rule.request_type or "onboarding"
     tenant_key = event.tenant_key or rule.tenant_key
@@ -755,7 +756,7 @@ def _fire_start_workflow(
     started_runs: list[int] = []
     created_requests: list[int] = []
     for index, email in enumerate(emails):
-        payload = api.OnboardingRequestIn(
+        payload = OnboardingRequestIn(
             request_type=request_type,
             employee_name=str(
                 inputs.get("employee_names", [None] * len(emails))[index]
@@ -770,7 +771,7 @@ def _fire_start_workflow(
             template=inputs.get("template"),
             tenant_key=tenant_key,
         )
-        record = api._create_onboarding_request(
+        record = _create_onboarding_request(
             payload, session, actor_subject=f"trigger:{rule.id}"
         )
         created_requests.append(record.id)

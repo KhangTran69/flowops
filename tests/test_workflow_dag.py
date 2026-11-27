@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 
 from src import api, chatops, db, jobs, onboarding, worker, workflow
 from src.actions import ActionResult
+from src.routes import onboarding as onboarding_routes
 
 ONBOARDING = {
     "request_type": "onboarding",
@@ -252,7 +253,7 @@ def test_terminal_failure_cascades_to_dependents(client, monkeypatch):
         def execute(self, action, context):
             raise RuntimeError("graph failure")
 
-    monkeypatch.setattr(api, "ACTION_ADAPTER", _FailingAdapter())
+    monkeypatch.setattr(onboarding_routes, "ACTION_ADAPTER", _FailingAdapter())
     monkeypatch.setenv("FLOWOPS_ACTION_RETRIES", '{"create_user_account": 1}')
     body = _create(client, template="onboarding-dag")
     request_id = body["id"]
@@ -274,7 +275,7 @@ def test_terminal_failure_cascades_to_dependents(client, monkeypatch):
 
 def test_prerequisite_outputs_are_piped_into_downstream_context(client, monkeypatch):
     adapter = _CapturingAdapter()
-    monkeypatch.setattr(api, "ACTION_ADAPTER", adapter)
+    monkeypatch.setattr(onboarding_routes, "ACTION_ADAPTER", adapter)
     body = _create(client, template="onboarding-dag")
     request_id = body["id"]
     items = _by_key(body)
@@ -297,7 +298,7 @@ def test_prerequisite_outputs_are_piped_into_downstream_context(client, monkeypa
 
 
 def test_step_output_is_persisted_for_later_reads(client, monkeypatch):
-    monkeypatch.setattr(api, "ACTION_ADAPTER", _CapturingAdapter())
+    monkeypatch.setattr(onboarding_routes, "ACTION_ADAPTER", _CapturingAdapter())
     body = _create(client, template="onboarding-dag")
     request_id = body["id"]
     items = _by_key(body)
@@ -314,7 +315,7 @@ def test_step_output_is_persisted_for_later_reads(client, monkeypatch):
 
 def test_worker_injects_prerequisite_outputs(client, monkeypatch):
     adapter = _CapturingAdapter()
-    monkeypatch.setattr(api, "ACTION_ADAPTER", adapter)
+    monkeypatch.setattr(onboarding_routes, "ACTION_ADAPTER", adapter)
     body = _create(client, template="onboarding-dag")
     request_id = body["id"]
     items = _by_key(body)
@@ -483,7 +484,7 @@ def test_chatops_approve_on_blocked_step_is_rejected(client):
 
 
 def test_ui_renders_dependencies_blocker_badge_and_output(client, monkeypatch):
-    monkeypatch.setattr(api, "ACTION_ADAPTER", _CapturingAdapter())
+    monkeypatch.setattr(onboarding_routes, "ACTION_ADAPTER", _CapturingAdapter())
     body = _create(client, template="onboarding-dag")
     request_id = body["id"]
     items = _by_key(body)

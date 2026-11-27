@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from src import api, db
+from src.routes import onboarding as onboarding_routes
 
 OFFBOARDING = {
     "request_type": "offboarding",
@@ -53,7 +54,7 @@ def test_first_completion_executes_once_and_replays(client, monkeypatch):
         calls.append((step_key, email))
         return {"simulated": True, "action": step_key, "target": email}
 
-    monkeypatch.setattr(api, "offboarding_executor", fake)
+    monkeypatch.setattr(onboarding_routes, "offboarding_executor", fake)
     body = _create_offboarding(client)
     path = f"/offboarding-requests/{body['id']}/steps/recover_laptop/complete"
 
@@ -83,7 +84,7 @@ def test_concurrent_requests_claim_before_executing(client, monkeypatch):
         assert release.wait(timeout=5)
         return {"simulated": True, "action": step_key, "target": email}
 
-    monkeypatch.setattr(api, "offboarding_executor", slow)
+    monkeypatch.setattr(onboarding_routes, "offboarding_executor", slow)
     body = _create_offboarding(client)
     path = f"/offboarding-requests/{body['id']}/steps/recover_laptop/complete"
 
@@ -105,7 +106,7 @@ def test_concurrent_requests_claim_before_executing(client, monkeypatch):
 
 
 def test_validation_errors_and_approval_gate(client, monkeypatch):
-    monkeypatch.setattr(api, "offboarding_executor", lambda key, email: {"action": key})
+    monkeypatch.setattr(onboarding_routes, "offboarding_executor", lambda key, email: {"action": key})
     body = _create_offboarding(client)
     checklist_id = body["id"]
     assert client.post(
@@ -143,20 +144,20 @@ def test_executor_failure_removes_claim_and_allows_retry(client, monkeypatch):
         calls.append(step_key)
         raise RuntimeError("simulated executor exploded")
 
-    monkeypatch.setattr(api, "offboarding_executor", failing)
+    monkeypatch.setattr(onboarding_routes, "offboarding_executor", failing)
     body = _create_offboarding(client)
     path = f"/offboarding-requests/{body['id']}/steps/recover_laptop/complete"
     with pytest.raises(RuntimeError, match="simulated executor exploded"):
         client.post(path)
     assert _ledger_rows(body["id"]) == []
 
-    monkeypatch.setattr(api, "offboarding_executor", lambda key, email: {"action": key})
+    monkeypatch.setattr(onboarding_routes, "offboarding_executor", lambda key, email: {"action": key})
     assert client.post(path).status_code == 201
     assert len(calls) == 1
 
 
 def test_closed_checklist_rejects_completion(client, monkeypatch):
-    monkeypatch.setattr(api, "offboarding_executor", lambda key, email: {"action": key})
+    monkeypatch.setattr(onboarding_routes, "offboarding_executor", lambda key, email: {"action": key})
     body = _create_offboarding(client)
     session = db.SessionLocal()
     try:

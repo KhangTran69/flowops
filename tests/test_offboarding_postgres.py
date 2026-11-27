@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from src import api, db
+from src.routes import onboarding as onboarding_routes
 
 POSTGRES_URL = os.environ.get("FLOWOPS_TEST_POSTGRES_URL")
 pytestmark = pytest.mark.skipif(
@@ -40,7 +41,7 @@ def test_postgres_offboarding_claim_and_replay(client, monkeypatch):
         calls.append(step_key)
         return {"simulated": True, "action": step_key, "target": email}
 
-    monkeypatch.setattr(api, "offboarding_executor", fake)
+    monkeypatch.setattr(onboarding_routes, "offboarding_executor", fake)
     created = client.post("/onboarding-requests", json=OFFBOARDING)
     assert created.status_code == 201
     checklist_id = created.json()["id"]

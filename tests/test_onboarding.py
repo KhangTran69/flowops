@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from src import api, db
 from src.onboarding import OFFBOARDING_STEPS, ONBOARDING_STEPS
+from src.routes import onboarding as onboarding_routes
 
 VALID_ONBOARDING = {
     "request_type": "onboarding",
@@ -282,7 +283,7 @@ def test_onboarding_concurrent_same_key_returns_409(client, monkeypatch):
     release = threading.Event()
     calls = 0
     call_lock = threading.Lock()
-    original_create = api._create_onboarding_request
+    original_create = onboarding_routes._create_onboarding_request
 
     def pause_first(request, session, actor_subject=None):
         nonlocal calls
@@ -294,7 +295,7 @@ def test_onboarding_concurrent_same_key_returns_409(client, monkeypatch):
             assert release.wait(timeout=5), "test did not release the first request"
         return original_create(request, session, actor_subject)
 
-    monkeypatch.setattr(api, "_create_onboarding_request", pause_first)
+    monkeypatch.setattr(onboarding_routes, "_create_onboarding_request", pause_first)
     headers = {"Idempotency-Key": "onboarding-concurrent"}
 
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -323,7 +324,7 @@ def test_onboarding_stale_owner_cannot_finalize_after_takeover(client, monkeypat
     release_a = threading.Event()
     calls = 0
     call_lock = threading.Lock()
-    original_create = api._create_onboarding_request
+    original_create = onboarding_routes._create_onboarding_request
 
     def pause_first(request, session, actor_subject=None):
         nonlocal calls
@@ -335,7 +336,7 @@ def test_onboarding_stale_owner_cannot_finalize_after_takeover(client, monkeypat
             assert release_a.wait(timeout=5), "test did not release the stale owner"
         return original_create(request, session, actor_subject)
 
-    monkeypatch.setattr(api, "_create_onboarding_request", pause_first)
+    monkeypatch.setattr(onboarding_routes, "_create_onboarding_request", pause_first)
     key = "onboarding-takeover"
     headers = {"Idempotency-Key": key}
 
@@ -403,7 +404,7 @@ def test_onboarding_failure_cleans_up_only_its_own_reservation(client, monkeypat
     def fail_create(request, session, actor_subject=None):
         raise RuntimeError("onboarding creation exploded")
 
-    monkeypatch.setattr(api, "_create_onboarding_request", fail_create)
+    monkeypatch.setattr(onboarding_routes, "_create_onboarding_request", fail_create)
     with pytest.raises(RuntimeError, match="onboarding creation exploded"):
         client.post(
             "/onboarding-requests",
