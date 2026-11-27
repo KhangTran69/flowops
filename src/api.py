@@ -1353,60 +1353,100 @@ def _definition_out(
     )
 
 
+def _definition_mutation(
+    session: Session, response: Response, actor: Actor, operation: str,
+    definition_key: str, payload: BaseModel, idempotency_key: Optional[str],
+) -> WorkflowDefinitionOut:
+    """Use the existing fenced transaction for all definition mutations."""
+    _validate_idempotency_key(idempotency_key)
+    scope = idempotency.SCOPE_DEFINITION
+    key = ("definition:" + hashlib.sha256(json.dumps(
+        [actor.subject, idempotency_key], separators=(",", ":")
+    ).encode()).hexdigest()) if idempotency_key else None
+    fingerprint = hashlib.sha256(json.dumps(
+        [operation, definition_key, payload.model_dump(mode="json")],
+        sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+    owner, replay = _reserve_idempotency_key(
+        session, response, key, fingerprint, scope, definition_key
+    )
+    if replay is not None:
+        return WorkflowDefinitionOut.model_validate(replay["definition"])
+    try:
+        if operation == "create":
+            definition = definitions.create_definition(
+                session, key=payload.key, name=payload.name,
+                request_type=payload.request_type, steps=payload.steps,
+                actor=actor.subject,
+            )
+        elif operation == "version":
+            definitions.create_version(session, definition_key, payload.steps, actor=actor.subject)
+            definition = definitions.get_definition(session, definition_key)
+        else:
+            definition = definitions.publish_version(
+                session, definition_key, payload.version, actor=actor.subject
+            )
+        if definition is None:
+            raise HTTPException(404, "Definition not found.")
+        result = _definition_out(session, definition)
+        db.log_execution(
+            session, run_id=_new_run_id(), action=f"workflow.definition.{operation}",
+            status="success", detail=f"definition={definition.key}",
+            actor_subject=actor.subject,
+        )
+        if key and owner:
+            if not _complete_idempotency_key(
+                session, key, owner, fingerprint, scope, definition.key,
+                {"definition": result.model_dump(mode="json")},
+            ):
+                raise HTTPException(409, "Definition reservation changed; retry.")
+        else:
+            session.commit()
+        return result
+    except Exception as error:
+        session.rollback()
+        if key and owner:
+            _release_idempotency_key(session, key, owner)
+        if isinstance(error, definitions.DefinitionError):
+            raise HTTPException(422, str(error)) from error
+        if isinstance(error, IntegrityError):
+            raise HTTPException(409, "Concurrent definition change; refresh and retry.") from error
+        raise
+
+
 @app.post("/workflow-definitions", response_model=WorkflowDefinitionOut)
 def create_workflow_definition(
     payload: DefinitionCreateIn,
+    response: Response,
     actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> WorkflowDefinitionOut:
-    try:
-        definition = definitions.create_definition(
-            session,
-            key=payload.key,
-            name=payload.name,
-            request_type=payload.request_type,
-            steps=payload.steps,
-            actor=actor.subject,
-        )
-    except definitions.DefinitionError as error:
-        raise HTTPException(422, str(error)) from error
-    session.commit()
-    return _definition_out(session, definition)
+    return _definition_mutation(session, response, actor, "create", payload.key, payload, idempotency_key)
 
 
 @app.put("/workflow-definitions/{key}", response_model=WorkflowDefinitionOut)
 def create_workflow_definition_version(
     key: str,
     payload: DefinitionVersionIn,
+    response: Response,
     actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> WorkflowDefinitionOut:
-    try:
-        definitions.create_version(session, key, payload.steps, actor=actor.subject)
-        definition = definitions.get_definition(session, key)
-    except definitions.DefinitionError as error:
-        raise HTTPException(422, str(error)) from error
-    if definition is None:
-        raise HTTPException(404, "Definition not found.")
-    session.commit()
-    return _definition_out(session, definition)
+    return _definition_mutation(session, response, actor, "version", key, payload, idempotency_key)
 
 
 @app.post("/workflow-definitions/{key}/publish", response_model=WorkflowDefinitionOut)
 def publish_workflow_definition(
     key: str,
     payload: DefinitionPublishIn,
+    response: Response,
     actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> WorkflowDefinitionOut:
-    try:
-        definition = definitions.publish_version(
-            session, key, payload.version, actor=actor.subject
-        )
-    except definitions.DefinitionError as error:
-        raise HTTPException(422, str(error)) from error
-    session.commit()
-    return _definition_out(session, definition)
+    return _definition_mutation(session, response, actor, "publish", key, payload, idempotency_key)
 
 
 @app.post("/onboarding-requests/{request_id}/definition")
