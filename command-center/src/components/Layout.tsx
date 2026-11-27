@@ -16,7 +16,7 @@ const nav = [
 ]
 
 export function Layout({ children }: { children: ReactNode }) {
-  const { role, email, configured } = useSession()
+  const { role, email, configured, loading: sessionLoading } = useSession()
   const [mobile, setMobile] = useState(false)
   const [dark, setDark] = useState(() => localStorage.getItem('flowops-theme') === 'dark')
   const location = useLocation()
@@ -25,6 +25,7 @@ export function Layout({ children }: { children: ReactNode }) {
   useEffect(() => { setMobile(false) }, [location.pathname])
   const healthLabel = ready.loading && !ready.updatedAt ? 'checking backend' : ready.error ? (ready.updatedAt ? 'backend stale' : 'backend unavailable') : ready.data?.status === 'ready' && ready.status === 200 ? 'backend ready' : 'backend unavailable'
   const healthy = healthLabel === 'backend ready'
+  if (sessionLoading) return <div role="status" className="grid min-h-screen place-items-center muted">Verifying console access…</div>
   if (configured === false) return <div className="grid min-h-screen place-items-center p-6"><div className="card max-w-lg p-6"><h1 className="text-xl font-semibold">Console access unavailable</h1><p className="muted mt-2">Sign in through the configured authentication gateway, or ask your administrator to verify the console configuration.</p></div></div>
   return <div className="min-h-screen md:flex">
     <aside className={cn('fixed inset-y-0 left-0 z-40 w-64 bg-slate-950 p-3 text-slate-200 transition-transform md:static md:translate-x-0', mobile ? 'translate-x-0' : '-translate-x-full')}>
