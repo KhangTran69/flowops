@@ -92,12 +92,16 @@ def start_run(
     now: Optional[datetime] = None,
 ) -> db.WorkflowRunRecord:
     """Start one run per request, idempotently."""
+    # Serialize concurrent starts using the existing request row. The unique
+    # constraint on request_id remains the final database invariant.
+    request = session.execute(select(db.OnboardingRequestRecord).where(
+        db.OnboardingRequestRecord.id == request_id
+    ).with_for_update().execution_options(populate_existing=True)).scalar_one_or_none()
+    if request is None:
+        raise LookupError("Onboarding request not found.")
     existing = get_run_for_request(session, request_id)
     if existing is not None:
         return existing
-    request = session.get(db.OnboardingRequestRecord, request_id)
-    if request is None:
-        raise LookupError("Onboarding request not found.")
     run = db.WorkflowRunRecord(
         request_id=request_id,
         status="running",
@@ -375,8 +379,14 @@ def advance_from_job(
     return tick(session, run.id, now=at, worker_id="event", commit=False)
 
 
+def _locked_run(session: Session, run_id: int) -> Optional[db.WorkflowRunRecord]:
+    return session.execute(select(db.WorkflowRunRecord).where(
+        db.WorkflowRunRecord.id == run_id
+    ).with_for_update().execution_options(populate_existing=True)).scalar_one_or_none()
+
+
 def pause_run(session: Session, run_id: int, actor_subject: str, now: Optional[datetime] = None) -> db.WorkflowRunRecord:
-    run = get_run(session, run_id)
+    run = _locked_run(session, run_id)
     if run is None:
         raise LookupError("Workflow run not found.")
     if run.status == "running":
@@ -387,7 +397,7 @@ def pause_run(session: Session, run_id: int, actor_subject: str, now: Optional[d
 
 
 def resume_run(session: Session, run_id: int, actor_subject: str, now: Optional[datetime] = None) -> db.WorkflowRunRecord:
-    run = get_run(session, run_id)
+    run = _locked_run(session, run_id)
     if run is None:
         raise LookupError("Workflow run not found.")
     if run.status == "paused":
@@ -400,10 +410,10 @@ def resume_run(session: Session, run_id: int, actor_subject: str, now: Optional[
 
 
 def cancel_run(session: Session, run_id: int, actor_subject: str, now: Optional[datetime] = None) -> db.WorkflowRunRecord:
-    run = get_run(session, run_id)
+    run = _locked_run(session, run_id)
     if run is None:
         raise LookupError("Workflow run not found.")
-    if run.status in ("completed", "cancelled"):
+    if run.status in TERMINAL_RUN_STATUSES:
         return run
     run.status = "cancelled"
     run.completed_at = _now(now)
