@@ -1958,8 +1958,57 @@ def decide_workflow_step(
     item_id: int,
     action: Literal["approve", "reject"],
     payload: ApprovalDecisionIn,
+    response: Response,
     actor: Actor = Depends(_admin_actor),
     session: Session = Depends(db.get_session),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+) -> WorkflowRunOut:
+    # Authenticate and authorize before a reservation can be replayed.
+    run = session.get(db.WorkflowRunRecord, run_id)
+    if run is None:
+        raise HTTPException(404, "Workflow run not found.")
+    _require_workflow_run_access(session, actor, run)
+    item = session.get(db.ChecklistItemRecord, item_id)
+    if item is None or item.request_id != run.request_id:
+        raise HTTPException(404, "Checklist item not found.")
+    _validate_idempotency_key(idempotency_key)
+    scope = idempotency.SCOPE_APPROVAL
+    key = ("approval:" + hashlib.sha256(json.dumps([
+        _actor_tenant(actor), actor.subject, idempotency_key
+    ], separators=(",", ":")).encode()).hexdigest()) if idempotency_key else None
+    fingerprint = hashlib.sha256(json.dumps([
+        run_id, item_id, action, payload.reason.strip()
+    ], separators=(",", ":")).encode()).hexdigest()
+    owner, replay = _reserve_idempotency_key(
+        session, response, key, fingerprint, scope, str(run.request_id)
+    )
+    if replay is not None:
+        return WorkflowRunOut.model_validate(replay["workflow_run"])
+    try:
+        result = _decide_workflow_step(session, run_id, item_id, action, payload, actor)
+        if key and owner:
+            if not _complete_idempotency_key(
+                session, key, owner, fingerprint, scope, str(result.request_id),
+                {"workflow_run": result.model_dump(mode="json")},
+            ):
+                raise HTTPException(409, "Decision reservation changed; retry.")
+        else:
+            session.commit()
+        return result
+    except Exception:
+        session.rollback()
+        if key and owner:
+            _release_idempotency_key(session, key, owner)
+        raise
+
+
+def _decide_workflow_step(
+    session: Session,
+    run_id: int,
+    item_id: int,
+    action: Literal["approve", "reject"],
+    payload: ApprovalDecisionIn,
+    actor: Actor,
 ) -> WorkflowRunOut:
     reason = payload.reason.strip()
     if len(reason) < 3:
@@ -2000,8 +2049,7 @@ def decide_workflow_step(
         detail=f"step '{item.step}'; reason={reason}", actor_subject=actor.subject,
     )
     scheduler.tick(session, run.id, worker_id="console-transition", commit=False)
-    session.commit()
-    session.refresh(run)
+    session.flush()
     return _workflow_run_out(session, run)
 
 
