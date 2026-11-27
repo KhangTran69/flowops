@@ -7,7 +7,6 @@ import time
 
 from concurrent.futures import ThreadPoolExecutor
 from fastapi.testclient import TestClient
-from sqlalchemy import delete
 
 from src import api, db
 
@@ -21,6 +20,7 @@ def main():
     with TestClient(api.app) as client:
         session = db.SessionLocal()
         try:
+            session.add(db.TenantRecord(key=tenant, name='Synthetic benchmark tenant', active=True))
             session.add_all([
                 db.TicketRecord(ticket_id=str(80000000+i), requester_id=7,
                     title="Benchmark VPN ticket", status="open", priority="normal",
