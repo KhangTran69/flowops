@@ -1,0 +1,31 @@
+# Example rules only. Tune thresholds and labels against a staging workload.
+groups:
+  - name: flowops-console
+    rules:
+      - alert: FlowOpsHighHttpErrorRate
+        expr: |
+          (sum(rate(flowops_http_requests_total{status=~"5.."}[5m]))
+          / clamp_min(sum(rate(flowops_http_requests_total[5m])), 0.001)) > 0.05
+          and sum(rate(flowops_http_requests_total[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "FlowOps HTTP error ratio exceeds 5%"
+      - alert: FlowOpsHighCoreReadLatency
+        expr: |
+          histogram_quantile(0.95, sum by (le) (
+            rate(flowops_http_request_duration_seconds_bucket{method="GET",route=~"/tickets|/workflow-runs|/command-center/summary"}[5m])
+          )) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "FlowOps core read p95 exceeds provisional 500 ms target"
+      - alert: FlowOpsFailedNotificationDelivery
+        expr: max(flowops_notification_outbox{status="failed"}) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Failed notification deliveries require reconciliation"
