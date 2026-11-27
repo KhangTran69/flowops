@@ -44,8 +44,10 @@ from src.deps import _new_run_id
 PROCESSING_TIMEOUT = timedelta(minutes=5)
 SCOPE_TICKET = "ticket"
 SCOPE_ONBOARDING = "onboarding"
+SCOPE_MANUAL_TICKET = "manual_ticket"
 REPLAY_ACTIONS = {
     SCOPE_TICKET: "ticket.idempotent_replay",
+    SCOPE_MANUAL_TICKET: "ticket.manual.idempotent_replay",
     SCOPE_ONBOARDING: "onboarding.request.idempotent_replay",
 }
 
