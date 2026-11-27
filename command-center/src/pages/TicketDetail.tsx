@@ -8,11 +8,12 @@ import { BackLink, JsonView, PageHeader } from '../components/Basics'
 import { StatusBadge } from '../components/StatusBadge'
 import { Confirm } from '../components/Confirm'
 import type { TicketDetail as TicketDetailContract } from '../lib/contracts'
+import type { Triage } from '../lib/validation'
 
 export default function TicketDetail() {
   const { id } = useParams()
   const { data: ticket, error, status, loading, reload } = usePoll<TicketDetailContract>(`/tickets/${id}`)
-  const [triage, setTriage] = useState<any>(null)
+  const [triage, setTriage] = useState<Triage | null>(null)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -22,15 +23,14 @@ export default function TicketDetail() {
     String(r.suggested ?? '') !== String(r.current ?? ''),), [recommendations])
   useEffect(() => { setSelected(new Set(eligible.map((r: any) => r.id))) }, [triage])
   async function runTriage() {
-    setBusy(true); const r = await api('POST', `/tickets/${id}/ai-triage`)
+    setBusy(true); const r = await api<Triage>('POST', `/tickets/${id}/ai-triage`)
     setBusy(false)
-    if (r.ok) { setTriage(r.data); reload() } else alert(r.error || 'Triage failed.')
+    if (r.ok) { setTriage(r.data ?? null); reload() } else alert(r.error || 'Triage failed.')
   }
   async function apply() {
     const ids = [...selected]
     if (!ids.length) return
-    const fields = eligible.filter((r: any) => ids.includes(r.id)).map((r: any) => ({ id: r.id, field: r.kind, current: r.current, suggested: r.suggested }))
-    setBusy(true); const r = await mutate('POST', `/tickets/${id}/ai-recommendations/apply`, { recommendation_ids: ids, fields }, 'AI recommendations applied.')
+      setBusy(true); const r = await mutate('POST', `/tickets/${id}/ai-recommendations/apply`, { recommendation_ids: ids }, 'AI recommendations applied.')
     setBusy(false); if (r.ok) { setConfirmOpen(false); setTriage(null); setSelected(new Set()); reload() }
   }
   const history = ticket?.history || []
@@ -58,7 +58,7 @@ export default function TicketDetail() {
           <p className="mb-3 whitespace-pre-wrap">{triage.summary?.text || txt(triage.summary)}</p>
           {(triage.summary?.urgency_signals || []).length > 0 && <div className="mb-4 flex flex-wrap gap-1"><span className="muted text-xs uppercase">Urgency:</span>{(triage.summary.urgency_signals || []).map((s: string) => <StatusBadge key={s} status={s} />)}</div>}
           <h3 className="mb-2 font-medium">Knowledge base matches</h3>
-          <div className="mb-4 grid gap-3 md:grid-cols-2">{[...(triage.knowledge_base || [])].sort((a: any, b: any) => (b.score || 0) - (a.score || 0)).map((m: any) => <article key={m.article?.id || m.id} className="rounded border border-[hsl(var(--border))] p-3"><div className="font-medium">{m.article?.title || m.title}</div><p className="muted mt-1 text-sm">{m.article?.summary || m.summary}</p><div className="muted mt-1 text-xs">score {m.score ?? '—'} · {m.article?.category || m.category || '—'}</div></article>)}</div>
+          <div className="mb-4 grid gap-3 md:grid-cols-2">{[...(triage.knowledge_base || [])].sort((a: any, b: any) => (b.score || 0) - (a.score || 0)).map((m: any) => <article key={m.article.id} className="rounded border border-[hsl(var(--border))] p-3"><div className="font-medium">{m.article.title}</div><p className="muted mt-1 text-sm">{m.article.summary}</p><div className="muted mt-1 text-xs">score {m.score ?? '—'} · {m.article.category}</div></article>)}</div>
           <h3 className="mb-2 font-medium">Recommendations</h3>
           {recommendations.length ? <div className="table-wrap"><table><thead><tr><th>Approve</th><th>Recommendation</th><th>Current</th><th>Suggested</th><th>Why</th><th>Confidence</th></tr></thead><tbody>
             {recommendations.map((r: any) => { const can = eligible.some((e: any) => e.id === r.id); return <tr key={r.id}><td>{can ? <input type="checkbox" checked={selected.has(r.id)} onChange={(e) => { const n = new Set(selected); e.target.checked ? n.add(r.id) : n.delete(r.id); setSelected(n) }} aria-label={`Approve ${r.title || r.id}`} /> : <span className="muted text-xs">info only</span>}</td><td>{r.title || r.id}</td><td>{r.current ?? '—'}</td><td>{r.suggested ?? '—'}</td><td className="muted text-sm">{r.rationale || '—'}</td><td>{r.confidence != null ? `${r.confidence}%` : '—'}</td></tr> })}
