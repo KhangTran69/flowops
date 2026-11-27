@@ -36,6 +36,7 @@ export function responseSchema(method: string, path: string): z.ZodType | undefi
   if (path.startsWith('/workflow-runs/')) return run
   if (path === '/workflow-definitions') return method === 'GET' ? z.array(definition) : definition
   if (path.endsWith('/diff') && path.startsWith('/workflow-definitions/')) return diff
+  if (path === '/workflow-definitions/validate') return z.object({ steps: z.array(definitionStep), checksum: text })
   if (path.startsWith('/workflow-definitions/')) return definition
   if (path === '/audit' || path === '/execution-logs') return z.array(history)
   return undefined
