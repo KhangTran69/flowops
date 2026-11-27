@@ -733,3 +733,45 @@ def test_run_detail_and_console_approval_fenced(fencing_client):
         assert len(rows) == 1
     finally:
         session.close()
+
+
+def test_run_list_batches_related_queries(fencing_client):
+    from sqlalchemy import event
+    client, set_actor = fencing_client
+    set_actor(_tenant_actor("tenant-a"))
+    for i in range(4):
+        request = client.post("/onboarding-requests", json={**ONBOARDING, "employee_email": f"employee{i}@example.test"})
+        assert request.status_code in (200, 201), request.text
+        assert client.post(f"/onboarding-requests/{request.json()['id']}/run").status_code == 200
+    queries = []
+    tables = ("workflow_runs", "onboarding_requests", "checklist_items", "workflow_timers", "workflow_step_runs", "workflow_events")
+    def collect(conn, cursor, statement, parameters, context, executemany):
+        sql = statement.strip().lower()
+        if sql.startswith("select") and any(f"from {table}" in sql for table in tables):
+            queries.append(sql)
+    event.listen(db.engine, "before_cursor_execute", collect)
+    try:
+        response = client.get("/workflow-runs", params={"limit": 50})
+        assert response.status_code == 200, response.text
+        assert len(response.json()) == 4
+        assert len(queries) <= 6, queries
+    finally:
+        event.remove(db.engine, "before_cursor_execute", collect)
+
+
+def test_definition_comparison_respects_global_admin(fencing_client):
+    client, set_actor = fencing_client
+    set_actor(_local_actor())
+    base = {"key": "first", "step": "First step", "queue": "it-hardware", "requires_approval": False, "action": "none"}
+    second = {"key": "second", "step": "Second step", "queue": "it-software", "requires_approval": False, "action": "none"}
+    created = client.post("/workflow-definitions", json={"key": "compare-test", "name": "Compare", "request_type": "onboarding", "steps": [base]})
+    assert created.status_code == 200, created.text
+    version = client.put("/workflow-definitions/compare-test", json={"steps": [{**base, "queue": "it-software"}, second]})
+    assert version.status_code == 200, version.text
+    result = client.get("/workflow-definitions/compare-test/diff", params={"from": 1, "to": 2})
+    assert result.status_code == 200, result.text
+    assert result.json()["added"] == ["second"]
+    assert result.json()["changed"] == ["first"]
+    assert result.json()["removed"] == []
+    set_actor(_tenant_actor("tenant-a"))
+    assert client.get("/workflow-definitions/compare-test/diff", params={"from": 1, "to": 2}).status_code == 403
