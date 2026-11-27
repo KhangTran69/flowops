@@ -2009,24 +2009,58 @@ def list_workflow_runs(
 
 
 def _run_action(
-    session: Session, run_id: int, actor: Actor, action: str
+    session: Session, run_id: int, actor: Actor, action: str,
+    response: Response, idempotency_key: Optional[str],
 ) -> WorkflowRunOut:
     run = session.get(db.WorkflowRunRecord, run_id)
     if run is None:
         raise HTTPException(404, "Workflow run not found.")
     _require_workflow_run_access(session, actor, run)
+    _validate_idempotency_key(idempotency_key)
+    scope = idempotency.SCOPE_RUN_CONTROL
+    key = ("run-control:" + hashlib.sha256(json.dumps(
+        [_actor_tenant(actor), actor.subject, idempotency_key], separators=(",", ":")
+    ).encode()).hexdigest()) if idempotency_key else None
+    fingerprint = hashlib.sha256(json.dumps([run_id, action]).encode()).hexdigest()
+    owner, replay = _reserve_idempotency_key(
+        session, response, key, fingerprint, scope, str(run.request_id),
+        actor_subject=actor.subject,
+    )
+    if replay is not None:
+        return WorkflowRunOut.model_validate(replay["workflow_run"])
     try:
+        run = scheduler._locked_run(session, run_id)
+        if run is None:
+            raise HTTPException(404, "Workflow run not found.")
+        _require_workflow_run_access(session, actor, run)
+        allowed = {"pause": {"running", "paused"}, "resume": {"paused", "running"},
+                   "cancel": {"pending", "running", "paused", "cancelled"}}
+        if run.status not in allowed[action]:
+            raise HTTPException(409, f"Cannot {action} a run with status '{run.status}'.")
         if action == "pause":
             run = scheduler.pause_run(session, run_id, actor.subject)
         elif action == "resume":
             run = scheduler.resume_run(session, run_id, actor.subject)
         else:
             run = scheduler.cancel_run(session, run_id, actor.subject)
-    except LookupError as error:
-        raise HTTPException(404, str(error)) from error
-    session.commit()
-    session.refresh(run)
-    return _workflow_run_out(session, run)
+        session.flush()
+        result = _workflow_run_out(session, run)
+        if key and owner:
+            if not _complete_idempotency_key(
+                session, key, owner, fingerprint, scope, str(result.request_id),
+                {"workflow_run": result.model_dump(mode="json")},
+            ):
+                raise HTTPException(409, "Run-control reservation changed; retry.")
+        else:
+            session.commit()
+        return result
+    except Exception as error:
+        session.rollback()
+        if key and owner:
+            _release_idempotency_key(session, key, owner)
+        if isinstance(error, LookupError):
+            raise HTTPException(404, str(error)) from error
+        raise
 
 
 class ApprovalDecisionIn(BaseModel):
@@ -2137,28 +2171,34 @@ def _decide_workflow_step(
 @app.post("/workflow-runs/{run_id}/pause", response_model=WorkflowRunOut)
 def pause_workflow_run(
     run_id: int,
+    response: Response,
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> WorkflowRunOut:
-    return _run_action(session, run_id, actor, "pause")
+    return _run_action(session, run_id, actor, "pause", response, idempotency_key)
 
 
 @app.post("/workflow-runs/{run_id}/resume", response_model=WorkflowRunOut)
 def resume_workflow_run(
     run_id: int,
+    response: Response,
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> WorkflowRunOut:
-    return _run_action(session, run_id, actor, "resume")
+    return _run_action(session, run_id, actor, "resume", response, idempotency_key)
 
 
 @app.post("/workflow-runs/{run_id}/cancel", response_model=WorkflowRunOut)
 def cancel_workflow_run(
     run_id: int,
+    response: Response,
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> WorkflowRunOut:
-    return _run_action(session, run_id, actor, "cancel")
+    return _run_action(session, run_id, actor, "cancel", response, idempotency_key)
 
 
 def _get_item(
