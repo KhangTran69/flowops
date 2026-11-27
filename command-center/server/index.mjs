@@ -22,7 +22,7 @@ const GET_PATHS = [
   rr('/execution-logs'), rr('/audit'),
 ]
 const OPERATOR_POST = [
-  rr('/tickets'), rr(`/tickets/${SEG}/ai-triage`),
+  rr('/tickets'), rr('/tickets/manual'), rr(`/tickets/${SEG}/ai-triage`),
   rr(`/tickets/${SEG}/ai-recommendations/apply`),
   rr('/onboarding-requests'), rr(`/onboarding-requests/${SEG}/run`),
   rr(`/workflow-runs/${SEG}/(pause|resume|cancel)`),
