@@ -43,8 +43,13 @@ def main():
             "method": "POST", "path": "/workflow-definitions", "body": {},
         }, headers={"X-FlowOps-Request": "1", "X-User-Role": "admin"})
         assert forged.status == 403
-        # Cookie removal simulates expired/invalid credentials on the next request.
-        context.clear_cookies()
+        # Verify server-side revocation, even when a previously copied cookie is replayed.
+        copied = context.cookies()
+        identity = page.request.get(api + "/command-center/session").json()
+        logged_out = page.request.post(api + "/logout", form={"csrf_token": identity["csrf_token"]}, max_redirects=0)
+        assert logged_out.status == 303
+        context.add_cookies(copied)
+        assert page.request.get(console + "/api/session").status == 401
         page.get_by_label("Search").fill("trigger identity check")
         expect(page.get_by_role("heading", name="Console access unavailable")).to_be_visible(timeout=15000)
         browser.close()
