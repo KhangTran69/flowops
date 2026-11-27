@@ -743,6 +743,14 @@ def log_execution(
     )
 
 
+class RevokedUISessionRecord(Base):
+    """A revoked signed session, retained until its maximum validity ends."""
+
+    __tablename__ = "revoked_ui_sessions"
+    digest: Mapped[str] = mapped_column(String(64), primary_key=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+
 class ChatOpsTokenUseRecord(Base):
     """Single-use record for signed ChatOps approval tokens (v1.1)."""
 
