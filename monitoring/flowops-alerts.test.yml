@@ -1,0 +1,36 @@
+rule_files:
+  - flowops-alerts.yml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'flowops_notification_outbox{status="failed"}'
+        values: '0 1+0x15'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: FlowOpsFailedNotificationDelivery
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: FlowOpsFailedNotificationDelivery
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Failed notification deliveries require reconciliation"
+  - interval: 1m
+    input_series:
+      - series: 'flowops_http_requests_total{status="200"}'
+        values: '0+600x20'
+      - series: 'flowops_http_requests_total{status="500"}'
+        values: '0+60x20'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: FlowOpsHighHttpErrorRate
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: FlowOpsHighHttpErrorRate
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "FlowOps HTTP error ratio exceeds 5%"
