@@ -639,9 +639,15 @@ def create_ticket(
         request_hash,
         IDEMPOTENCY_SCOPE_TICKET,
         str(request.id),
+        actor_subject=actor.subject,
     )
     if replay is not None:
-        return Ticket.model_validate(replay["ticket"])
+        result = Ticket.model_validate(replay["ticket"])
+        record = session.get(db.TicketRecord, result.ticket_id)
+        if record is None:
+            raise HTTPException(404, "Ticket not found.")
+        _require_ticket_access(actor, record)
+        return result
 
     ownership_lost = False
     try:
@@ -700,7 +706,7 @@ def create_manual_ticket(
     ).hexdigest()
     fingerprint = _request_fingerprint(payload)
     owner, replay = _reserve_idempotency_key(
-        session, response, key, fingerprint, scope, "manual"
+        session, response, key, fingerprint, scope, "manual", actor_subject=actor.subject
     )
     if replay is not None:
         result = Ticket.model_validate(replay["ticket"])
@@ -1353,60 +1359,123 @@ def _definition_out(
     )
 
 
+def _definition_mutation(
+    session: Session, response: Response, actor: Actor, operation: str,
+    definition_key: str, payload: BaseModel, idempotency_key: Optional[str],
+) -> WorkflowDefinitionOut:
+    """Use the existing fenced transaction for all definition mutations."""
+    _validate_idempotency_key(idempotency_key)
+    scope = idempotency.SCOPE_DEFINITION
+    key = ("definition:" + hashlib.sha256(json.dumps(
+        [actor.subject, idempotency_key], separators=(",", ":")
+    ).encode()).hexdigest()) if idempotency_key else None
+    fingerprint = hashlib.sha256(json.dumps(
+        [operation, definition_key, payload.model_dump(mode="json")],
+        sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+    owner, replay = _reserve_idempotency_key(
+        session, response, key, fingerprint, scope, definition_key, actor_subject=actor.subject
+    )
+    if replay is not None:
+        return WorkflowDefinitionOut.model_validate(replay["definition"])
+    try:
+        if operation == "create":
+            definition = definitions.create_definition(
+                session, key=payload.key, name=payload.name,
+                request_type=payload.request_type, steps=payload.steps,
+                actor=actor.subject,
+            )
+        elif operation == "version":
+            definitions.create_version(session, definition_key, payload.steps, actor=actor.subject)
+            definition = definitions.get_definition(session, definition_key)
+        else:
+            definition = definitions.publish_version(
+                session, definition_key, payload.version, actor=actor.subject
+            )
+        if definition is None:
+            raise HTTPException(404, "Definition not found.")
+        result = _definition_out(session, definition)
+        db.log_execution(
+            session, run_id=_new_run_id(), action=f"workflow.definition.{operation}",
+            status="success", detail=f"definition={definition.key}",
+            actor_subject=actor.subject,
+        )
+        if key and owner:
+            if not _complete_idempotency_key(
+                session, key, owner, fingerprint, scope, definition.key,
+                {"definition": result.model_dump(mode="json")},
+            ):
+                raise HTTPException(409, "Definition reservation changed; retry.")
+        else:
+            session.commit()
+        return result
+    except Exception as error:
+        session.rollback()
+        if key and owner:
+            _release_idempotency_key(session, key, owner)
+        if isinstance(error, definitions.DefinitionError):
+            raise HTTPException(422, str(error)) from error
+        if isinstance(error, IntegrityError):
+            raise HTTPException(409, "Concurrent definition change; refresh and retry.") from error
+        raise
+
+
+class DefinitionValidationIn(BaseModel):
+    request_type: Literal["onboarding", "offboarding"]
+    steps: list[dict[str, Any]] = Field(min_length=1, max_length=200)
+
+
+class DefinitionValidationOut(BaseModel):
+    steps: list[dict[str, Any]]
+    checksum: str
+
+
+@app.post("/workflow-definitions/validate", response_model=DefinitionValidationOut)
+def validate_workflow_definition(
+    payload: DefinitionValidationIn,
+    actor: Actor = Depends(_global_admin_actor),
+) -> DefinitionValidationOut:
+    """Preview the authoritative DAG validator without writing any records."""
+    try:
+        steps = definitions.validate_steps(payload.steps, payload.request_type)
+    except definitions.DefinitionError as error:
+        raise HTTPException(422, str(error)) from error
+    return DefinitionValidationOut(steps=steps, checksum=definitions.checksum_for(steps))
+
+
 @app.post("/workflow-definitions", response_model=WorkflowDefinitionOut)
 def create_workflow_definition(
     payload: DefinitionCreateIn,
+    response: Response,
     actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> WorkflowDefinitionOut:
-    try:
-        definition = definitions.create_definition(
-            session,
-            key=payload.key,
-            name=payload.name,
-            request_type=payload.request_type,
-            steps=payload.steps,
-            actor=actor.subject,
-        )
-    except definitions.DefinitionError as error:
-        raise HTTPException(422, str(error)) from error
-    session.commit()
-    return _definition_out(session, definition)
+    return _definition_mutation(session, response, actor, "create", payload.key, payload, idempotency_key)
 
 
 @app.put("/workflow-definitions/{key}", response_model=WorkflowDefinitionOut)
 def create_workflow_definition_version(
     key: str,
     payload: DefinitionVersionIn,
+    response: Response,
     actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> WorkflowDefinitionOut:
-    try:
-        definitions.create_version(session, key, payload.steps, actor=actor.subject)
-        definition = definitions.get_definition(session, key)
-    except definitions.DefinitionError as error:
-        raise HTTPException(422, str(error)) from error
-    if definition is None:
-        raise HTTPException(404, "Definition not found.")
-    session.commit()
-    return _definition_out(session, definition)
+    return _definition_mutation(session, response, actor, "version", key, payload, idempotency_key)
 
 
 @app.post("/workflow-definitions/{key}/publish", response_model=WorkflowDefinitionOut)
 def publish_workflow_definition(
     key: str,
     payload: DefinitionPublishIn,
+    response: Response,
     actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> WorkflowDefinitionOut:
-    try:
-        definition = definitions.publish_version(
-            session, key, payload.version, actor=actor.subject
-        )
-    except definitions.DefinitionError as error:
-        raise HTTPException(422, str(error)) from error
-    session.commit()
-    return _definition_out(session, definition)
+    return _definition_mutation(session, response, actor, "publish", key, payload, idempotency_key)
 
 
 @app.post("/onboarding-requests/{request_id}/definition")
@@ -1659,9 +1728,15 @@ def create_onboarding_request(
         request_hash,
         IDEMPOTENCY_SCOPE_ONBOARDING,
         "0",
+        actor_subject=actor.subject,
     )
     if replay is not None:
-        return OnboardingRequestOut.model_validate(replay["onboarding_request"])
+        result = OnboardingRequestOut.model_validate(replay["onboarding_request"])
+        record = session.get(db.OnboardingRequestRecord, result.id)
+        if record is None:
+            raise HTTPException(404, "Onboarding request not found.")
+        _require_request_access(actor, record)
+        return result
 
     ownership_lost = False
     try:
@@ -1934,24 +2009,58 @@ def list_workflow_runs(
 
 
 def _run_action(
-    session: Session, run_id: int, actor: Actor, action: str
+    session: Session, run_id: int, actor: Actor, action: str,
+    response: Response, idempotency_key: Optional[str],
 ) -> WorkflowRunOut:
     run = session.get(db.WorkflowRunRecord, run_id)
     if run is None:
         raise HTTPException(404, "Workflow run not found.")
     _require_workflow_run_access(session, actor, run)
+    _validate_idempotency_key(idempotency_key)
+    scope = idempotency.SCOPE_RUN_CONTROL
+    key = ("run-control:" + hashlib.sha256(json.dumps(
+        [_actor_tenant(actor), actor.subject, idempotency_key], separators=(",", ":")
+    ).encode()).hexdigest()) if idempotency_key else None
+    fingerprint = hashlib.sha256(json.dumps([run_id, action]).encode()).hexdigest()
+    owner, replay = _reserve_idempotency_key(
+        session, response, key, fingerprint, scope, str(run.request_id),
+        actor_subject=actor.subject,
+    )
+    if replay is not None:
+        return WorkflowRunOut.model_validate(replay["workflow_run"])
     try:
+        run = scheduler._locked_run(session, run_id)
+        if run is None:
+            raise HTTPException(404, "Workflow run not found.")
+        _require_workflow_run_access(session, actor, run)
+        allowed = {"pause": {"running", "paused"}, "resume": {"paused", "running"},
+                   "cancel": {"pending", "running", "paused", "cancelled"}}
+        if run.status not in allowed[action]:
+            raise HTTPException(409, f"Cannot {action} a run with status '{run.status}'.")
         if action == "pause":
             run = scheduler.pause_run(session, run_id, actor.subject)
         elif action == "resume":
             run = scheduler.resume_run(session, run_id, actor.subject)
         else:
             run = scheduler.cancel_run(session, run_id, actor.subject)
-    except LookupError as error:
-        raise HTTPException(404, str(error)) from error
-    session.commit()
-    session.refresh(run)
-    return _workflow_run_out(session, run)
+        session.flush()
+        result = _workflow_run_out(session, run)
+        if key and owner:
+            if not _complete_idempotency_key(
+                session, key, owner, fingerprint, scope, str(result.request_id),
+                {"workflow_run": result.model_dump(mode="json")},
+            ):
+                raise HTTPException(409, "Run-control reservation changed; retry.")
+        else:
+            session.commit()
+        return result
+    except Exception as error:
+        session.rollback()
+        if key and owner:
+            _release_idempotency_key(session, key, owner)
+        if isinstance(error, LookupError):
+            raise HTTPException(404, str(error)) from error
+        raise
 
 
 class ApprovalDecisionIn(BaseModel):
@@ -1986,7 +2095,7 @@ def decide_workflow_step(
         run_id, item_id, action, payload.reason.strip()
     ], separators=(",", ":")).encode()).hexdigest()
     owner, replay = _reserve_idempotency_key(
-        session, response, key, fingerprint, scope, str(run.request_id)
+        session, response, key, fingerprint, scope, str(run.request_id), actor_subject=actor.subject
     )
     if replay is not None:
         return WorkflowRunOut.model_validate(replay["workflow_run"])
@@ -2062,28 +2171,34 @@ def _decide_workflow_step(
 @app.post("/workflow-runs/{run_id}/pause", response_model=WorkflowRunOut)
 def pause_workflow_run(
     run_id: int,
+    response: Response,
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> WorkflowRunOut:
-    return _run_action(session, run_id, actor, "pause")
+    return _run_action(session, run_id, actor, "pause", response, idempotency_key)
 
 
 @app.post("/workflow-runs/{run_id}/resume", response_model=WorkflowRunOut)
 def resume_workflow_run(
     run_id: int,
+    response: Response,
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> WorkflowRunOut:
-    return _run_action(session, run_id, actor, "resume")
+    return _run_action(session, run_id, actor, "resume", response, idempotency_key)
 
 
 @app.post("/workflow-runs/{run_id}/cancel", response_model=WorkflowRunOut)
 def cancel_workflow_run(
     run_id: int,
+    response: Response,
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> WorkflowRunOut:
-    return _run_action(session, run_id, actor, "cancel")
+    return _run_action(session, run_id, actor, "cancel", response, idempotency_key)
 
 
 def _get_item(
@@ -2867,6 +2982,31 @@ def _outbox_out(record: db.NotificationOutboxRecord) -> NotificationOutboxOut:
             "last_error", "created_at",
         )}
     )
+
+
+class ConsoleDeliveryOut(BaseModel):
+    id: int
+    ticket_id: Optional[str] = None
+    status: str
+    attempts: int
+    created_at: datetime
+
+
+@app.get("/command-center/deliveries", response_model=list[ConsoleDeliveryOut])
+def console_deliveries(
+    state: Literal["pending", "failed"] = Query(default="failed"),
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> list[ConsoleDeliveryOut]:
+    """Tenant-scoped delivery visibility without destination URLs or raw errors."""
+    query = _scope_ticket_or_request_keyed_query(
+        select(db.NotificationOutboxRecord).where(db.NotificationOutboxRecord.status == state),
+        db.NotificationOutboxRecord.ticket_id, actor,
+    )
+    rows = session.execute(query.order_by(db.NotificationOutboxRecord.id.desc()).offset(offset).limit(limit)).scalars()
+    return [ConsoleDeliveryOut.model_validate(row, from_attributes=True) for row in rows]
 
 
 @app.get("/notifications/pending", response_model=list[NotificationOutboxOut])

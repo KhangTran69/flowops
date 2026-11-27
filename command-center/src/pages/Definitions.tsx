@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { usePoll } from '../hooks/usePoll'
 import { asList, mutate } from '../lib/api'
 import { useSession } from '../lib/session'
@@ -34,12 +34,15 @@ export default function Definitions() {
   const { role } = useSession()
   const [open, setOpen] = useState(false); const [json, setJson] = useState(template); const [busy, setBusy] = useState(false)
   const rows = data || []
+  const retry = useRef<{ payload: string; key: string } | null>(null)
   async function create() {
     let payload: any
     try { payload = JSON.parse(json) } catch { alert('Invalid JSON.'); return }
     if (!payload.key || !payload.name || !payload.request_type || !Array.isArray(payload.steps) || !payload.steps.every((s: any) => s.key)) { alert('key, name, request_type and steps[].key are required.'); return }
-    setBusy(true); const r = await mutate('POST', '/workflow-definitions', payload, 'Definition draft created.'); setBusy(false)
-    if (r.ok) { setOpen(false); reload() }
+    const fingerprint = JSON.stringify(payload)
+    if (!retry.current || retry.current.payload !== fingerprint) retry.current = { payload: fingerprint, key: crypto.randomUUID() }
+    setBusy(true); const r = await mutate('POST', '/workflow-definitions', payload, 'Definition draft created.', retry.current.key); setBusy(false)
+    if (r.ok) { retry.current = null; setOpen(false); reload() }
   }
   return <>
     <PageHeader title="Workflow definitions" description="Immutable versioned DAG definitions." actions={role === 'admin' ? <button className="btn btn-primary" onClick={() => setOpen(true)}>Create draft</button> : undefined} />

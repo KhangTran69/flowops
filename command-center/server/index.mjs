@@ -14,7 +14,7 @@ const SEG = '[A-Za-z0-9_.:-]+'
 const rr = (s) => new RegExp(`^${s}$`)
 
 const GET_PATHS = [
-  rr('/health'), rr('/ready'), rr('/command-center/summary'), rr('/tickets'), rr(`/tickets/${SEG}`),
+  rr('/health'), rr('/ready'), rr('/command-center/summary'), rr('/command-center/deliveries'), rr('/tickets'), rr(`/tickets/${SEG}`),
   rr('/onboarding-requests'), rr(`/onboarding-requests/${SEG}`),
   rr(`/onboarding-requests/${SEG}/run`), rr('/workflow-runs'),
   rr(`/workflow-runs/${SEG}`), rr('/workflow-definitions'),
@@ -29,7 +29,7 @@ const OPERATOR_POST = [
 ]
 const ADMIN_POST = [
   rr(`/workflow-runs/${SEG}/steps/${SEG}/(approve|reject)`),
-  rr('/workflow-definitions'), rr(`/workflow-definitions/${SEG}/publish`),
+  rr('/workflow-definitions'), rr('/workflow-definitions/validate'), rr(`/workflow-definitions/${SEG}/publish`),
 ]
 const ADMIN_PUT = [rr(`/workflow-definitions/${SEG}`)]
 

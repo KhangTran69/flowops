@@ -155,6 +155,7 @@ def logout(
         return response
     if not csrf_token or not secrets.compare_digest(csrf_token, session.csrf_token):
         raise HTTPException(status_code=403, detail="CSRF token missing or invalid.")
+    ui_session.revoke_session(session_db, session)
     db.log_execution(
         session_db,
         run_id=_new_run_id(),
@@ -266,7 +267,7 @@ def ui_ticket_detail(
             ticket_id=ticket_id,
             duration_ms=int((time.perf_counter() - started) * 1000),
             detail=f"adapter={analysis.adapter}; source=operator-ui",
-            actor_subject="operator-ui",
+            actor_subject=actor.subject,
             correlation_id=correlation_id,
         )
         db.log_execution(
@@ -277,7 +278,7 @@ def ui_ticket_detail(
             ticket_id=ticket_id,
             duration_ms=int((time.perf_counter() - started) * 1000),
             detail=f"adapter={analysis.adapter}; source=operator-ui",
-            actor_subject="operator-ui",
+            actor_subject=actor.subject,
             correlation_id=correlation_id,
         )
         session.commit()

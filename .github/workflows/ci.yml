@@ -86,6 +86,11 @@ jobs:
         env:
           FLOWOPS_DATABASE_URL: postgresql+psycopg://flowops:flowops@127.0.0.1:5432/flowops
         run: alembic upgrade head
+      - name: Validate manual ticket migration rollback
+        env:
+          FLOWOPS_DATABASE_URL: postgresql+psycopg://flowops:flowops@127.0.0.1:5432/flowops
+          FLOWOPS_DISPOSABLE_MIGRATION_CHECK: '1'
+        run: python -m scripts.check_manual_ticket_migration
       - name: Run PostgreSQL reliability tests
         env:
           FLOWOPS_TEST_POSTGRES_URL: postgresql+psycopg://flowops:flowops@127.0.0.1:5432/flowops
@@ -93,6 +98,20 @@ jobs:
           pytest -q tests/test_idempotency_postgres.py tests/test_outbox_postgres.py \
             tests/test_jobs_postgres.py tests/test_outbox_worker_postgres.py \
             tests/test_offboarding_postgres.py tests/test_ai_postgres.py tests/test_orchestrator_postgres.py tests/test_v13_postgres.py tests/test_triggers_postgres.py
+
+      - name: Benchmark disposable PostgreSQL workload
+        env:
+          FLOWOPS_DATABASE_URL: postgresql+psycopg://flowops:flowops@127.0.0.1:5432/flowops
+          FLOWOPS_DISPOSABLE_BENCHMARK: '1'
+          FLOWOPS_AUTH_REQUIRED: 'false'
+          FLOWOPS_UI_AUTH_REQUIRED: 'false'
+          FLOWOPS_ENVIRONMENT: development
+          FLOWOPS_ACTION_ADAPTER: simulated
+          FLOWOPS_AI_ADAPTER: simulated
+          FLOWOPS_AUTOMATION_ADAPTER: simulated
+        run: |
+          alembic upgrade head
+          python -m scripts.benchmark_console
 
   command-center:
     runs-on: ubuntu-latest
@@ -111,9 +130,8 @@ jobs:
       - run: node --check server/index.mjs
       - run: node --test server/*.test.mjs
       - run: node --experimental-strip-types --test tests/contracts.test.mjs
-      - name: Report dependency advisories (non-blocking)
-        run: npm audit --json
-        continue-on-error: true
+      - name: Fail on moderate or higher dependency advisories
+        run: npm audit --audit-level=moderate
 
 
   console-browser:
@@ -130,6 +148,8 @@ jobs:
           cache-dependency-path: command-center/package-lock.json
       - run: python -m pip install -r requirements-dev.txt playwright==1.51.0
       - run: python -m playwright install --with-deps chromium
+      - name: Install isolated accessibility test dependency
+        run: npm install --prefix /tmp/flowops-axe --no-package-lock --ignore-scripts axe-core@4.10.3
       - run: npm ci && npm run build
         working-directory: command-center
       - name: Exercise isolated browser and backend
@@ -146,6 +166,7 @@ jobs:
           FLOWOPS_COMMAND_CENTER_DEV: 'true'
           DEV_USER_ROLE: admin
           SERVE_STATIC: 'true'
+          FLOWOPS_AXE_PATH: /tmp/flowops-axe/node_modules/axe-core/axe.min.js
         run: |
           alembic upgrade head
           python -m uvicorn src.api:app --host 127.0.0.1 --port 8000 > /tmp/flowops-api.log 2>&1 &
@@ -155,3 +176,41 @@ jobs:
           trap 'kill "$api_pid" "$console_pid" 2>/dev/null || true; cat /tmp/flowops-api.log /tmp/flowops-console.log' EXIT
           curl --fail --retry 20 --retry-delay 1 --retry-all-errors http://127.0.0.1:8000/ready
           python command-center/tests/browser_smoke.py
+
+      - name: Exercise protected browser session with synthetic credentials
+        env:
+          FLOWOPS_DATABASE_URL: sqlite:///data/console-auth-browser.db
+          FLOWOPS_ENVIRONMENT: development
+          FLOWOPS_AUTH_REQUIRED: 'true'
+          FLOWOPS_UI_AUTH_REQUIRED: 'true'
+          FLOWOPS_SESSION_COOKIE_SECURE: 'false'
+          FLOWOPS_ACTION_ADAPTER: simulated
+          FLOWOPS_AI_ADAPTER: simulated
+          FLOWOPS_AUTOMATION_ADAPTER: simulated
+          FLOWOPS_API_URL: http://127.0.0.1:8000
+          FLOWOPS_COMMAND_CENTER_DEV: 'false'
+          NODE_ENV: production
+          FLOWOPS_DEV_TENANT_KEY: browser-test
+        run: |
+          export FLOWOPS_SESSION_SECRET="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+          export FLOWOPS_DEV_BEARER_TOKEN="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+          export FLOWOPS_BROWSER_TEST_PASSWORD="$(python -c 'import secrets; print(secrets.token_urlsafe(24))')"
+          export FLOWOPS_DEMO_USERS="$(python -c 'import json, os; from src.ui_session import hash_demo_password; print(json.dumps({"ci-operator": {"password_hash": hash_demo_password(os.environ["FLOWOPS_BROWSER_TEST_PASSWORD"]), "roles": ["automation.operator"], "tenant_key": "browser-test"}}))')"
+          alembic upgrade head
+          python -m uvicorn src.api:app --host 127.0.0.1 --port 8000 > /tmp/flowops-auth-api.log 2>&1 &
+          api_pid=$!
+          node command-center/server/index.mjs > /tmp/flowops-auth-console.log 2>&1 &
+          console_pid=$!
+          trap 'kill "$api_pid" "$console_pid" 2>/dev/null || true; cat /tmp/flowops-auth-api.log /tmp/flowops-auth-console.log' EXIT
+          curl --fail --retry 20 --retry-delay 1 --retry-all-errors http://127.0.0.1:8000/ready
+          python command-center/tests/browser_auth.py
+
+
+  monitoring-rules:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate example Prometheus rules
+        run: |
+          docker run --rm -v "$PWD/monitoring:/rules:ro" --entrypoint /bin/promtool prom/prometheus:v3.5.0 check rules /rules/flowops-alerts.yml
+          docker run --rm -v "$PWD/monitoring:/rules:ro" --entrypoint /bin/promtool prom/prometheus:v3.5.0 test rules /rules/flowops-alerts.test.yml

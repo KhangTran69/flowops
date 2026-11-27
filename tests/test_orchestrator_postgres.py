@@ -63,3 +63,40 @@ def test_postgres_run_claim_and_stale_takeover(client):
     finally:
         first_session.close()
         second_session.close()
+
+
+def test_concurrent_start_and_control_replay(client):
+    from concurrent.futures import ThreadPoolExecutor
+    created = client.post("/onboarding-requests", json={
+        "request_type": "onboarding", "employee_name": "Concurrent",
+        "employee_email": "concurrent@example.test", "department": "IT",
+        "requester_id": 7, "template": "onboarding-dag",
+    })
+    assert created.status_code == 201, created.text
+    start_path = f"/onboarding-requests/{created.json()['id']}/run"
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: client.post(start_path), range(2)))
+    assert all(r.status_code == 200 for r in results), [r.text for r in results]
+    assert results[0].json()["id"] == results[1].json()["id"]
+    run_id = results[0].json()["id"]
+    path = f"/workflow-runs/{run_id}"
+    headers = {"Idempotency-Key": "concurrent-pause"}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pauses = list(pool.map(lambda _: client.post(path + "/pause", headers=headers), range(2)))
+    assert any(r.status_code == 200 for r in pauses)
+    assert all(r.status_code in (200, 409) for r in pauses)
+    resumed = client.post(path + "/resume", headers={"Idempotency-Key": "resume"})
+    assert resumed.status_code == 200 and resumed.json()["status"] == "running"
+    replay = client.post(path + "/pause", headers=headers)
+    assert replay.headers["Idempotency-Replayed"] == "true"
+    assert replay.json()["status"] == "paused"
+    assert client.get(path).json()["status"] == "running"
+    assert client.post(path + "/cancel", headers=headers).status_code == 409
+    assert client.post(path + "/cancel", headers={"Idempotency-Key": "cancel"}).json()["status"] == "cancelled"
+    assert client.post(path + "/resume").status_code == 409
+    session = db.SessionLocal()
+    try:
+        assert session.query(db.WorkflowRunRecord).count() == 1
+        assert session.query(db.ExecutionLogRecord).filter_by(action="workflow.run.paused").count() == 1
+    finally:
+        session.close()

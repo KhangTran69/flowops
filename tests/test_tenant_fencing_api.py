@@ -820,3 +820,44 @@ def test_console_large_ticket_page_coverage(fencing_client):
         identifiers.extend(row["ticket_id"] for row in result.json())
     assert identifiers == [str(10000+i) for i in range(257)]
     assert client.get("/command-center/summary").json()["open_tickets"] == 257
+
+
+def test_definition_preview_is_non_mutating_and_authorized(fencing_client):
+    client, set_actor = fencing_client
+    set_actor(_local_actor())
+    step = {"key": "first", "step": "First step", "queue": "it-hardware",
+            "requires_approval": False, "action": "none"}
+    before = client.get("/workflow-definitions").json()
+    preview = client.post("/workflow-definitions/validate",
+                          json={"request_type": "onboarding", "steps": [step]})
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["steps"][0]["key"] == "first"
+    assert len(preview.json()["checksum"]) == 64
+    invalid = client.post("/workflow-definitions/validate",
+                          json={"request_type": "onboarding", "steps": [{**step, "depends_on": ["first"]}]})
+    assert invalid.status_code == 422
+    assert client.get("/workflow-definitions").json() == before
+    set_actor(_tenant_actor("tenant-a"))
+    assert client.post("/workflow-definitions/validate",
+                       json={"request_type": "onboarding", "steps": [step]}).status_code == 403
+
+
+def test_console_delivery_visibility_redacts_destination_and_fences_tenant(fencing_client):
+    client, set_actor = fencing_client
+    with db.SessionLocal() as session:
+        for ticket_id, tenant in [("950001", "tenant-a"), ("950002", "tenant-b")]:
+            session.add(db.TicketRecord(ticket_id=ticket_id, requester_id=7, title="Delivery fixture",
+                                       status="open", priority="normal", tenant_key=tenant))
+            session.add(db.NotificationOutboxRecord(ticket_id=ticket_id, url="https://example.test/secret",
+                payload_json='{"private":"fixture"}', status="failed", attempts=3, last_error="private error"))
+        session.commit()
+    set_actor(_tenant_actor("tenant-a"))
+    response = client.get("/command-center/deliveries", params={"state": "failed"})
+    assert response.status_code == 200, response.text
+    assert len(response.json()) == 1
+    row = response.json()[0]
+    assert row["ticket_id"] == "950001"
+    assert set(row) == {"id", "ticket_id", "status", "attempts", "created_at"}
+    assert client.get("/command-center/deliveries", params={"state": "pending"}).json() == []
+    set_actor(_tenant_actor("tenant-b"))
+    assert client.get("/command-center/deliveries").json()[0]["ticket_id"] == "950002"

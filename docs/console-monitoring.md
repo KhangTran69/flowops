@@ -40,3 +40,48 @@ Production workforce browser access is blocked until a real identity provider
 and browser sign-in flow have been configured and independently tested.
 Do not remove this release gate to enable a demo. Use the development-only
 workforce setup for synthetic data.
+
+
+## Release-validation evidence (November 27, 2026)
+
+CI revision 08a61294e1fdce37b2a5d284c12b606a57d8d231 passed all eight
+configured jobs (run 45938463991), with 495 offline tests passed, 22 skipped,
+and 22 separate PostgreSQL tests passed. Vite 6.4.6 was built and npm audit
+reported zero vulnerabilities at that revision.
+
+The disposable PostgreSQL benchmark used 1,000 synthetic tickets and 50
+workflow runs, 40 requests per endpoint per concurrency level. TestClient
+measurements include the application and database but exclude WAN/TLS and
+real integrations.
+
+| Endpoint | Serial p95 ms | Concurrent (4) p95 ms | Concurrent requests/s |
+| --- | ---: | ---: | ---: |
+| Tickets | 6.97 | 39.37 | 163.09 |
+| Workflow runs | 26.42 | 127.15 | 50.11 |
+| Dashboard summary | 11.16 | 37.18 | 130.54 |
+
+These are historical synthetic baseline measurements, not a production SLA.
+The repeatable scripts run on disposable CI databases only. No new database
+index was justified by these results.
+
+Migration 0017 adds a revocation table containing only a hash of a session's
+random CSRF token and its retention deadline. Logout records revocation and
+the audit event atomically. Existing signed cookies remain accepted unless
+revoked or expired. Revocation is retained for the maximum supported cookie
+lifetime (24 hours); expired rows are pruned on subsequent logout. A rollback
+that drops this table removes revocation history: before rollback, rotate
+the session signing secret and require reauthentication. Never downgrade
+a production database just to test this procedure.
+
+The console delivery list exposes resource identifiers, status, attempts and
+creation timestamps; destinations, raw errors and payloads remain outside
+this read-only view. Existing tenant scope is enforced before pagination.
+It cannot trigger an external notification.
+
+The focused browser accessibility checks cover labels, names, document
+metadata and selected ARIA rules; the monitoring CI uses promtool to check
+syntax and synthetic alert behavior. Neither substitutes for a full WCAG
+2.2 AA audit or a live monitoring deployment. Production Entra/gateway
+configuration, secure logout at the identity provider, workforce browser
+sign-in, production backup/restore rehearsals and live connector verification
+remain release gates.

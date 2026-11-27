@@ -16,6 +16,7 @@ export async function api<T = unknown>(
       body: JSON.stringify({ method, path, query: opts.query, body: opts.body }),
     })
     const json = (await r.json()) as ApiResult<T>
+    if (r.status === 401 || json.status === 401) window.dispatchEvent(new Event('flowops:unauthorized'))
     if (typeof json?.ok !== 'boolean') return { ok: false, status: r.status, error: 'Unexpected proxy response.' }
     if (json.ok) {
       const schema = responseSchema(method, path)

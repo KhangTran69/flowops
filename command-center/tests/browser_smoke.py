@@ -1,5 +1,6 @@
 """Real browser smoke tests against an isolated simulated FlowOps stack."""
 import os
+import json
 import time
 from urllib.request import urlopen
 
@@ -74,11 +75,52 @@ def main():
         decision.get_by_label("Reason").fill("Verified in browser smoke test")
         decision.get_by_role("button", name="Confirm").click()
         expect(decision).not_to_be_visible(timeout=15000)
+        page.goto(base + "/definitions")
+        page.get_by_role("button", name="Create draft").click()
+        create = page.get_by_role("dialog", name="Create workflow definition")
+        create.get_by_role("button", name="Create draft").click()
+        expect(create).not_to_be_visible(timeout=15000)
+        definition = page.locator("table:visible tbody tr").filter(has_text="my-workflow")
+        expect(definition).to_be_visible(timeout=15000)
+        definition.click()
+        page.get_by_role("button", name="Publish v1").click()
+        page.get_by_role("dialog").get_by_role("button", name="Publish", exact=True).click()
+        expect(page.get_by_role("dialog")).not_to_be_visible(timeout=15000)
+        page.get_by_role("button", name="New version").click()
+        editor = page.get_by_role("dialog", name="Create new version")
+        editor.get_by_role("button", name="Add step").click()
+        editor.get_by_role("group", name="Step 2").get_by_label("Dependencies (comma-separated keys)").fill("create_user")
+        editor.get_by_role("button", name="Validate DAG").click()
+        expect(editor.get_by_text("DAG validated by FlowOps. No version was saved.")).to_be_visible(timeout=15000)
+        editor.get_by_role("button", name="Create version").click()
+        expect(editor).not_to_be_visible(timeout=15000)
+        expect(page.get_by_role("button", name="v2", exact=False)).to_be_visible(timeout=15000)
         page.set_viewport_size({"width": 390, "height": 844})
+        expect(page.get_by_role("navigation", name="Main")).not_to_be_visible()
+        menu = page.get_by_role("button", name="Open menu")
+        menu.click()
+        expect(page.get_by_role("button", name="Close menu")).to_be_focused()
+        page.keyboard.press("Escape")
+        expect(menu).to_be_focused()
+        expect(page.get_by_role("navigation", name="Main")).not_to_be_visible()
         page.get_by_role("button", name="Open menu").click()
         expect(page.get_by_role("navigation", name="Main")).to_be_visible()
         page.get_by_role("link", name="Tickets", exact=True).click()
         expect(page.get_by_role("heading", name="Tickets", exact=True)).to_be_visible()
+        page.goto(base + '/deliveries')
+        expect(page.get_by_role('heading', name='Notification deliveries')).to_be_visible()
+        page.get_by_label('Delivery state').select_option('pending')
+        expect(page.get_by_text('Page 1', exact=True)).to_be_visible()
+        axe_path = os.environ.get('FLOWOPS_AXE_PATH')
+        if axe_path:
+            for route, heading in [('/tickets', 'Tickets'), ('/definitions', 'Workflow definitions'), ('/deliveries', 'Notification deliveries')]:
+                page.set_viewport_size({'width': 1280, 'height': 900})
+                page.goto(base + route)
+                expect(page.get_by_role('heading', name=heading, exact=True)).to_be_visible()
+                page.add_script_tag(path=axe_path)
+                result = page.evaluate('''async () => window.axe.run({runOnly: {type: 'rule', values: ['button-name', 'link-name', 'label', 'aria-valid-attr-value', 'aria-roles', 'aria-required-attr', 'document-title', 'html-has-lang']}})''')
+                assert not result['violations'], json.dumps(result['violations'], default=str)
+                print('AXE_FOCUSED_PASS ' + route, flush=True)
         browser.close()
 
 

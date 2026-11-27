@@ -231,6 +231,13 @@ def _enforce_rate_limit(actor_key: str) -> None:
         return
     now = time.monotonic()
     with _RATE_LIMIT_LOCK:
+        # Bound expired identities and fail closed on excessive active keys.
+        if len(_RATE_LIMIT_BUCKETS) >= 10000:
+            expired = [key for key, (start, _) in _RATE_LIMIT_BUCKETS.items() if now - start >= 60]
+            for key in expired:
+                del _RATE_LIMIT_BUCKETS[key]
+            if actor_key not in _RATE_LIMIT_BUCKETS and len(_RATE_LIMIT_BUCKETS) >= 10000:
+                raise HTTPException(429, "Rate limit capacity reached; retry later.", headers={"Retry-After": "60"})
         window_start, count = _RATE_LIMIT_BUCKETS.get(actor_key, (now, 0))
         if now - window_start >= 60:
             window_start, count = now, 0
