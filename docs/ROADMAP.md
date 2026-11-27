@@ -102,15 +102,21 @@ One API, one workflow engine, one operator console trajectory.
 
 ### 1a. Finish the API decomposition (closes gap 3)
 
-- [ ] Extract `src/routes/onboarding.py` (onboarding/offboarding/runs/jobs
-      sections, ~1,430 lines), `src/routes/ai.py`, and
-      `src/routes/monitoring.py` from `src/api.py`, following the existing
-      `src/routes/workforce.py` pattern.
-- [ ] Guardrail: byte-identical OpenAPI. Add a CI step that dumps
-      `app.openapi()` before/after and diffs; any drift fails the PR. The
-      command-center `contracts.ts` and runtime validators (#51/#52 work)
-      then prove the frontend still agrees.
-- [ ] Result: `src/api.py` is app assembly + middleware only (< 500 lines).
+- [x] Extract `src/routes/monitoring.py` (#56), `src/routes/ai.py` (#57), and
+      `src/routes/onboarding.py` (#58) from `src/api.py`, following the
+      existing router pattern. `src/api.py`: 3,158 -> 1,177 lines.
+- [x] Guardrail: byte-identical OpenAPI. `scripts/dump_openapi.py` dumps the
+      spec; CI diffs it against the committed `tests/openapi_snapshot.json`
+      on every matrix leg. The command-center `contracts.ts` and runtime
+      validators (#51/#52 work) prove the frontend still agrees.
+      Intentional API changes regenerate the snapshot in the same PR.
+- [ ] Extract the remaining tickets/intake section (~460 lines) as
+      `src/routes/tickets.py`; `src/api.py` then holds app assembly,
+      middleware, idempotency aliases, and service routes only (~500 lines).
+      Lesson from #56/#58, applied going forward: after moving code, tests
+      that monkeypatch module attributes must repoint at the module that now
+      owns the callable — including `original = api.X` attribute reads and
+      PostgreSQL-only variants that only CI exercises.
 
 ### 1b. Offboarding DAG parity (closes gap 4)
 
