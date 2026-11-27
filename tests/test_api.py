@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src import api, db
+from src.routes import monitoring
 
 VALID_REQUEST = {
     "userId": 7,
@@ -736,6 +737,8 @@ def test_successful_webhook_does_not_touch_outbox(client, monkeypatch):
 def test_retry_endpoint_redelivers_pending_and_marks_delivered(client, monkeypatch):
     fake = FakeDelivery([_failing_delivery(), _succeeding_delivery(attempts=1)])
     monkeypatch.setattr(api, "deliver_webhook", fake)
+    # /notifications/retry delivers from the monitoring router module.
+    monkeypatch.setattr(monitoring, "deliver_webhook", fake)
     monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
     client.post("/tickets", json=VALID_REQUEST)
 
@@ -763,6 +766,8 @@ def test_retry_endpoint_redelivers_pending_and_marks_delivered(client, monkeypat
 def test_retry_keeps_still_failing_delivery_pending(client, monkeypatch):
     fake = FakeDelivery([_failing_delivery(), _failing_delivery(attempts=1)])
     monkeypatch.setattr(api, "deliver_webhook", fake)
+    # /notifications/retry delivers from the monitoring router module.
+    monkeypatch.setattr(monitoring, "deliver_webhook", fake)
     monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
     client.post("/tickets", json=VALID_REQUEST)
 
@@ -781,6 +786,8 @@ def test_retry_keeps_still_failing_delivery_pending(client, monkeypatch):
 def test_retry_dead_letters_delivery_at_attempt_limit(client, monkeypatch):
     fake = FakeDelivery([_failing_delivery(), _failing_delivery(attempts=1)])
     monkeypatch.setattr(api, "deliver_webhook", fake)
+    # /notifications/retry delivers from the monitoring router module.
+    monkeypatch.setattr(monitoring, "deliver_webhook", fake)
     monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
     monkeypatch.setenv("FLOWOPS_NOTIFICATION_MAX_ATTEMPTS", "4")
     client.post("/tickets", json=VALID_REQUEST)
@@ -810,6 +817,8 @@ def test_requeue_failed_delivery_and_retry_succeeds(client, monkeypatch):
         ]
     )
     monkeypatch.setattr(api, "deliver_webhook", fake)
+    # /notifications/retry delivers from the monitoring router module.
+    monkeypatch.setattr(monitoring, "deliver_webhook", fake)
     monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
     monkeypatch.setenv("FLOWOPS_NOTIFICATION_MAX_ATTEMPTS", "4")
     client.post("/tickets", json=VALID_REQUEST)
@@ -849,6 +858,8 @@ def test_requeue_rejects_non_failed_or_unknown_delivery(client, monkeypatch):
 def test_requeue_failed_delivery_only_once(client, monkeypatch):
     fake = FakeDelivery([_failing_delivery(), _failing_delivery(attempts=1)])
     monkeypatch.setattr(api, "deliver_webhook", fake)
+    # /notifications/retry delivers from the monitoring router module.
+    monkeypatch.setattr(monitoring, "deliver_webhook", fake)
     monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
     monkeypatch.setenv("FLOWOPS_NOTIFICATION_MAX_ATTEMPTS", "4")
     client.post("/tickets", json=VALID_REQUEST)
@@ -862,6 +873,8 @@ def test_requeue_failed_delivery_only_once(client, monkeypatch):
 def test_retry_with_empty_queue_is_a_noop(client, monkeypatch):
     fake = FakeDelivery([])
     monkeypatch.setattr(api, "deliver_webhook", fake)
+    # /notifications/retry delivers from the monitoring router module.
+    monkeypatch.setattr(monitoring, "deliver_webhook", fake)
     assert client.post("/notifications/retry").json() == []
     assert fake.calls == []
 
@@ -881,6 +894,8 @@ def test_dashboard_shows_pending_retries_section(client, monkeypatch):
 def test_dashboard_shows_dead_letter_section(client, monkeypatch):
     fake = FakeDelivery([_failing_delivery(), _failing_delivery(attempts=1)])
     monkeypatch.setattr(api, "deliver_webhook", fake)
+    # /notifications/retry delivers from the monitoring router module.
+    monkeypatch.setattr(monitoring, "deliver_webhook", fake)
     monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
     monkeypatch.setenv("FLOWOPS_NOTIFICATION_MAX_ATTEMPTS", "4")
     client.post("/tickets", json=VALID_REQUEST)

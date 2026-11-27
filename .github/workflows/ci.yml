@@ -31,6 +31,13 @@ jobs:
           alembic upgrade head
       - name: Run offline tests
         run: pytest -q
+      - name: Check OpenAPI snapshot (public API surface unchanged)
+        run: |
+          python scripts/dump_openapi.py /tmp/openapi.current.json
+          if ! diff -u tests/openapi_snapshot.json /tmp/openapi.current.json; then
+            echo "::error::The OpenAPI surface changed. If intentional, regenerate the snapshot in the same PR: python scripts/dump_openapi.py tests/openapi_snapshot.json" >&2
+            exit 1
+          fi
 
   docker-postgres:
     runs-on: ubuntu-latest
