@@ -1,7 +1,11 @@
-# FlowOps — Base44 Development Setup
+# FlowOps — Development Setup
 
 ## What this is
-FlowOps is a FastAPI IT workflow automation platform (Python 3.13, SQLAlchemy 2.0, Jinja2 templates, PostgreSQL). It receives support tickets, classifies/routes them, runs onboarding/offboarding workflows, and exposes a monitoring dashboard.
+FlowOps is a FastAPI IT workflow automation platform (Python 3.10–3.13, SQLAlchemy 2.0, Alembic, Jinja2 templates + a React operator console, SQLite locally / PostgreSQL for deployment). It receives support tickets, classifies/routes them, runs onboarding/offboarding workflows with versioned DAG definitions, SLA timers, durable leased jobs, event triggers and source connectors, and exposes monitoring dashboards and analytics.
+
+> **Plan of record for future work:** [`docs/ROADMAP.md`](docs/ROADMAP.md).
+> Pick work from there, keep PRs single-concern, and rebase on `main` before
+> opening. Tick the roadmap checkbox your PR completes in the PR body.
 
 ## How to run (Base44 sandbox)
 ```bash
@@ -33,12 +37,30 @@ The app boots with all defaults: auth is off (`FLOWOPS_AUTH_REQUIRED=false`, `FL
 
 ## Local development (without Docker)
 ```bash
-pip install -r requirements.txt
-uvicorn src.api:app --reload   # http://127.0.0.1:8000
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-dev.txt   # pinned runtime + test dependencies
+uvicorn src.api:app --reload          # http://127.0.0.1:8000
 ```
 Without `FLOWOPS_DATABASE_URL`, the app defaults to `sqlite:///data/flowops.db`.
+
+**After pulling new commits, re-run `pip install -r requirements-dev.txt`.**
+Dependabot bumps the pinned files weekly; a stale local venv can fail test
+collection with import errors that do not exist in CI. CI installs the pinned
+files fresh on every run and is the authoritative signal.
 
 ## Tests
 ```bash
 pytest -q
 ```
+The suite is fully offline (mocked HTTP, `tmp_path` SQLite). PostgreSQL-only
+tests skip unless `FLOWOPS_TEST_POSTGRES_URL` is set; CI's `postgres-idempotency`
+job runs them against a `postgres:16` service. Test counts are not pinned in
+docs — run the suite for the current number.
+
+## Conventions for changes
+- Schema changes go through a new Alembic revision; never edit existing migrations or the baseline. SQLite also gets the additive column via `_add_missing_columns()` in `src/db.py`.
+- API changes are additive: existing response shapes, status codes, and idempotency semantics are contracts. The command-center validates responses against typed contracts (`command-center/src/lib/contracts.ts`) at runtime.
+- Every workflow action writes an actor-attributed execution log.
+- Tests stay offline: mock HTTP, never depend on internet access, never `sleep`.
+- Do not commit or push secrets; connector/tenant credentials live in env-var names only (see `.env.example`, `.connector-secrets.env.example`).

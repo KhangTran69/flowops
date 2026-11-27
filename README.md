@@ -88,7 +88,22 @@ flowops/
 │   ├── ui_session.py         # signed UI sessions, cookie flags, and CSRF helpers
 │   ├── ai_agent.py           # simulated AI agent, KB search, OpenAI-compatible + Claude providers
 │   ├── schemas.py / deps.py  # Pydantic models and shared auth/rate-limit dependencies
-│   ├── routes/               # routers: operator UI, tenants/drift/PSA sync, reports
+│   ├── actions.py            # action-adapter boundary: simulated, Graph, Power Automate, PowerShell, RPA dispatch
+│   ├── idempotency.py        # fenced Idempotency-Key claim/replay/cleanup protocol (tickets + onboarding)
+│   ├── workflow.py           # graph-to-rows bridge: apply_graph_transitions, output piping
+│   ├── definitions.py        # versioned workflow definitions with checksums (v1.3)
+│   ├── expressions.py        # hand-written safe predicate evaluator (no eval)
+│   ├── chatops.py            # HMAC-signed single-use ChatOps approve/reject tokens (v1.1)
+│   ├── triggers.py           # event-driven trigger scheduler + signed webhook verification (v1.4)
+│   ├── connectors.py         # source connectors (Jira/ServiceNow/Slack/Teams/generic) + trigger rules (v1.4)
+│   ├── analytics.py          # run analytics, step bottlenecks, SLA breach/risk reporting (v1.5)
+│   ├── metrics.py            # in-process counters behind /metrics
+│   ├── logging_config.py     # central logging setup for services
+│   ├── m365_simulator.py     # simulated M365 provisioning for offline action demos
+│   ├── workforce_worker.py   # workforce transactional outbox -> n8n / local simulator
+│   ├── workforce_demo.py / demo_users.py  # synthetic workforce data + dev account hash helper
+│   ├── routes/               # routers: operator UI, tenants/drift/PSA sync, reports,
+│   │                         #   triggers, connectors, analytics, workforce
 │   ├── graph.py              # Microsoft Graph client: client credentials, OData, paging, throttling
 │   ├── graph_simulator.py    # in-memory Graph (httpx MockTransport) for demos and tests
 │   ├── tenants.py            # multi-tenant settings, per-tenant Graph clients, drift check
@@ -558,10 +573,16 @@ No real secrets or Microsoft tenant are included.
 ## Running the tests
 
 ```bash
-pytest    # 321 passed, 19 skipped locally; the skips are PostgreSQL-only tests
+pytest -q
 
 python -m compileall -q src tests
 ```
+
+Test counts are intentionally not pinned in this README — the suite grows
+weekly and stale numbers mislead. Run `pytest -q` for the current count and
+treat the [CI badge](https://github.com/KhangTran69/flowops/actions) as the
+authoritative signal. Locally, expect roughly 500 passed with about 20 skips;
+the skips are PostgreSQL-only tests.
 
 The default suite is fully offline: mocked HTTP and temporary SQLite databases. The PostgreSQL reliability tests run when `FLOWOPS_TEST_POSTGRES_URL` points at a disposable database:
 
