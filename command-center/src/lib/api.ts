@@ -26,8 +26,9 @@ export async function mutate(
   path: string,
   body: unknown,
   successMsg: string,
+  idempotencyKey?: string,
 ): Promise<ApiResult> {
-  const result = await api(method, path, { body })
+  const result = await api(method, path, { body, idempotencyKey })
   if (result.ok) toast.success(successMsg)
   else toast.error(result.error || 'Request failed.')
   return result
