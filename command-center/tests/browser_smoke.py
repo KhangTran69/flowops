@@ -107,9 +107,13 @@ def main():
         expect(page.get_by_role("navigation", name="Main")).to_be_visible()
         page.get_by_role("link", name="Tickets", exact=True).click()
         expect(page.get_by_role("heading", name="Tickets", exact=True)).to_be_visible()
+        page.goto(base + '/deliveries')
+        expect(page.get_by_role('heading', name='Notification deliveries')).to_be_visible()
+        page.get_by_label('Delivery state').select_option('pending')
+        expect(page.get_by_text('Page 1', exact=True)).to_be_visible()
         axe_path = os.environ.get('FLOWOPS_AXE_PATH')
         if axe_path:
-            for route, heading in [('/tickets', 'Tickets'), ('/definitions', 'Workflow definitions')]:
+            for route, heading in [('/tickets', 'Tickets'), ('/definitions', 'Workflow definitions'), ('/deliveries', 'Notification deliveries')]:
                 page.set_viewport_size({'width': 1280, 'height': 900})
                 page.goto(base + route)
                 expect(page.get_by_role('heading', name=heading, exact=True)).to_be_visible()
