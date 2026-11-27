@@ -25,6 +25,12 @@ x-flowops-env: &flowops-env
   FLOWOPS_TIMER_INTERVAL: "2"
   FLOWOPS_RATE_LIMIT_PER_MINUTE: "0"
 
+x-flowops-dev-image: &flowops-dev-image
+  image: flowops-dev:local
+  build:
+    context: .
+    dockerfile: Dockerfile.dev
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -42,7 +48,7 @@ services:
       retries: 10
 
   app:
-    image: python:3.13-slim
+    <<: *flowops-dev-image
     restart: on-failure
     stop_grace_period: 15s
     env_file:
@@ -59,7 +65,7 @@ services:
       - .:/app
     working_dir: /app
     command:
-      ["sh", "-ec", "pip install --no-cache-dir -r requirements.txt && alembic upgrade head && exec uvicorn src.api:app --host 0.0.0.0 --port 8000 --reload --reload-dir src"]
+      ["sh", "-ec", "alembic upgrade head && exec uvicorn src.api:app --host 0.0.0.0 --port 8000 --reload --reload-dir src"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -72,7 +78,7 @@ services:
       start_period: 40s
 
   worker:
-    image: python:3.13-slim
+    <<: *flowops-dev-image
     restart: on-failure
     stop_grace_period: 15s
     environment:
@@ -82,7 +88,7 @@ services:
       - .:/app
     working_dir: /app
     command:
-      ["sh", "-ec", "pip install --no-cache-dir -r requirements.txt && exec python -m src.worker --poll-interval 2"]
+      ["sh", "-ec", "exec python -m src.worker --poll-interval 2"]
     depends_on:
       app:
         condition: service_healthy
@@ -93,7 +99,7 @@ services:
       retries: 3
 
   scheduler:
-    image: python:3.13-slim
+    <<: *flowops-dev-image
     restart: on-failure
     stop_grace_period: 15s
     env_file:
@@ -106,7 +112,7 @@ services:
       - .:/app
     working_dir: /app
     command:
-      ["sh", "-ec", "pip install --no-cache-dir -r requirements.txt && exec python -m src.scheduler --poll --interval 2"]
+      ["sh", "-ec", "exec python -m src.scheduler --poll --interval 2"]
     depends_on:
       app:
         condition: service_healthy
@@ -117,7 +123,7 @@ services:
       retries: 3
 
   timers:
-    image: python:3.13-slim
+    <<: *flowops-dev-image
     restart: on-failure
     stop_grace_period: 15s
     environment:
@@ -127,7 +133,7 @@ services:
       - .:/app
     working_dir: /app
     command:
-      ["sh", "-ec", "pip install --no-cache-dir -r requirements.txt && exec python -m src.timers --poll --interval 2"]
+      ["sh", "-ec", "exec python -m src.timers --poll --interval 2"]
     depends_on:
       app:
         condition: service_healthy
@@ -138,7 +144,7 @@ services:
       retries: 3
 
   outbox:
-    image: python:3.13-slim
+    <<: *flowops-dev-image
     restart: on-failure
     stop_grace_period: 15s
     env_file:
@@ -151,7 +157,7 @@ services:
       - .:/app
     working_dir: /app
     command:
-      ["sh", "-ec", "pip install --no-cache-dir -r requirements.txt && exec python -m src.outbox_worker --poll-interval 2"]
+      ["sh", "-ec", "exec python -m src.outbox_worker --poll-interval 2"]
     depends_on:
       app:
         condition: service_healthy
@@ -162,7 +168,7 @@ services:
       retries: 3
 
   workforce-outbox:
-    image: python:3.13-slim
+    <<: *flowops-dev-image
     restart: on-failure
     stop_grace_period: 15s
     environment:
@@ -172,7 +178,7 @@ services:
       - .:/app
     working_dir: /app
     command:
-      ["sh", "-ec", "pip install --no-cache-dir -r requirements.txt && exec python -m src.workforce_worker"]
+      ["sh", "-ec", "exec python -m src.workforce_worker"]
     depends_on:
       app:
         condition: service_healthy
