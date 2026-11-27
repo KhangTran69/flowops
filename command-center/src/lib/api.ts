@@ -5,11 +5,12 @@ export type ApiResult<T = unknown> = { ok: boolean; status: number; data?: T; er
 export async function api<T = unknown>(
   method: 'GET' | 'POST' | 'PUT',
   path: string,
-  opts: { query?: Record<string, unknown>; body?: unknown; idempotencyKey?: string } = {},
+  opts: { query?: Record<string, unknown>; body?: unknown; idempotencyKey?: string; signal?: AbortSignal } = {},
 ): Promise<ApiResult<T>> {
   try {
     const r = await fetch('/api/flowops', {
       method: 'POST',
+      signal: opts.signal,
       headers: { 'Content-Type': 'application/json', 'X-FlowOps-Request': '1', ...(opts.idempotencyKey ? { 'Idempotency-Key': opts.idempotencyKey } : {}) },
       body: JSON.stringify({ method, path, query: opts.query, body: opts.body }),
     })
