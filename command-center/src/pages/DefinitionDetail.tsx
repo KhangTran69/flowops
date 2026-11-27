@@ -7,6 +7,7 @@ import { DataState } from '../components/DataState'
 import { BackLink, JsonView, PageHeader } from '../components/Basics'
 import { StatusBadge } from '../components/StatusBadge'
 import { Confirm } from '../components/Confirm'
+import { WorkflowStepEditor } from '../components/WorkflowStepEditor'
 
 import type { WorkflowDefinition, DefinitionDiff } from '../lib/contracts'
 
@@ -55,7 +56,7 @@ export default function DefinitionDetail() {
         {diffError && <p className="mt-3 text-sm text-[var(--danger)]">{diffError}</p>}{diff && <div className="mt-3 grid gap-3 md:grid-cols-3"><JsonView label="Added" value={diff.added || []} /><JsonView label="Removed" value={diff.removed || []} /><JsonView label="Changed" value={diff.changed || []} /></div>}
       </section>
     </DataState>
-    <Confirm open={open} onOpenChange={setOpen} title="Create new version" description="Published versions are immutable; this creates a new draft version." confirmLabel="Create version" busy={busy} onConfirm={newVersion}><label><span className="label">Steps JSON</span><textarea className="input min-h-[360px] font-mono text-xs" value={editor} onChange={(e) => setEditor(e.target.value)} spellCheck={false} /></label></Confirm>
+    <Confirm open={open} onOpenChange={setOpen} title="Create new version" description="Published versions are immutable; this creates a new draft version." confirmLabel="Create version" busy={busy} onConfirm={newVersion}><WorkflowStepEditor value={editor} onChange={setEditor} requestType={data?.request_type || "onboarding"} /></Confirm>
     <Confirm open={publishOpen} onOpenChange={setPublishOpen} title={`Publish version ${selected}?`} description="New requests will pin this version. In-flight requests keep their pinned version." confirmLabel="Publish" busy={busy} onConfirm={publish} />
   </>
 }
