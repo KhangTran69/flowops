@@ -24,6 +24,7 @@ export type Triage = z.infer<typeof triage>
 export function responseSchema(method: string, path: string): z.ZodType | undefined {
   if (path === '/ready') return z.object({ status: text, database: text })
   if (path === '/command-center/summary') return summary
+  if (path === '/command-center/deliveries') return z.array(z.object({ id: integer, ticket_id: nullableText, status: z.enum(['pending', 'failed']), attempts: integer.nonnegative(), created_at: text }))
   if (path === '/tickets') return method === 'GET' ? z.array(ticket) : ticket
   if (path === '/tickets/manual') return ticket
   if (/^\/tickets\/[^/]+\/ai-triage$/.test(path)) return triage
