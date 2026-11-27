@@ -60,8 +60,8 @@ const DONE = new Set(['completed', 'succeeded', 'skipped', 'done', 'cancelled', 
 export const isDone = (status: unknown) => DONE.has(String(status || '').toLowerCase())
 
 export function progressOf(run: any): number {
-  const steps = run?.steps || run?.step_runs || []
-  const total = Number(run?.total_steps ?? run?.step_count ?? steps.length)
+  const steps = run?.checklist || run?.steps || run?.step_runs || []
+  const total = Number(run?.checklist ? steps.length : run?.total_steps ?? run?.step_count ?? steps.length)
   const completed = steps.filter((s: any) => ['completed', 'succeeded', 'done'].includes(String(s?.status).toLowerCase())).length
   return total > 0 ? Math.min(100, Math.round((completed / total) * 100)) : 0
 }
@@ -81,7 +81,7 @@ export function isGated(step: any): boolean {
 
 export function collect(runs: any[], pred: (step: any) => boolean): Array<{ run: any; step: any }> {
   const out: Array<{ run: any; step: any }> = []
-  for (const run of runs || []) for (const step of (run?.steps || run?.step_runs || [])) if (pred(step)) out.push({ run, step })
+  for (const run of runs || []) for (const step of (run?.checklist || run?.steps || run?.step_runs || [])) if (pred(step)) out.push({ run, step })
   return out
 }
 
