@@ -3046,6 +3046,10 @@ def list_audit_trail(
     session: Session = Depends(db.get_session),
     status_filter: Optional[str] = Query(default=None, alias="status"),
     actor_filter: Optional[str] = Query(default=None, alias="actor"),
+    action: Optional[str] = Query(default=None, max_length=64),
+    ticket_id: Optional[str] = Query(default=None, max_length=64),
+    created_from: Optional[datetime] = Query(default=None, alias="from"),
+    created_to: Optional[datetime] = Query(default=None, alias="to"),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> list[ExecutionLogOut]:
@@ -3060,6 +3064,14 @@ def list_audit_trail(
         query = query.where(db.ExecutionLogRecord.status == status_filter)
     if actor_filter:
         query = query.where(db.ExecutionLogRecord.actor_subject == actor_filter)
+    if action:
+        query = query.where(db.ExecutionLogRecord.action.startswith(action, autoescape=True))
+    if ticket_id:
+        query = query.where(db.ExecutionLogRecord.ticket_id == ticket_id)
+    if created_from is not None:
+        query = query.where(db.ExecutionLogRecord.created_at >= created_from)
+    if created_to is not None:
+        query = query.where(db.ExecutionLogRecord.created_at < created_to)
     records = session.execute(
         query.order_by(db.ExecutionLogRecord.id.desc()).offset(offset).limit(limit)
     ).scalars().all()
