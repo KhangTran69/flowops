@@ -820,3 +820,23 @@ def test_console_large_ticket_page_coverage(fencing_client):
         identifiers.extend(row["ticket_id"] for row in result.json())
     assert identifiers == [str(10000+i) for i in range(257)]
     assert client.get("/command-center/summary").json()["open_tickets"] == 257
+
+
+def test_definition_preview_is_non_mutating_and_authorized(fencing_client):
+    client, set_actor = fencing_client
+    set_actor(_local_actor())
+    step = {"key": "first", "step": "First step", "queue": "it-hardware",
+            "requires_approval": False, "action": "none"}
+    before = client.get("/workflow-definitions").json()
+    preview = client.post("/workflow-definitions/validate",
+                          json={"request_type": "onboarding", "steps": [step]})
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["steps"][0]["key"] == "first"
+    assert len(preview.json()["checksum"]) == 64
+    invalid = client.post("/workflow-definitions/validate",
+                          json={"request_type": "onboarding", "steps": [{**step, "depends_on": ["first"]}]})
+    assert invalid.status_code == 422
+    assert client.get("/workflow-definitions").json() == before
+    set_actor(_tenant_actor("tenant-a"))
+    assert client.post("/workflow-definitions/validate",
+                       json={"request_type": "onboarding", "steps": [step]}).status_code == 403
