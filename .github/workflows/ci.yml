@@ -36,6 +36,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Validate development compose configuration
+        run: docker compose -f docker-compose.base44.yml config --quiet
       - name: Build and start the PostgreSQL demo stack
         run: docker compose up --build --detach --wait --wait-timeout 120
       - name: Show service status
