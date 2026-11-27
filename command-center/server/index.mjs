@@ -29,7 +29,7 @@ const OPERATOR_POST = [
 ]
 const ADMIN_POST = [
   rr(`/workflow-runs/${SEG}/steps/${SEG}/(approve|reject)`),
-  rr('/workflow-definitions'), rr(`/workflow-definitions/${SEG}/publish`),
+  rr('/workflow-definitions'), rr('/workflow-definitions/validate'), rr(`/workflow-definitions/${SEG}/publish`),
 ]
 const ADMIN_PUT = [rr(`/workflow-definitions/${SEG}`)]
 
