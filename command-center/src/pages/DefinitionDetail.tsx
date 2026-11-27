@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { usePoll } from '../hooks/usePoll'
 import { api, fmtDate, mutate } from '../lib/api'
@@ -21,13 +21,18 @@ export default function DefinitionDetail() {
   const [from, setFrom] = useState(''); const [to, setTo] = useState(''); const [diff, setDiff] = useState<DefinitionDiff | null>(null); const [diffError, setDiffError] = useState('')
   useEffect(() => { if (versions.length && selected === null) { const v = versions.find((x: any) => x.version === data?.current_version) || versions[versions.length - 1]; setSelected(v.version); setEditor(JSON.stringify(v.steps, null, 2)); setFrom(String(versions[0].version)); setTo(String(v.version)) } }, [data])
   const current = useMemo(() => versions.find((v: any) => v.version === selected), [versions, selected])
+  const retry = useRef<{ fingerprint: string; key: string } | null>(null)
+  function retryKey(fingerprint: string) {
+    if (!retry.current || retry.current.fingerprint !== fingerprint) retry.current = { fingerprint, key: crypto.randomUUID() }
+    return retry.current.key
+  }
   async function newVersion() {
     let steps: any
     try { steps = JSON.parse(editor) } catch { alert('Invalid steps JSON.'); return }
-    setBusy(true); const r = await mutate('PUT', `/workflow-definitions/${key}`, { steps }, 'New version created.'); setBusy(false)
-    if (r.ok) { setOpen(false); reload() }
+    setBusy(true); const r = await mutate('PUT', `/workflow-definitions/${key}`, { steps }, 'New version created.', retryKey(JSON.stringify(['version', key, steps]))); setBusy(false)
+    if (r.ok) { retry.current = null; setOpen(false); reload() }
   }
-  async function publish() { setBusy(true); const r = await mutate('POST', `/workflow-definitions/${key}/publish`, { version: selected }, 'Definition published.'); setBusy(false); if (r.ok) { setPublishOpen(false); reload() } }
+  async function publish() { setBusy(true); const r = await mutate('POST', `/workflow-definitions/${key}/publish`, { version: selected }, 'Definition published.', retryKey(JSON.stringify(['publish', key, selected]))); setBusy(false); if (r.ok) { retry.current = null; setPublishOpen(false); reload() } }
   async function compare() {
     setDiff(null); setDiffError(''); const r = await api<DefinitionDiff>('GET', `/workflow-definitions/${key}/diff`, { query: { from: Number(from), to: Number(to) } })
     if (r.ok) setDiff(r.data ?? null); else setDiffError(r.error || 'Diff failed.')
