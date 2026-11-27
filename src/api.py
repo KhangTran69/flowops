@@ -1132,6 +1132,7 @@ def _request_out(
                 sla_minutes=item.sla_minutes,
                 overdue=bool(getattr(item, "overdue", False)),
                 sla_remaining_minutes=getattr(item, "sla_remaining_minutes", None),
+                sla_due_at=getattr(item, "sla_due_at", None),
             )
             for item in sorted(items, key=lambda i: i.id)
         ],
@@ -1157,6 +1158,7 @@ def _load_request(
     now = db.utcnow()
     for item in items:
         timer = by_item.get(item.id)
+        item.sla_due_at = timer.due_at if timer is not None else None
         if timer is not None:
             due = timer.due_at
             if due.tzinfo is None:
@@ -1597,6 +1599,7 @@ def get_onboarding_request_status(
 def _workflow_run_out(
     session: Session, run: db.WorkflowRunRecord
 ) -> WorkflowRunOut:
+    request, items = _load_request(session, run.request_id)
     steps = session.execute(
         select(db.WorkflowStepRunRecord)
         .where(db.WorkflowStepRunRecord.run_id == run.id)
@@ -1616,6 +1619,9 @@ def _workflow_run_out(
         created_at=run.created_at,
         started_at=run.started_at,
         completed_at=run.completed_at,
+        checklist=_request_out(request, items).checklist,
+        definition_key=request.definition_key,
+        employee_name=request.employee_name,
         steps=[
             WorkflowStepRunOut(
                 id=row.id,
