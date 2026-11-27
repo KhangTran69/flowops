@@ -657,3 +657,79 @@ def test_tenant_connector_polling_passes_actor_scope(fencing_client, monkeypatch
     assert response.status_code == 200
     assert response.json() == {"ingested": 2}
     assert tenants == ["tenant-a"]
+
+
+def test_manual_ticket_retry_metadata_and_tenant_fence(fencing_client):
+    client, set_actor = fencing_client
+    set_actor(_tenant_actor("tenant-a"))
+    payload = {
+        "requester_id": 7, "title": "VPN outage all users cannot work",
+        "description": "Manual intake details", "requester_email": "requester@example.test",
+    }
+    headers = {"Idempotency-Key": "manual-test-1"}
+    first = client.post("/tickets/manual", json=payload, headers=headers)
+    assert first.status_code == 201, first.text
+    ticket_id = first.json()["ticket_id"]
+    assert int(ticket_id) < 0
+    replay = client.post("/tickets/manual", json=payload, headers=headers)
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == first.json()
+    assert replay.headers["Idempotency-Replayed"] == "true"
+    assert client.post("/tickets/manual", json={**payload, "title": "Different title"}, headers=headers).status_code == 409
+    assert client.post("/tickets/manual", json=payload).status_code == 422
+    assert client.get("/tickets", params={"search": "VPN", "limit": 1}).json()[0]["ticket_id"] == ticket_id
+    detail = client.get(f"/tickets/{ticket_id}").json()
+    assert detail["description"] == payload["description"]
+    assert detail["requester_email"] == payload["requester_email"]
+    assert any(row["actor_subject"] == "ops-tenant-a" for row in detail["history"])
+    assert client.get("/command-center/summary").json()["open_tickets"] == 1
+    set_actor(_tenant_actor("tenant-b"))
+    assert client.get(f"/tickets/{ticket_id}").status_code == 404
+    assert client.get("/command-center/summary").json()["open_tickets"] == 0
+    assert client.get("/tickets", params={"search": "VPN"}).json() == []
+
+
+def test_filters_before_pagination_and_summary_not_page_limited(fencing_client):
+    client, set_actor = fencing_client
+    set_actor(_tenant_actor("tenant-a"))
+    for i in range(5):
+        response = client.post("/tickets", json={"id": 5000 + i, "userId": 1,
+            "title": "VPN access" if i >= 2 else "Printer issue", "completed": False})
+        assert response.status_code == 201, response.text
+    page = client.get("/tickets", params={"search": "VPN", "limit": 1, "offset": 1}).json()
+    assert [row["ticket_id"] for row in page] == ["5003"]
+    assert client.get("/command-center/summary").json()["open_tickets"] == 5
+
+
+def test_run_detail_and_console_approval_fenced(fencing_client):
+    client, set_actor = fencing_client
+    set_actor(Actor("admin-a", ("automation.admin",), source="bearer", tenant_key="tenant-a"))
+    created = client.post("/onboarding-requests", json=ONBOARDING)
+    assert created.status_code in (200, 201), created.text
+    request_id = created.json()["id"]
+    started = client.post(f"/onboarding-requests/{request_id}/run")
+    assert started.status_code == 200, started.text
+    run_id = started.json()["id"]
+    detail = client.get(f"/workflow-runs/{run_id}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["checklist"]
+    gated = next((item for item in detail.json()["checklist"]
+                  if item["requires_approval"] and item["status"] == "pending"), None)
+    assert gated is not None, detail.text
+    path = f"/workflow-runs/{run_id}/steps/{gated['id']}/reject"
+    set_actor(_tenant_actor("tenant-a"))
+    assert client.post(path, json={"reason": "Not approved"}).status_code == 403
+    set_actor(Actor("admin-b", ("automation.admin",), source="bearer", tenant_key="tenant-b"))
+    assert client.get(f"/workflow-runs/{run_id}").status_code == 404
+    assert client.post(path, json={"reason": "Not approved"}).status_code == 404
+    set_actor(Actor("admin-a", ("automation.admin",), source="bearer", tenant_key="tenant-a"))
+    result = client.post(path, json={"reason": "Not approved"})
+    assert result.status_code == 200, result.text
+    assert client.post(path, json={"reason": "Not approved"}).status_code == 409
+    session = db.SessionLocal()
+    try:
+        assert session.get(db.ChecklistItemRecord, gated["id"]).status == "rejected"
+        rows = session.query(db.ExecutionLogRecord).filter_by(action="onboarding.item.rejected", actor_subject="admin-a").all()
+        assert len(rows) == 1
+    finally:
+        session.close()
