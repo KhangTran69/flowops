@@ -39,7 +39,20 @@ jobs:
             exit 1
           fi
 
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Coverage floor (83%)
+        run: ./scripts/coverage.sh
+
   docker-postgres:
+
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
