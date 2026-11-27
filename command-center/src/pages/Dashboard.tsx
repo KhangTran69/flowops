@@ -7,10 +7,10 @@ import { PageHeader, ProgressBar } from '../components/Basics'
 import { RecordTable } from '../components/RecordTable'
 import { StatusBadge } from '../components/StatusBadge'
 
-import type { DashboardSummary, Ticket, WorkflowRun } from '../lib/contracts'
+import type { DashboardSummary, Ticket as TicketContract, WorkflowRun } from '../lib/contracts'
 
 export default function Dashboard() {
-  const tickets = usePoll<Ticket[]>('/tickets')
+  const tickets = usePoll<TicketContract[]>('/tickets')
   const runs = usePoll<WorkflowRun[]>('/workflow-runs')
   const summary = usePoll<DashboardSummary>('/command-center/summary')
   const ts = tickets.data || [], rs = runs.data || []
