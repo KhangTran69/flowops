@@ -24,7 +24,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import Integer, String, and_, cast, delete, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -1769,6 +1769,63 @@ def _run_action(
             run = scheduler.cancel_run(session, run_id, actor.subject)
     except LookupError as error:
         raise HTTPException(404, str(error)) from error
+    session.commit()
+    session.refresh(run)
+    return _workflow_run_out(session, run)
+
+
+class ApprovalDecisionIn(BaseModel):
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+@app.post("/workflow-runs/{run_id}/steps/{item_id}/{action}", response_model=WorkflowRunOut)
+def decide_workflow_step(
+    run_id: int,
+    item_id: int,
+    action: Literal["approve", "reject"],
+    payload: ApprovalDecisionIn,
+    actor: Actor = Depends(_admin_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowRunOut:
+    reason = payload.reason.strip()
+    if len(reason) < 3:
+        raise HTTPException(422, "A decision reason is required.")
+    run = session.execute(
+        select(db.WorkflowRunRecord).where(db.WorkflowRunRecord.id == run_id).with_for_update()
+    ).scalar_one_or_none()
+    if run is None:
+        raise HTTPException(404, "Workflow run not found.")
+    _require_workflow_run_access(session, actor, run)
+    if run.status not in ("pending", "running"):
+        raise HTTPException(409, "Workflow run is not active.")
+    target = "approved" if action == "approve" else "rejected"
+    item = session.get(db.ChecklistItemRecord, item_id)
+    if item is None or item.request_id != run.request_id:
+        raise HTTPException(404, "Checklist item not found.")
+    if not item.requires_approval or item.status != "pending":
+        raise HTTPException(409, "Checklist item is not awaiting approval.")
+    changed = session.execute(
+        update(db.ChecklistItemRecord).where(
+            db.ChecklistItemRecord.id == item_id,
+            db.ChecklistItemRecord.request_id == run.request_id,
+            db.ChecklistItemRecord.requires_approval.is_(True),
+            db.ChecklistItemRecord.status == "pending",
+        ).values(status=target)
+    )
+    if changed.rowcount != 1:
+        raise HTTPException(409, "Checklist item state changed; refresh and retry.")
+    session.refresh(item)
+    _, items = _load_request(session, run.request_id)
+    workflow.apply_graph_transitions(
+        session, items, request_id=run.request_id, actor_subject=actor.subject, reason=reason
+    )
+    timers.sync_timers(session, run.request_id)
+    db.log_execution(
+        session, run_id=_new_run_id(), action=f"onboarding.item.{target}",
+        status="success", ticket_id=str(run.request_id), duration_ms=0,
+        detail=f"step '{item.step}'; reason={reason}", actor_subject=actor.subject,
+    )
+    scheduler.tick(session, run.id, worker_id="console-transition", commit=False)
     session.commit()
     session.refresh(run)
     return _workflow_run_out(session, run)
