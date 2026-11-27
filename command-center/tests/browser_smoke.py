@@ -1,5 +1,6 @@
 """Real browser smoke tests against an isolated simulated FlowOps stack."""
 import os
+import json
 import time
 from urllib.request import urlopen
 
@@ -95,10 +96,27 @@ def main():
         expect(editor).not_to_be_visible(timeout=15000)
         expect(page.get_by_role("button", name="v2", exact=False)).to_be_visible(timeout=15000)
         page.set_viewport_size({"width": 390, "height": 844})
+        expect(page.get_by_role("navigation", name="Main")).not_to_be_visible()
+        menu = page.get_by_role("button", name="Open menu")
+        menu.click()
+        expect(page.get_by_role("button", name="Close menu")).to_be_focused()
+        page.keyboard.press("Escape")
+        expect(menu).to_be_focused()
+        expect(page.get_by_role("navigation", name="Main")).not_to_be_visible()
         page.get_by_role("button", name="Open menu").click()
         expect(page.get_by_role("navigation", name="Main")).to_be_visible()
         page.get_by_role("link", name="Tickets", exact=True).click()
         expect(page.get_by_role("heading", name="Tickets", exact=True)).to_be_visible()
+        axe_path = os.environ.get('FLOWOPS_AXE_PATH')
+        if axe_path:
+            for route, heading in [('/tickets', 'Tickets'), ('/definitions', 'Workflow definitions')]:
+                page.set_viewport_size({'width': 1280, 'height': 900})
+                page.goto(base + route)
+                expect(page.get_by_role('heading', name=heading, exact=True)).to_be_visible()
+                page.add_script_tag(path=axe_path)
+                result = page.evaluate('''async () => window.axe.run({runOnly: {type: 'rule', values: ['button-name', 'link-name', 'label', 'aria-valid-attr-value', 'aria-roles', 'aria-required-attr', 'document-title', 'html-has-lang']}})''')
+                assert not result['violations'], json.dumps(result['violations'], default=str)
+                print('AXE_FOCUSED_PASS ' + route, flush=True)
         browser.close()
 
 
