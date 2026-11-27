@@ -25,7 +25,7 @@ from src.deps import _admin_actor, _new_run_id, _operator_actor
 from src.notify import deliver_webhook
 from src.schemas import ExecutionLogOut, NotificationOutboxOut
 
-from src.api import _scope_execution_log_query, _scope_ticket_or_request_keyed_query  # noqa: E402
+from src.deps import _scope_execution_log_query, _scope_ticket_or_request_keyed_query
 
 
 router = APIRouter()

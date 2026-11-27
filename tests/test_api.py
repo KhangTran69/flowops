@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from src import api, db
 from src.routes import monitoring
+from src.routes import tickets
 
 VALID_REQUEST = {
     "userId": 7,
@@ -268,14 +269,14 @@ def test_concurrent_same_key_returns_in_progress_then_replays(client, monkeypatc
 
     entered_pipeline = Event()
     release_pipeline = Event()
-    original_process = api._process_intake
+    original_process = tickets._process_intake
 
     def pause_pipeline(request, session, actor_subject=None):
         entered_pipeline.set()
         assert release_pipeline.wait(timeout=5), "test did not release the first request"
         return original_process(request, session, actor_subject)
 
-    monkeypatch.setattr(api, "_process_intake", pause_pipeline)
+    monkeypatch.setattr(tickets, "_process_intake", pause_pipeline)
     headers = {"Idempotency-Key": "concurrent-same-key"}
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -416,7 +417,7 @@ def test_stale_owner_cannot_finalize_after_takeover(client, monkeypatch):
     release_a = threading.Event()
     calls = 0
     call_lock = threading.Lock()
-    original_process = api._process_intake
+    original_process = tickets._process_intake
 
     def pause_first_request(request, session, actor_subject=None):
         nonlocal calls
@@ -428,7 +429,7 @@ def test_stale_owner_cannot_finalize_after_takeover(client, monkeypatch):
             assert release_a.wait(timeout=5), "test did not release the stale owner"
         return original_process(request, session, actor_subject)
 
-    monkeypatch.setattr(api, "_process_intake", pause_first_request)
+    monkeypatch.setattr(tickets, "_process_intake", pause_first_request)
     key = "takeover-finalize-key"
     headers = {"Idempotency-Key": key}
 
@@ -487,7 +488,7 @@ def test_stale_owner_cleanup_cannot_delete_new_owner_reservation(client, monkeyp
     b_release = threading.Event()
     calls = 0
     call_lock = threading.Lock()
-    original_process = api._process_intake
+    original_process = tickets._process_intake
 
     def controlled_process(request, session, actor_subject=None):
         nonlocal calls
@@ -503,7 +504,7 @@ def test_stale_owner_cleanup_cannot_delete_new_owner_reservation(client, monkeyp
             assert b_release.wait(timeout=5), "test did not release the new owner"
         return original_process(request, session, actor_subject)
 
-    monkeypatch.setattr(api, "_process_intake", controlled_process)
+    monkeypatch.setattr(tickets, "_process_intake", controlled_process)
     key = "takeover-cleanup-key"
     headers = {"Idempotency-Key": key}
 
@@ -572,7 +573,7 @@ def test_processing_failure_cleans_up_only_its_own_reservation(client, monkeypat
     def fail_pipeline(request, session, actor_subject=None):
         raise RuntimeError("ticket pipeline exploded")
 
-    monkeypatch.setattr(api, "_process_intake", fail_pipeline)
+    monkeypatch.setattr(tickets, "_process_intake", fail_pipeline)
     with pytest.raises(RuntimeError, match="ticket pipeline exploded"):
         client.post(
             "/tickets",
@@ -673,6 +674,7 @@ def test_notification_failure_is_logged_not_raised(client, monkeypatch):
         return DeliveryResult(success=False, attempts=3, last_error="boom")
 
     monkeypatch.setattr(api, "deliver_webhook", fake_deliver)
+    monkeypatch.setattr(tickets, "deliver_webhook", fake_deliver)
     monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
     response = client.post("/tickets", json=VALID_REQUEST)
     assert response.status_code == 201
@@ -714,6 +716,7 @@ def _succeeding_delivery(attempts=1):
 def test_failed_webhook_is_stored_in_outbox(client, monkeypatch):
     fake = FakeDelivery([_failing_delivery()])
     monkeypatch.setattr(api, "deliver_webhook", fake)
+    monkeypatch.setattr(tickets, "deliver_webhook", fake)
     monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
     assert client.post("/tickets", json=VALID_REQUEST).status_code == 201
 
@@ -729,6 +732,7 @@ def test_failed_webhook_is_stored_in_outbox(client, monkeypatch):
 def test_successful_webhook_does_not_touch_outbox(client, monkeypatch):
     fake = FakeDelivery([_succeeding_delivery()])
     monkeypatch.setattr(api, "deliver_webhook", fake)
+    monkeypatch.setattr(tickets, "deliver_webhook", fake)
     monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
     assert client.post("/tickets", json=VALID_REQUEST).status_code == 201
     assert client.get("/notifications/pending").json() == []
@@ -737,6 +741,7 @@ def test_successful_webhook_does_not_touch_outbox(client, monkeypatch):
 def test_retry_endpoint_redelivers_pending_and_marks_delivered(client, monkeypatch):
     fake = FakeDelivery([_failing_delivery(), _succeeding_delivery(attempts=1)])
     monkeypatch.setattr(api, "deliver_webhook", fake)
+    monkeypatch.setattr(tickets, "deliver_webhook", fake)
     # /notifications/retry delivers from the monitoring router module.
     monkeypatch.setattr(monitoring, "deliver_webhook", fake)
     monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
@@ -766,6 +771,7 @@ def test_retry_endpoint_redelivers_pending_and_marks_delivered(client, monkeypat
 def test_retry_keeps_still_failing_delivery_pending(client, monkeypatch):
     fake = FakeDelivery([_failing_delivery(), _failing_delivery(attempts=1)])
     monkeypatch.setattr(api, "deliver_webhook", fake)
+    monkeypatch.setattr(tickets, "deliver_webhook", fake)
     # /notifications/retry delivers from the monitoring router module.
     monkeypatch.setattr(monitoring, "deliver_webhook", fake)
     monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
@@ -786,6 +792,7 @@ def test_retry_keeps_still_failing_delivery_pending(client, monkeypatch):
 def test_retry_dead_letters_delivery_at_attempt_limit(client, monkeypatch):
     fake = FakeDelivery([_failing_delivery(), _failing_delivery(attempts=1)])
     monkeypatch.setattr(api, "deliver_webhook", fake)
+    monkeypatch.setattr(tickets, "deliver_webhook", fake)
     # /notifications/retry delivers from the monitoring router module.
     monkeypatch.setattr(monitoring, "deliver_webhook", fake)
     monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
@@ -817,6 +824,7 @@ def test_requeue_failed_delivery_and_retry_succeeds(client, monkeypatch):
         ]
     )
     monkeypatch.setattr(api, "deliver_webhook", fake)
+    monkeypatch.setattr(tickets, "deliver_webhook", fake)
     # /notifications/retry delivers from the monitoring router module.
     monkeypatch.setattr(monitoring, "deliver_webhook", fake)
     monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
@@ -845,6 +853,7 @@ def test_requeue_failed_delivery_and_retry_succeeds(client, monkeypatch):
 def test_requeue_rejects_non_failed_or_unknown_delivery(client, monkeypatch):
     fake = FakeDelivery([_failing_delivery()])
     monkeypatch.setattr(api, "deliver_webhook", fake)
+    monkeypatch.setattr(tickets, "deliver_webhook", fake)
     monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
     client.post("/tickets", json=VALID_REQUEST)
 
@@ -858,6 +867,7 @@ def test_requeue_rejects_non_failed_or_unknown_delivery(client, monkeypatch):
 def test_requeue_failed_delivery_only_once(client, monkeypatch):
     fake = FakeDelivery([_failing_delivery(), _failing_delivery(attempts=1)])
     monkeypatch.setattr(api, "deliver_webhook", fake)
+    monkeypatch.setattr(tickets, "deliver_webhook", fake)
     # /notifications/retry delivers from the monitoring router module.
     monkeypatch.setattr(monitoring, "deliver_webhook", fake)
     monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
@@ -873,6 +883,7 @@ def test_requeue_failed_delivery_only_once(client, monkeypatch):
 def test_retry_with_empty_queue_is_a_noop(client, monkeypatch):
     fake = FakeDelivery([])
     monkeypatch.setattr(api, "deliver_webhook", fake)
+    monkeypatch.setattr(tickets, "deliver_webhook", fake)
     # /notifications/retry delivers from the monitoring router module.
     monkeypatch.setattr(monitoring, "deliver_webhook", fake)
     assert client.post("/notifications/retry").json() == []
@@ -882,6 +893,7 @@ def test_retry_with_empty_queue_is_a_noop(client, monkeypatch):
 def test_dashboard_shows_pending_retries_section(client, monkeypatch):
     fake = FakeDelivery([_failing_delivery()])
     monkeypatch.setattr(api, "deliver_webhook", fake)
+    monkeypatch.setattr(tickets, "deliver_webhook", fake)
     monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
     client.post("/tickets", json=VALID_REQUEST)
 
@@ -894,6 +906,7 @@ def test_dashboard_shows_pending_retries_section(client, monkeypatch):
 def test_dashboard_shows_dead_letter_section(client, monkeypatch):
     fake = FakeDelivery([_failing_delivery(), _failing_delivery(attempts=1)])
     monkeypatch.setattr(api, "deliver_webhook", fake)
+    monkeypatch.setattr(tickets, "deliver_webhook", fake)
     # /notifications/retry delivers from the monitoring router module.
     monkeypatch.setattr(monitoring, "deliver_webhook", fake)
     monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/t")
