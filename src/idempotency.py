@@ -284,6 +284,7 @@ def replay_stored_response(
     resource_type: str,
     response: Response,
     session: Session,
+    actor_subject: Optional[str] = None,
 ) -> dict[str, Any]:
     """Validate and replay a stored completed response, or return a 409."""
     if _stored_resource_type(payload) != resource_type:
@@ -308,7 +309,8 @@ def replay_stored_response(
         run_id=_new_run_id(),
         action=REPLAY_ACTIONS[resource_type],
         status="success",
-        ticket_id=stored.ticket_id,
+        ticket_id=None if resource_type == SCOPE_DEFINITION else stored.ticket_id,
+        actor_subject=actor_subject,
         detail="replayed stored response without re-executing",
     )
     return payload
@@ -321,6 +323,7 @@ def reserve_key(
     request_hash: str,
     resource_type: str,
     resource_id: str,
+    actor_subject: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
     """Claim a reservation or return a completed stored response.
 
@@ -363,7 +366,7 @@ def reserve_key(
                 )
         else:
             return None, replay_stored_response(
-                stored, payload, request_hash, resource_type, response, session
+                stored, payload, request_hash, resource_type, response, session, actor_subject
             )
     else:
         owner_token = claim_key(
@@ -378,7 +381,7 @@ def reserve_key(
             )
         payload = json.loads(stored.response_json)
         return None, replay_stored_response(
-            stored, payload, request_hash, resource_type, response, session
+            stored, payload, request_hash, resource_type, response, session, actor_subject
         )
     return owner_token, None
 
