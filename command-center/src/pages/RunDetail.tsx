@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { ChevronDown, ChevronRight, Pause, Play, Square } from 'lucide-react'
 import { usePoll } from '../hooks/usePoll'
@@ -21,10 +21,13 @@ export default function RunDetail() {
   const steps = run?.checklist ? run.checklist.map((item) => { const history = attempts.filter((a) => a.checklist_item_id === item.id); const latest = history[history.length - 1]; return { ...item, attempts: history.length, attempts_json: history, error: latest?.error, output: item.output ?? latest?.output } }) : attempts
   const events = run?.events || []
   const finished = useMemo(() => ['completed', 'failed', 'cancelled'].includes(String(run?.status || '').toLowerCase()), [run])
+  const retry = useRef<{ operation: string; key: string } | null>(null)
   async function action() {
     if (!confirm) return
-    setBusy(true); const r = await mutate('POST', `/workflow-runs/${id}/${confirm}`, {}, `Run ${confirm}d.`); setBusy(false)
-    if (r.ok) { setConfirm(null); reload() }
+    const operation = `${id}:${confirm}`
+    if (!retry.current || retry.current.operation !== operation) retry.current = { operation, key: crypto.randomUUID() }
+    setBusy(true); const r = await mutate('POST', `/workflow-runs/${id}/${confirm}`, {}, `Run ${confirm}d.`, retry.current.key); setBusy(false)
+    if (r.ok) { retry.current = null; setConfirm(null); reload() }
   }
   return <>
     <BackLink to="/runs">Workflow runs</BackLink>
