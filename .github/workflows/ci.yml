@@ -154,3 +154,31 @@ jobs:
           trap 'kill "$api_pid" "$console_pid" 2>/dev/null || true; cat /tmp/flowops-api.log /tmp/flowops-console.log' EXIT
           curl --fail --retry 20 --retry-delay 1 --retry-all-errors http://127.0.0.1:8000/ready
           python command-center/tests/browser_smoke.py
+
+      - name: Exercise protected browser session with synthetic credentials
+        env:
+          FLOWOPS_DATABASE_URL: sqlite:///data/console-auth-browser.db
+          FLOWOPS_ENVIRONMENT: development
+          FLOWOPS_AUTH_REQUIRED: 'true'
+          FLOWOPS_UI_AUTH_REQUIRED: 'true'
+          FLOWOPS_SESSION_COOKIE_SECURE: 'false'
+          FLOWOPS_ACTION_ADAPTER: simulated
+          FLOWOPS_AI_ADAPTER: simulated
+          FLOWOPS_AUTOMATION_ADAPTER: simulated
+          FLOWOPS_API_URL: http://127.0.0.1:8000
+          FLOWOPS_COMMAND_CENTER_DEV: 'false'
+          NODE_ENV: production
+          FLOWOPS_DEV_TENANT_KEY: browser-test
+        run: |
+          export FLOWOPS_SESSION_SECRET="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+          export FLOWOPS_DEV_BEARER_TOKEN="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+          export FLOWOPS_BROWSER_TEST_PASSWORD="$(python -c 'import secrets; print(secrets.token_urlsafe(24))')"
+          export FLOWOPS_DEMO_USERS="$(python -c 'import json, os; from src.ui_session import hash_demo_password; print(json.dumps({"ci-operator": {"password_hash": hash_demo_password(os.environ["FLOWOPS_BROWSER_TEST_PASSWORD"]), "roles": ["automation.operator"], "tenant_key": "browser-test"}}))')"
+          alembic upgrade head
+          python -m uvicorn src.api:app --host 127.0.0.1 --port 8000 > /tmp/flowops-auth-api.log 2>&1 &
+          api_pid=$!
+          node command-center/server/index.mjs > /tmp/flowops-auth-console.log 2>&1 &
+          console_pid=$!
+          trap 'kill "$api_pid" "$console_pid" 2>/dev/null || true; cat /tmp/flowops-auth-api.log /tmp/flowops-auth-console.log' EXIT
+          curl --fail --retry 20 --retry-delay 1 --retry-all-errors http://127.0.0.1:8000/ready
+          python command-center/tests/browser_auth.py
