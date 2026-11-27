@@ -413,6 +413,18 @@ def metrics_endpoint(
             f'{{method="{method}",route="{route}",status="{status_code}"}} {count}'
         )
 
+    lines.extend([
+        "# HELP flowops_http_request_duration_seconds HTTP request latency in seconds",
+        "# TYPE flowops_http_request_duration_seconds histogram",
+    ])
+    for (method, route), (counts, total, seconds) in sorted(metrics.snapshot_latency().items()):
+        labels = f'method="{method}",route="{route}"'
+        for upper, count in zip(metrics.LATENCY_BUCKETS, counts):
+            lines.append(f'flowops_http_request_duration_seconds_bucket{{{labels},le="{upper}"}} {count}')
+        lines.append(f'flowops_http_request_duration_seconds_bucket{{{labels},le="+Inf"}} {total}')
+        lines.append(f'flowops_http_request_duration_seconds_count{{{labels}}} {total}')
+        lines.append(f'flowops_http_request_duration_seconds_sum{{{labels}}} {seconds}')
+
     job_records = session.execute(select(db.WorkflowJobRecord)).scalars().all()
     job_counts = Counter(job.status for job in job_records)
     lines.extend(
