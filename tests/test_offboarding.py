@@ -179,3 +179,71 @@ def test_offboarding_completion_requires_admin(client, monkeypatch):
     assert client.post(path).status_code == 401
     operator = client.post(path, headers={"Authorization": "Bearer dev-secret"})
     assert operator.status_code == 403
+
+
+def test_dag_ledger_rejects_out_of_order_completion(client, monkeypatch):
+    """offboarding-dag: the ledger enforces prerequisite order like onboarding.
+
+    ``revoke_licenses`` depends on ``disable_user_account``; completing it
+    first must return 409 naming the blocker, leave no ledger row behind,
+    and succeed once the prerequisite is done.
+    """
+    monkeypatch.setattr(
+        onboarding_routes, "offboarding_executor", lambda key, email: {"action": key}
+    )
+    body = client.post(
+        "/onboarding-requests", json={**OFFBOARDING, "template": "offboarding-dag"}
+    ).json()
+    checklist_id = body["id"]
+    assert _step(body, "revoke_licenses")["status"] == "blocked"
+
+    response = client.post(
+        f"/offboarding-requests/{checklist_id}/steps/revoke_licenses/complete"
+    )
+    assert response.status_code == 409
+    assert "disable_user_account" in response.json()["detail"]
+    # The rejected attempt must not poison the (checklist, step) ledger key.
+    assert _ledger_rows(checklist_id) == []
+
+    gated = _step(body, "disable_user_account")
+    assert client.post(
+        f"/onboarding-requests/{checklist_id}/items/{gated['id']}/approve"
+    ).status_code == 200
+    assert client.post(
+        f"/offboarding-requests/{checklist_id}/steps/disable_user_account/complete"
+    ).status_code == 201
+    assert client.post(
+        f"/offboarding-requests/{checklist_id}/steps/revoke_licenses/complete"
+    ).status_code == 201
+
+
+def test_dag_ledger_rejects_skipped_step(client):
+    """offboarding-dag: a step skipped by its predicate cannot be completed.
+
+    The skipped state is written directly to keep the test focused on the
+    ledger's guard (predicate evaluation itself is covered by the v1.3
+    tests); the endpoint must still refuse with a clear reason and leave
+    no claim behind.
+    """
+    body = client.post(
+        "/onboarding-requests", json={**OFFBOARDING, "template": "offboarding-dag"}
+    ).json()
+    checklist_id = body["id"]
+    # recover_laptop has no prerequisites and no approval gate, so reaching
+    # the endpoint's skipped-guard is not shadowed by an earlier rejection.
+    skipped = _step(body, "recover_laptop")
+
+    session = db.SessionLocal()
+    try:
+        item = session.get(db.ChecklistItemRecord, skipped["id"])
+        item.status = "skipped"
+        session.commit()
+    finally:
+        session.close()
+
+    response = client.post(
+        f"/offboarding-requests/{checklist_id}/steps/recover_laptop/complete"
+    )
+    assert response.status_code == 409
+    assert "skipped" in response.json()["detail"].lower()
+    assert _ledger_rows(checklist_id) == []

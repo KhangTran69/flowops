@@ -105,12 +105,13 @@ cascade dependents to `cascade_blocked`. ChatOps approve/reject tokens are
 HMAC-SHA256 signed, action-bound, expire after 24 hours, and are recorded once
 in `chatops_token_uses` for replay protection.
 
-`onboarding-dag` is the only selectable graph template. Offboarding keeps its
-flat template on purpose: that flow completes through the idempotent
-`offboarding_completions` ledger, which authorises a step by approval state
-rather than by graph edges, so a DAG template there would let a `blocked`
-dependent step complete out of order. Teaching the ledger about edges is the
-follow-up; `OFFBOARDING_DAG_SHAPE` records the intended graph.
+Both `onboarding-dag` and `offboarding-dag` are selectable graph templates;
+the flat v0.5 templates remain the defaults. Offboarding completes through
+the idempotent `offboarding_completions` ledger, which consults the same
+graph resolver as onboarding: unmet prerequisites and skipped steps return
+409 with the blocker named, on top of the approval-state check, so a
+`blocked` dependent step cannot complete out of order
+(`tests/test_offboarding.py::test_dag_ledger_rejects_out_of_order_completion`).
 
 The built-in simulated adapter returns no structured identifiers, so a demo
 run stores `{}` outputs. The piping contract is exercised with adapter doubles
