@@ -2984,6 +2984,31 @@ def _outbox_out(record: db.NotificationOutboxRecord) -> NotificationOutboxOut:
     )
 
 
+class ConsoleDeliveryOut(BaseModel):
+    id: int
+    ticket_id: Optional[str] = None
+    status: str
+    attempts: int
+    created_at: datetime
+
+
+@app.get("/command-center/deliveries", response_model=list[ConsoleDeliveryOut])
+def console_deliveries(
+    state: Literal["pending", "failed"] = Query(default="failed"),
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> list[ConsoleDeliveryOut]:
+    """Tenant-scoped delivery visibility without destination URLs or raw errors."""
+    query = _scope_ticket_or_request_keyed_query(
+        select(db.NotificationOutboxRecord).where(db.NotificationOutboxRecord.status == state),
+        db.NotificationOutboxRecord.ticket_id, actor,
+    )
+    rows = session.execute(query.order_by(db.NotificationOutboxRecord.id.desc()).offset(offset).limit(limit)).scalars()
+    return [ConsoleDeliveryOut.model_validate(row, from_attributes=True) for row in rows]
+
+
 @app.get("/notifications/pending", response_model=list[NotificationOutboxOut])
 def list_pending_notifications(
     actor: Actor = Depends(_operator_actor),
