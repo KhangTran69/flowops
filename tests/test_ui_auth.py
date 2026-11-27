@@ -265,3 +265,25 @@ def test_console_identity_ignores_forged_headers_and_requires_authentication(cli
     client.cookies.clear()
     client.cookies.set(ui_session.SESSION_COOKIE, "invalid-signature")
     assert client.get("/command-center/session").status_code == 401
+
+
+def test_logout_revokes_copied_cookie_without_revoking_other_session(client):
+    session = _operator_cookie(client)
+    copied = client.cookies.get(ui_session.SESSION_COOKIE)
+    other = ui_session.create_session(Actor("operator-test", ("automation.operator",),
+                                          source="session", tenant_key="tenant-a"))
+    assert client.get("/command-center/session").status_code == 200
+    denied = client.post("/logout", data={"csrf_token": "incorrect"}, follow_redirects=False)
+    assert denied.status_code == 403
+    assert client.get("/command-center/session").status_code == 200
+    assert client.post("/logout", data={"csrf_token": session.csrf_token},
+                       follow_redirects=False).status_code == 303
+    client.cookies.set(ui_session.SESSION_COOKIE, copied)
+    assert client.get("/command-center/session").status_code == 401
+    client.cookies.clear()
+    client.cookies.set(ui_session.SESSION_COOKIE, ui_session.encode_session(other))
+    assert client.get("/command-center/session").status_code == 200
+    with db.SessionLocal() as session_db:
+        record = session_db.get(db.RevokedUISessionRecord, ui_session._revocation_digest(session))
+        assert record is not None
+        assert record.digest != session.csrf_token
