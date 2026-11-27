@@ -204,3 +204,13 @@ jobs:
           trap 'kill "$api_pid" "$console_pid" 2>/dev/null || true; cat /tmp/flowops-auth-api.log /tmp/flowops-auth-console.log' EXIT
           curl --fail --retry 20 --retry-delay 1 --retry-all-errors http://127.0.0.1:8000/ready
           python command-center/tests/browser_auth.py
+
+
+  monitoring-rules:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate example Prometheus rules
+        run: |
+          docker run --rm -v "$PWD/monitoring:/rules:ro" --entrypoint /bin/promtool prom/prometheus:v3.5.0 check rules /rules/flowops-alerts.yml
+          docker run --rm -v "$PWD/monitoring:/rules:ro" --entrypoint /bin/promtool prom/prometheus:v3.5.0 test rules /rules/flowops-alerts.test.yml
