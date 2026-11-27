@@ -1357,6 +1357,29 @@ def list_workflow_definitions(
     ]
 
 
+@app.get("/workflow-definitions/{key}/diff")
+def compare_workflow_definition_versions(
+    key: str,
+    from_version: int = Query(alias="from", ge=1),
+    to_version: int = Query(alias="to", ge=1),
+    actor: Actor = Depends(_global_admin_actor),
+    session: Session = Depends(db.get_session),
+) -> dict[str, Any]:
+    previous = definitions.get_version(session, key, from_version)
+    current = definitions.get_version(session, key, to_version)
+    if previous is None or current is None:
+        raise HTTPException(404, "Definition version not found.")
+    before = {step["key"]: step for step in json.loads(previous.steps_json)}
+    after = {step["key"]: step for step in json.loads(current.steps_json)}
+    return {
+        "from_version": from_version,
+        "to_version": to_version,
+        "added": sorted(after.keys() - before.keys()),
+        "removed": sorted(before.keys() - after.keys()),
+        "changed": sorted(k for k in before.keys() & after.keys() if before[k] != after[k]),
+    }
+
+
 @app.get("/workflow-definitions/{key}", response_model=WorkflowDefinitionOut)
 def get_workflow_definition(
     key: str,
@@ -1666,6 +1689,25 @@ def get_workflow_run_by_id(
         raise HTTPException(404, "Workflow run not found.")
     _require_workflow_run_access(session, actor, run)
     return _workflow_run_out(session, run)
+
+
+@app.get("/command-center/session")
+def command_center_session(
+    request: Request,
+    actor: Actor = Depends(_operator_actor),
+) -> dict[str, Any]:
+    """Verify the caller at the backend, never accept proxy-supplied roles."""
+    if os.environ.get("FLOWOPS_AUTH_REQUIRED", "false").lower() != "true":
+        raise HTTPException(401, "Protected authentication is required.")
+    if actor.source not in ("session", "bearer"):
+        raise HTTPException(401, "Authentication required.")
+    browser_session = ui_session.read_session(request) if actor.source == "session" else None
+    return {
+        "subject": actor.subject,
+        "role": "admin" if "automation.admin" in actor.roles else "operator",
+        "tenant_key": actor.tenant_key,
+        "csrf_token": browser_session.csrf_token if browser_session else None,
+    }
 
 
 @app.get("/workflow-runs", response_model=list[WorkflowRunOut])
