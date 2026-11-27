@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src import api, db
-from src.routes import monitoring
+from src.routes import monitoring, tickets
 from src.notify import DeliveryResult
 
 POSTGRES_URL = os.environ.get("FLOWOPS_TEST_POSTGRES_URL")
@@ -95,7 +95,10 @@ def test_postgres_retry_dead_letters_then_requeue_delivers(client, monkeypatch):
             _successful_delivery(attempts=1),  # after requeue
         ]
     )
+    # Intake delivery now runs through the tickets module; retry through
+    # the monitoring router. Patch every module that owns a call site.
     monkeypatch.setattr(api, "deliver_webhook", fake)
+    monkeypatch.setattr(tickets, "deliver_webhook", fake)
     # /notifications/retry delivers from the monitoring router module.
     monkeypatch.setattr(monitoring, "deliver_webhook", fake)
     monkeypatch.setenv("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "https://hooks.example/pg")
