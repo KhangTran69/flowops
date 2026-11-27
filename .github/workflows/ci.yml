@@ -110,6 +110,10 @@ jobs:
       - run: npm run build
       - run: node --check server/index.mjs
       - run: node --test server/*.test.mjs
+      - run: node --experimental-strip-types --test tests/contracts.test.mjs
+      - name: Report dependency advisories (non-blocking)
+        run: npm audit --json
+        continue-on-error: true
 
 
   console-browser:
