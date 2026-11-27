@@ -723,8 +723,14 @@ def test_run_detail_and_console_approval_fenced(fencing_client):
     assert client.get(f"/workflow-runs/{run_id}").status_code == 404
     assert client.post(path, json={"reason": "Not approved"}).status_code == 404
     set_actor(Actor("admin-a", ("automation.admin",), source="bearer", tenant_key="tenant-a"))
-    result = client.post(path, json={"reason": "Not approved"})
+    headers = {"Idempotency-Key": "reject-console-1"}
+    result = client.post(path, json={"reason": "Not approved"}, headers=headers)
     assert result.status_code == 200, result.text
+    replay = client.post(path, json={"reason": "Not approved"}, headers=headers)
+    assert replay.status_code == 200, replay.text
+    assert replay.headers["Idempotency-Replayed"] == "true"
+    assert replay.json() == result.json()
+    assert client.post(path, json={"reason": "Different reason"}, headers=headers).status_code == 409
     assert client.post(path, json={"reason": "Not approved"}).status_code == 409
     session = db.SessionLocal()
     try:
@@ -775,3 +781,16 @@ def test_definition_comparison_respects_global_admin(fencing_client):
     assert result.json()["removed"] == []
     set_actor(_tenant_actor("tenant-a"))
     assert client.get("/workflow-definitions/compare-test/diff", params={"from": 1, "to": 2}).status_code == 403
+
+
+def test_audit_filters_are_applied_with_tenant_scope(fencing_client):
+    client, set_actor = fencing_client
+    set_actor(_tenant_actor("tenant-a"))
+    for i in range(3):
+        assert client.post("/tickets", json={"id": 6000+i, "userId": 7, "title": "Printer issue", "completed": False}).status_code == 201
+    filtered = client.get("/audit", params={"action": "ticket.created", "ticket_id": "6000", "limit": 1})
+    assert filtered.status_code == 200, filtered.text
+    assert len(filtered.json()) == 1
+    assert filtered.json()[0]["ticket_id"] == "6000"
+    set_actor(_tenant_actor("tenant-b"))
+    assert client.get("/audit", params={"ticket_id": "6000"}).json() == []
