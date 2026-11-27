@@ -65,10 +65,10 @@ Evidence-based; each one is addressed by a phase below.
 
 Small, unglamorous, unblocks everything else.
 
-- [ ] Merge PR #53 once its consolidated CI is green (it is the current
+- [x] Merge PR #53 once its consolidated CI is green (it is the current
       release-validation head; later phases assume its session-revocation and
-      accessibility work).
-- [ ] **Docs debt sweep** (closes gap 5):
+      accessibility work). — merged 2026-11-27.
+- [x] **Docs debt sweep** (closes gap 5):
   - Refresh README "Running the tests" count policy: stop pinning counts in
     prose — link the CI badge and say "the suite is fully offline; PostgreSQL
     tests opt in via `FLOWOPS_TEST_POSTGRES_URL`".
@@ -80,14 +80,15 @@ Small, unglamorous, unblocks everything else.
     that cost (PR #12 was closed as a superseded parallel rewrite).
   - Extend `AGENTS.md` to describe both run modes (Base44 sandbox and local
     venv) and point contributors at this roadmap.
-- [ ] **Environment refresh procedure**: add a one-liner to the README dev
+- [x] **Environment refresh procedure**: add a one-liner to the README dev
       setup — after pulling, reinstall pinned deps
       (`pip install -r requirements-dev.txt`). Rationale: a stale local venv
       (`mcp` 1.30 vs pinned 2.3.0) currently breaks test collection for two
       files while CI stays green, which looks like a repo bug but isn't.
-- [ ] Adopt a lightweight **contribution protocol** for the concurrent IDE/bot
+- [x] Adopt a lightweight **contribution protocol** for the concurrent IDE/bot
       workflows that already exist here: one PR per concern, rebase on `main`
-      before opening, roadmap checkbox updates belong in the PR body.
+      before opening, roadmap checkbox updates belong in the PR body. — now in
+      `AGENTS.md`.
 
 **Definition of done:** PR #53 merged; every doc claim about tests, auth, and
 migrations matches the code; a fresh clone + README instructions produce a

@@ -1,82 +1,91 @@
 # FlowOps — AI Handoff Prompt
 
-Copy everything below this line into the AI assistant of your IDE to continue the project.
+Copy everything below this line into the AI assistant of your IDE to continue
+the project. This file is intentionally short: the detailed, living sources of
+truth are the README, the architecture doc, and the roadmap — it links to
+them instead of duplicating them, so it cannot go stale the way long
+state-dumps do.
 
 ---
 
 ## Role
 
-Act as a senior Python backend engineer and automation engineer. Continue developing **FlowOps**, an IT workflow automation platform, in the current workspace (project root contains this file, `src/`, `tests/`, `data/`, `README.md`). Create real files, run the test suite, verify with live requests, and only report what you actually verified. This is a learning/portfolio project targeting Automation Engineer roles (Rewst, Power Automate, n8n, REST APIs, webhooks, SQL, workflow reliability) — keep it interview-ready and beginner-readable.
+Act as a senior Python backend engineer and automation engineer. Continue
+developing **FlowOps**, an IT workflow automation platform, in the current
+workspace. Create real files, run the test suite, verify with live requests,
+and only report what you actually verified. This is a learning/portfolio
+project targeting Automation Engineer roles (Rewst, Power Automate, n8n,
+REST APIs, webhooks, SQL, workflow reliability) — keep it interview-ready and
+beginner-readable.
 
-## Current state (verified complete as of 2026-10-17 — do not rebuild, extend it)
+## First actions (in order)
 
-Milestones v0.1–v0.7 plus the v1.1 workflow DAG/ChatOps engine, secure operator console, durable workflow jobs, auth/audit, observability, and migrations are implemented and tested (298 offline pytest tests passing, plus 15 PostgreSQL-only tests that skip unless `FLOWOPS_TEST_POSTGRES_URL` is set):
+1. Read [`AGENTS.md`](../../AGENTS.md) (setup, conventions) and
+   [`docs/ROADMAP.md`](../ROADMAP.md) (the plan of record — pick your task
+   from there).
+2. Establish the baseline:
+   ```bash
+   source .venv/bin/activate && pip install -r requirements-dev.txt && pytest -q
+   ```
+   (Reinstalling the pinned requirements matters: a stale local venv causes
+   import errors that do not exist in CI.)
+3. Spot-check the running system: `uvicorn src.api:app --reload`, then curl
+   `/health`, `POST /tickets` (example in the README), and open `/dashboard`.
+4. **Report any drift** between these docs and the actual code before making
+   changes, then fix the docs as part of your change.
 
-- **v0.1 CLI** — `src/ticket_processor.py`: fetches a JSONPlaceholder todo (`https://jsonplaceholder.typicode.com/todos/1`), strict validation (`TicketValidationError`, rejects bool-as-int, empty titles, non-object payloads), normalizes to the internal format (`ticket_id`, `requester_id`, `title`, `status` open/closed, `priority`), saves `data/ticket.json`. Run: `python -m src.ticket_processor`.
-- **v0.2+ API** — `src/api.py` (FastAPI): `POST /tickets` (strict Pydantic: `StrictInt`/`StrictStr`/`StrictBool`, ge=1, non-blank title), `GET /tickets`, `GET /tickets/{id}` (404 for non-numeric IDs — path-traversal safe), `GET /health`, HTML landing page at `/`, Swagger at `/docs`.
-- **v0.3 persistence** — `src/db.py` (SQLAlchemy 2.0): `TicketRecord`, `ExecutionLogRecord`, `IdempotencyRecord`, `NotificationOutboxRecord`, `OnboardingRequestRecord`, `ChecklistItemRecord`. Default SQLite at `data/flowops.db`; PostgreSQL via `FLOWOPS_DATABASE_URL=postgresql+psycopg://...`. `db.get_session()` is the FastAPI dependency; `db.log_execution()` writes run logs (run_id, action, status, ticket_id, duration_ms, detail).
-- **v0.4 routing + notifications** — `src/routing.py`: **pure functions** (keyword → category; urgency keywords + category → priority normal/high/urgent; category → queue like `it-access-management`, fallback `it-service-desk`). `src/notify.py`: `deliver_webhook()` retries 3× with exponential backoff (0.5s, 1s), returns a `DeliveryResult` and never raises; API logs the outcome as `notification.webhook`. Bulk n8n-style intake: `POST /webhooks/intake` accepts one ticket or a list (422 rejects the whole batch).
-- **v0.5 onboarding + idempotency** — `src/onboarding.py`: checklist templates (onboarding/offboarding, each step has queue + `requires_approval`). API: `POST /onboarding-requests` → generates checklist; `GET /onboarding-requests/{id}/status` returns lightweight progress summary (total, completed, pending approval, percent); `.../items/{id}/approve` and `.../complete` with state machine (gated steps must be approved before completion → else 409); when all steps complete, the request flips to `completed`. `POST /tickets` and `POST /onboarding-requests` honor an `Idempotency-Key` header (≤128 chars): same-payload replay returns the stored response with `Idempotency-Replayed: true`; concurrent matching requests get 409 while the original is processing; reusing the key with a different payload returns 409. Legacy stored keys predating payload binding return 409.
-- **Fenced idempotency (v1.0 reliability)** — every successful claim stores a unique `owner_token` (fencing token). A processing reservation older than five minutes can be taken over; the takeover atomically rotates the token and refreshes `created_at` (the lease start). Completion is a conditional update that also requires `owner_token` and the `processing` state, and runs in the same transaction as the ticket/onboarding and execution-log writes. If ownership changed, those writes roll back and the stale request gets a retryable 409. Error cleanup is a conditional delete with the same token, so a stale owner cannot remove the new reservation. Keys are scoped by a `resource_type` column (`ticket` or `onboarding`); legacy rows without a scope are treated as ticket reservations, and reusing a key across resource types returns 409. Completed records are never reclaimed. SQLite uses the upsert's affected row count; PostgreSQL uses `RETURNING owner_token` because `psycopg` reports `rowcount = -1` for `INSERT ... ON CONFLICT DO UPDATE`.
-- **Notification dead-letter workflow (v1.0 reliability)** — failed in-request webhooks go to `notification_outbox` as `pending`. `POST /notifications/retry` attempts pending rows once each. When `attempts` reaches `FLOWOPS_NOTIFICATION_MAX_ATTEMPTS` (default 5, bounded 1–20) the row becomes `failed` (dead-lettered) and a `notification.dead_lettered` execution log is written. `GET /notifications/failed` lists dead letters; `POST /notifications/{id}/requeue` uses a conditional `status = failed` update to return one to `pending` (409 if another operator already requeued it). Attempt history and `last_error` are preserved, so each requeue grants one more delivery attempt. `POST /notifications/retry` never selects failed rows. Delivery remains at-least-once.
+## What exists (do not rebuild — extend it)
 
-- **Operator UI (v1.0)** — `src/web.py` + `src/templates/` + `src/static/` render the landing page, dashboard, onboarding list/detail, notification outbox, job queue/detail, and audit trail with Jinja2. Local CSS/vanilla JS only; theme toggle, responsive layout, inline fetch actions, empty states, HTML 404s, and pagination/filter controls. `tests/test_web.py` and `test_pagination.py` cover rendering, escaping, static assets, empty states, and page boundaries.
-- **Durable workflow jobs (v1.0 reliability)** — `src/jobs.py` defines `WorkflowJobRecord` with queued/running/succeeded/retry_scheduled/failed/cancelled states, unique owner tokens, leases, exponential backoff, and conditional completion/cancel/retry. `src/worker.py` claims jobs, heartbeats the lease during slow actions, passes stable idempotency keys to adapters, executes onboarding actions, writes execution/audit rows, and commits item updates with job completion in one fenced transaction. `POST /onboarding-requests/{id}/items/{item}/jobs` enqueues; `GET /workflow-jobs`, `/retry`, and `/cancel` expose operator controls. The synchronous execute endpoint remains for compatibility. `src/outbox.py` + `src/outbox_worker.py` add the same leased delivery loop for pending notification rows with backoff/dead-letter. `tests/test_jobs.py`, `test_jobs_postgres.py`, `test_outbox_worker.py`, and `test_outbox_worker_postgres.py` cover completion, heartbeat, idempotency keys, stale-lease takeover, retries/dead-letter, dispatcher claims, and API transitions.
-- **AI support agent (v0.7)** — `src/ai_agent.py` provides a deterministic simulated adapter, a keyword-scored IT knowledge base, structured ticket summaries with urgency signals, and suggest-only recommendations (`queue-reassign`, `priority-upgrade`, `reply-draft`, `onboarding-checklist`). `POST /tickets/{id}/ai-triage` never mutates the ticket; `POST /tickets/{id}/ai-recommendations/apply` requires an operator actor, re-runs triage, and applies only explicitly approved queue/priority IDs. `GET /knowledge-base` lists/searches articles. The optional `LLMAIAdapter` supports OpenAI-compatible providers (`gemini`, `groq`, `openai`, `openrouter`, `ollama`, generic `llm`) through `FLOWOPS_AI_BASE_URL`/`FLOWOPS_AI_MODEL`/`FLOWOPS_AI_TIMEOUT`. It is selected only when configured with a key (or `ollama` locally); tests inject an `httpx.MockTransport` and make no network calls. AI logs (`ai.summarize`, `ai.recommend`, `ai.recommendation_applied`, and `ai.error`) include actor, duration, and correlation ID. `/ui/tickets` and `/ui/tickets/{id}?triage=1` provide the operator UI. Safety: ticket text is PII-redacted and truncated before provider calls, ticket data is marked untrusted, LLM output is schema/allowlist-validated (only queue/priority applicable; status is never mutable), and provider errors return 503. `tests/test_ai_eval.py` adds a deterministic 12-ticket golden evaluation. `/metrics` exposes AI triage/apply/provider-error counters; the dashboard has an AI activity panel. `scripts/ai_smoke.py` is an opt-in live provider check, not CI. Tests: `test_ai_agent.py`, `test_ai_eval.py`, `test_ai_postgres.py`.
-- **Offboarding completion ledger (v0.6.1 reliability)** — `POST /offboarding-requests/{checklist_id}/steps/{step_key}/complete` is admin-only and uses an append-only `offboarding_completions` ledger. The rows are claimed with an owner token/lease before the simulated side effect runs, replayed with `X-Offboarding-Replayed: true`, and can be taken over after the five-minute window. Executor failures release the claim; every path logs the actor. The operator UI completes offboarding steps through this endpoint, and the dashboard shows offboarding progress. `tests/test_offboarding.py` and `test_offboarding_postgres.py` cover first/replay, concurrent claims, approval gates, validation, failure cleanup, closed checklists, and admin auth.
-- **Auth, roles, and audit (v1.0 security)** — `src/auth.py` supports optional Entra JWT or a dev bearer token. Mutating routes use `_operator_actor`; requeue/cancel use `_admin_actor`; local development is admin-equivalent, while protected dev tokens are operator-only. `FLOWOPS_AUTH_REQUIRED=true` enables enforcement, startup validation fails fast on missing config, and `GET /auth/me` returns the actor. Webhook intake can require `FLOWOPS_WEBHOOK_API_KEY`. `FLOWOPS_RATE_LIMIT_PER_MINUTE` enables an in-process limiter (off by default, not multi-process safe). Execution logs carry `actor_subject`; `GET /audit`, `/ui/audit`, and `/execution-logs?actor=` expose the trail. `tests/test_auth.py` covers 401/403/429 paths, webhook keys, startup validation, and actor attribution.
-- **Workflow DAG and ChatOps approvals (v1.1)** — `src/onboarding.py` adds `depends_on` graph rules (`blocked`, `cascade_blocked`, cycle validation, topological order); `src/workflow.py` bridges graph state to DB rows, aggregates prerequisite outputs, and logs unblock/cascade transitions. `ChecklistItemRecord.depends_on_json`/`output_json` come from migration `0006_workflow_dag_chatops`. `src/chatops.py` signs 24h HMAC-SHA256 approve/reject tokens bound to request/item/action; `POST /webhooks/actions/approve|reject` verify them and record single-use `jti` values in `chatops_token_uses` with `chatops:slack|teams|email|webhook` actor attribution. The operator detail page renders dependencies, blockers, structured outputs, and ChatOps controls. `tests/test_workflow_dag.py` covers blocking, unblocking, cascades, cycles, output piping, token expiry/tamper/replay, audit rows, and UI rendering.
-- **Workflow orchestrator (v1.2)** — `src/scheduler.py` leases runs, resolves DAG readiness, and enqueues ready steps through the existing durable jobs table; `workflow_runs`/`workflow_step_runs`/`workflow_events` (migration `0007_workflow_orchestrator`) record attempts, outputs, and events. Gated steps are never auto-approved; worker completion/failure and ChatOps/operator approvals advance the run immediately. Pause/resume/cancel endpoints and `/ui/workflow-runs` expose control-plane state; `/metrics` adds DAG run/step/tick gauges. Tests: `test_orchestrator.py`, `test_orchestrator_postgres.py`.
-- **v2 integration pack** — `src/graph.py` (client credentials, paging, 429 retry), `src/connectwise.py` (mock conditions/PATCH/time entries), `src/powershell.py` + `scripts/exchange/Set-MailboxForwarding.ps1`, `src/mcp_server.py` (official MCP SDK), `flows/` n8n exports, `sql/reporting.sql` + reporting view migration, `docs/runbooks/`, and a multi-tenancy migration plan. Live Graph credentials, n8n screenshots, Claude Desktop, and video require external environments and were not fabricated.
-- **Versioned definitions and SLA timers (v1.3)** — `src/definitions.py` stores immutable definition versions with SHA-256 checksums; requests pin a definition key/version. `src/expressions.py` provides a hand-written safe predicate evaluator; the resolver supports `all`/`any` joins, predicates (`skipped` on false), and audit reasons. `workflow_timers` + `src/timers.py` fire leased SLA alarms, write `onboarding.step.overdue`, enqueue escalation notices, and optionally reassign queues. Definition CRUD/publish and safe runtime migration endpoints are additive; `/ui/workflow-definitions` exposes version history. `tests/test_v13_orchestration.py` and `test_v13_postgres.py` cover this.
-- **Secure operator console (v1.1 security)** — `src/ui_session.py` signs browser sessions with `itsdangerous`; set `FLOWOPS_UI_AUTH_REQUIRED=true` plus `FLOWOPS_SESSION_SECRET`. `/login` validates a dev bearer/Entra token through the existing auth path; `/dashboard` and `/ui/*` redirect unauthenticated browsers to login. Cookies are HttpOnly, SameSite=Lax, optionally Secure, and bounded by `FLOWOPS_SESSION_MAX_AGE_SECONDS`. Cookie-authenticated mutations require `X-CSRF-Token`; bearer clients remain CSRF-exempt. Admin-only controls are hidden from operators while server-side roles remain authoritative. `ui.login`/`ui.logout` are audit-logged. This is a prototype token-paste login; it is not full SSO or user management. `tests/test_ui_auth.py` covers redirects, login/logout, cookie flags, expiry, open-redirect rejection, CSRF, bearer exemptions, role hiding, and audit rows.
-- **Observability and migrations (v1.0 operations)** — middleware adds `X-Correlation-ID` and request counters; `GET /ready` checks the database; `GET /metrics` exposes HTTP, workflow-job, and outbox metrics. Alembic (`alembic.ini`, `migrations/`) owns the schema with an additive baseline for existing databases. The Docker entrypoint runs migrations; the worker waits for a healthy app. The image runs as non-root `flowops`. Tests: `test_observability.py`, `test_migrations.py`.
+Everything in the README milestone table is implemented and CI-tested:
+tickets with strict validation + fenced idempotency, rule-based routing,
+notification outbox with dead-letter/requeue, onboarding/offboarding with
+approval gates, versioned DAG definitions with safe predicates/joins/SLA
+timers, a leased durable job queue, a DB-backed orchestrator (runs, step
+attempts, events), event triggers + source connectors (Jira/ServiceNow/
+Slack/Teams/generic) with tenant-scoped webhook identity, multi-tenant
+(GDAP-style) fencing, a workforce module with an n8n transactional outbox,
+operational analytics, a Microsoft Graph client (offline-tested via
+simulator), ConnectWise + MCP + AI adapters (simulated by default), a
+server-rendered Jinja console, and a React **command center**
+(`command-center/`) behind an allowlist proxy.
 
-- **Dashboard** — `GET /dashboard` (server-rendered HTML, `html.escape`d): ticket counts, queue/priority breakdowns, success/failure run counts, avg duration, estimated staff time saved (15 min per auto-routed ticket), notification counters, pending-delivery table, and a dead-letter table with requeue hints.
-- **Tests** — `tests/test_ticket_processor.py`, `test_api.py`, `test_web.py`, `test_routing.py`, `test_notify.py`, `test_onboarding.py`, `test_actions.py`, `test_auth.py`, `test_jobs.py`, `test_ai_agent.py`, `test_ai_eval.py`, `test_ui_auth.py`, `test_workflow_dag.py`, `test_orchestrator.py`, `test_v13_orchestration.py`, `test_expressions.py`, `test_offboarding.py`, `test_pagination.py`, `test_outbox_worker.py`, `test_observability.py`, `test_migrations.py`, `test_idempotency_postgres.py`, `test_outbox_postgres.py`, `test_jobs_postgres.py`, `test_outbox_worker_postgres.py`, `test_offboarding_postgres.py`, `test_ai_postgres.py`, `test_orchestrator_postgres.py`, `test_v13_postgres.py`, `test_integrations.py`. All HTTP mocked; file/DB tests use `tmp_path` + per-test SQLite. Run with `pytest` (298 passing, 15 PostgreSQL-only tests skipped locally, plus the FastAPI startup-event deprecation warning). Coverage includes same-payload replay, changed-payload conflict, concurrent same-key requests, stale reservation recovery without reclaiming completed keys, deterministic lease takeover and fencing for tickets and onboarding, cross-resource key rejection, owner-only failure cleanup, additive migration of pre-fencing databases, outbox dead-lettering at the attempt limit, conditional requeue, impossible calendar dates, legacy idempotency keys, onboarding status, and simulated action retries. `test_idempotency_postgres.py`, `test_outbox_postgres.py`, `test_jobs_postgres.py`, `test_outbox_worker_postgres.py`, `test_offboarding_postgres.py`, and `test_ai_postgres.py` run when `FLOWOPS_TEST_POSTGRES_URL` is set and are exercised by the CI `postgres-idempotency` job. The CI matrix also runs `alembic upgrade head` on SQLite and PostgreSQL.
-- **Stack** — Python 3.10+ (3.13 in dev), venv at `.venv`, `requirements.txt`: requests, pytest, fastapi, uvicorn, httpx, sqlalchemy. Run API: `uvicorn src.api:app --reload`. No dotenv dependency — plain env vars (`FLOWOPS_SAMPLE_API_URL`, `FLOWOPS_DATABASE_URL`, `FLOWOPS_TICKET_STORE_DIR`, `FLOWOPS_NOTIFICATION_WEBHOOK_URL`, `FLOWOPS_NOTIFICATION_MAX_ATTEMPTS`), documented in `.env.example`.
-- GitHub repository: `https://github.com/KhangTran69/flowops.git`, default branch `main`; runtime artifacts (`data/*.json`, `data/tickets/`, `data/*.db`) are git-ignored via `.gitkeep`-tracked `data/`.
+Schema: Alembic owns migrations (`migrations/versions/`, additive baseline);
+SQLite is the default dev database, PostgreSQL is exercised in CI
+(`docker-postgres`, `postgres-idempotency` jobs).
 
-## Long-term vision (four pillars)
+Tests: fully offline (mocked HTTP, `tmp_path` SQLite); PostgreSQL-only tests
+skip unless `FLOWOPS_TEST_POSTGRES_URL` is set. Do not trust counts written
+anywhere in docs — run `pytest -q` for the current number; the CI badge is
+authoritative.
 
-1. **Automated ticket management** — classify, prioritize, route to queues, notify (rule-based core done; notifications are webhook-based).
-2. **Employee onboarding/offboarding** — checklists for accounts, equipment, software access, approvals, tracked to completion (checklist engine done).
-3. **AI support agent** — summarize ticket history, suggest KB solutions, recommend actions; **human approval required for sensitive actions**.
-4. **Automation monitoring dashboard** — run success/failure, processing time, tickets auto-handled, staff time saved (preview done at `/dashboard`).
+## Where to work next
 
-## Next steps (in order)
+Pick from [`docs/ROADMAP.md`](../ROADMAP.md). Its phases are ordered; within
+a phase, tasks are independently PR-able. Keep each PR single-concern, rebase
+on `main` before opening, and tick the roadmap checkbox your PR completes in
+the PR body.
 
-1. **v1.0 polish** (done 2026-10-17): GitHub Actions CI (`.github/workflows/ci.yml`, pytest on 3.10–3.13, plus a PostgreSQL deployment job and a `postgres-idempotency` job for the idempotency, outbox, workflow-job, and dispatcher tests, plus migration checks) and Docker Compose (`Dockerfile`, `docker-compose.yml` — API + PostgreSQL 16, `FLOWOPS_DATABASE_URL` prewired, `psycopg[binary]` in requirements).
-2. **v0.6 Microsoft / External action adapters** (done 2026-10-17): Microsoft Graph, Power Automate, and PowerShell adapters in `src/actions.py`; dry-run testing; per-step retry and failure alerts wired into both the sync executor and the durable workflow worker (`src/worker.py`).
-3. **v0.7 AI support agent** (done with a simulated adapter): summarize history, search the local KB, and suggest actions; apply is operator-gated. Real Claude/Gemini/OpenAI clients can be injected through the optional `LLMAIAdapter` when credentials are available.
+## Known reliability limits (documented, deliberate)
 
-## Known reliability limits
-
-- Outbound webhook *delivery* is outside the reservation transaction. A stale owner may already have sent a notification before it loses its lease, even though its ticket, onboarding, execution-log, and outbox writes roll back. Webhook delivery is at-least-once; receivers should deduplicate using the ticket ID or an event key.
-- The five-minute lease is a recovery window, not a hard request timeout. A healthy slow request keeps ownership until another request takes over and rotates the token.
-- Lease staleness uses wall-clock time (`db.utcnow()`). Clock skew between hosts can cause a premature takeover; the fence keeps that safe because only one token can finalize, but keep host clocks synchronized.
-- PostgreSQL coverage requires `FLOWOPS_TEST_POSTGRES_URL`; it skips locally and runs in CI. SQLite remains the default offline development path.
-- The fencing/scope columns are added by small additive `ALTER TABLE` compatibility steps. There is no general migration framework yet.
-- Outbox requeue preserves attempts rather than resetting them, so a requeued row gets exactly one more attempt before returning to `failed` if it fails again.
-- Workflow jobs execute external actions at-least-once. The job/item/log/audit transaction is fenced, but a worker crash after an external call and before commit can cause a retry; adapters should use the stable per-item idempotency key where the provider supports it.
-- The worker heartbeats in a background thread; if the heartbeat fails or the lease is taken over, completion is fenced. Keep actions reasonably short for the prototype.
-- Auth defaults to local-development mode. Entra/JWT and webhook API keys are configuration-driven; there is no user-management UI or secret store. Rate limiting is in-process and per-worker, not a distributed limiter. The HTML operator pages are local-development oriented; protected deployments should put them behind the same auth boundary before exposing them.
-- Offboarding remains simulated and synchronous behind the claim ledger. A crash after an external side effect but before the ledger update can still require manual reconciliation; the ledger prevents concurrent double execution, not every at-least-once external failure.
-- The Alembic baseline is additive and intentionally metadata-driven; create a new revision for future schema changes rather than editing the baseline.
+- Outbound webhook delivery is at-least-once and outside the reservation
+  transaction; receivers deduplicate by ticket ID / event key.
+- Leases use wall-clock time; keep host clocks synchronized (fencing keeps
+  takeover safe regardless).
+- The rate limiter is in-process and not multi-process safe.
+- External side effects execute at-least-once; adapters should use the stable
+  per-item idempotency key where the provider supports it.
 
 ## Rules
 
-- Extend the existing architecture (pure routing functions, strict validation at the boundary, execution logging on every workflow action). No new frameworks without asking.
-- Tests stay fully offline: mock HTTP, use `tmp_path`, per-test SQLite. Never depend on internet access.
-- Never claim a command, test, or API request succeeded unless you ran it and saw the output.
+- Extend the existing architecture (strict validation at the boundary, pure
+  routing functions, execution logging on every workflow action). No new
+  frameworks without an explicit decision recorded in the roadmap.
+- Tests stay fully offline: mock HTTP, use `tmp_path`, per-test SQLite.
+- Never claim a command, test, or API request succeeded unless you ran it and
+  saw the output.
 - Do not commit or push to GitHub unless the user explicitly asks.
-- Clearly label simulated/learning-prototype status; never call the project production-ready. The API has no auth yet — localhost only.
-- Avoid overengineering: small functions with clear responsibilities, no class hierarchies, concise docstrings, type hints where they help.
-
-## First command to run
-
-```bash
-source .venv/bin/activate && pytest -q
-```
-
-Then `uvicorn src.api:app --reload` and curl `/health`, `POST /tickets`, `/dashboard` to confirm the state matches this prompt. Report any drift between this handoff and the actual code before making changes.
+- Clearly label simulated/learning-prototype status; the platform is not a
+  production ticketing system. Deployment is gated by the release gates in
+  the roadmap — do not lift a gate without its evidence artifact.
+- Avoid overengineering: small functions with clear responsibilities,
+  concise docstrings, type hints where they help.
