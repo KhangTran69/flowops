@@ -317,3 +317,17 @@ def test_postgres_ticket_and_onboarding_keys_are_scoped(client):
     )
     assert onboarding_conflict.status_code == 409
     assert "different resource type" in onboarding_conflict.json()["detail"]
+
+
+def test_postgres_manual_ticket_idempotent_create(client):
+    payload = {"requester_id": 7, "title": "VPN outage", "description": "Manual ticket", "requester_email": "requester@example.test"}
+    headers = {"Idempotency-Key": "postgres-manual-ticket"}
+    first = client.post("/tickets/manual", json=payload, headers=headers)
+    assert first.status_code == 201, first.text
+    ticket_id = first.json()["ticket_id"]
+    replay = client.post("/tickets/manual", json=payload, headers=headers)
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == first.json()
+    assert client.get(f"/tickets/{ticket_id}").json()["description"] == "Manual ticket"
+    assert len(client.get("/tickets").json()) == 1
+    assert client.get("/command-center/summary").json()["open_tickets"] == 1

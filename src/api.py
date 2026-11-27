@@ -6,13 +6,14 @@ onboarding/offboarding checklists, idempotency keys, and delivery retries;
 the v1.0 preview keeps failed webhook deliveries in a retryable outbox.
 """
 
+import hashlib
 import json
 import os
 import re
 import threading
 import time
 import uuid
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator, Literal, Optional
@@ -24,8 +25,8 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-from sqlalchemy import Integer, String, and_, cast, delete, or_, select, text, update
+from pydantic import BaseModel, Field
+from sqlalchemy import Integer, String, and_, cast, delete, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -62,6 +63,9 @@ from src.deps import (
 from src.schemas import (
     TicketIntakeRequest,
     Ticket,
+    TicketDetailOut,
+    TicketHistoryOut,
+    ManualTicketIn,
     KnowledgeBaseArticleOut,
     KnowledgeBaseMatchOut,
     AISummaryOut,
@@ -242,7 +246,7 @@ async def correlation_and_metrics(request: Request, call_next):
     response = await call_next(request)
     duration = time.perf_counter() - started
     route = request.scope.get("route")
-    route_path = getattr(route, "path", request.url.path)
+    route_path = getattr(route, "path", "<unmatched>")
     _record_request(request.method, route_path, response.status_code, duration)
     response.headers["X-Correlation-ID"] = correlation_id
     return response
@@ -408,6 +412,18 @@ def metrics_endpoint(
             "flowops_http_requests_total"
             f'{{method="{method}",route="{route}",status="{status_code}"}} {count}'
         )
+
+    lines.extend([
+        "# HELP flowops_http_request_duration_seconds HTTP request latency in seconds",
+        "# TYPE flowops_http_request_duration_seconds histogram",
+    ])
+    for (method, route), (counts, total, seconds) in sorted(metrics.snapshot_latency().items()):
+        labels = f'method="{method}",route="{route}"'
+        for upper, count in zip(metrics.LATENCY_BUCKETS, counts):
+            lines.append(f'flowops_http_request_duration_seconds_bucket{{{labels},le="{upper}"}} {count}')
+        lines.append(f'flowops_http_request_duration_seconds_bucket{{{labels},le="+Inf"}} {total}')
+        lines.append(f'flowops_http_request_duration_seconds_count{{{labels}}} {total}')
+        lines.append(f'flowops_http_request_duration_seconds_sum{{{labels}}} {seconds}')
 
     job_records = session.execute(select(db.WorkflowJobRecord)).scalars().all()
     job_counts = Counter(job.status for job in job_records)
@@ -659,12 +675,83 @@ def create_ticket(
         raise
 
 
+@app.post("/tickets/manual", response_model=Ticket, status_code=201)
+def create_manual_ticket(
+    payload: ManualTicketIn,
+    response: Response,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+    idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=128),
+) -> Ticket:
+    """Create, never upsert, an operator-entered ticket in a separate ID namespace."""
+    tenant = _actor_tenant(actor)
+    # Positive integer IDs belong to the upstream intake contract. Negative
+    # integer IDs are reserved for local creation and remain sortable by the
+    # existing Jinja and API ticket lists.
+    scope = idempotency.SCOPE_MANUAL_TICKET
+    key = "manual:" + hashlib.sha256(
+        json.dumps([tenant, actor.subject, idempotency_key], separators=(",", ":")).encode()
+    ).hexdigest()
+    fingerprint = _request_fingerprint(payload)
+    owner, replay = _reserve_idempotency_key(
+        session, response, key, fingerprint, scope, "manual"
+    )
+    if replay is not None:
+        result = Ticket.model_validate(replay["ticket"])
+        existing = session.get(db.TicketRecord, result.ticket_id)
+        if existing is None:
+            raise HTTPException(404, "Ticket not found.")
+        _require_ticket_access(actor, existing)
+        return result
+    if owner is None:
+        raise HTTPException(409, "Unable to reserve manual ticket.")
+    try:
+        for _ in range(10):
+            ticket_id = str(-(uuid.uuid4().int % 2147483647 + 1))
+            if session.get(db.TicketRecord, ticket_id) is None:
+                break
+        else:
+            raise HTTPException(503, "Unable to allocate a ticket ID; retry.")
+        decision = route_ticket(payload.title)
+        ticket = Ticket(
+            ticket_id=ticket_id, requester_id=payload.requester_id,
+            title=payload.title, status="open", priority=decision.priority,
+            category=decision.category, queue=decision.queue,
+        )
+        session.add(db.TicketRecord(
+            **ticket.model_dump(), tenant_key=tenant, description=payload.description,
+            requester_email=payload.requester_email,
+        ))
+        session.flush()
+        run_id = _new_run_id()
+        db.log_execution(
+            session, run_id=run_id, action="ticket.created", status="success",
+            ticket_id=ticket_id, duration_ms=0,
+            detail=f"manual intake routed to {decision.queue}", actor_subject=actor.subject,
+        )
+        _notify("ticket.created", ticket, run_id, session)
+        if not _complete_idempotency_key(
+            session, key, owner, fingerprint, scope, ticket_id,
+            {"ticket": ticket.model_dump()},
+        ):
+            raise HTTPException(409, "Ticket reservation changed; retry.")
+        return ticket
+    except IntegrityError as error:
+        session.rollback()
+        _release_idempotency_key(session, key, owner)
+        raise HTTPException(409, "Ticket ID allocation conflicted; retry.") from error
+    except Exception:
+        session.rollback()
+        _release_idempotency_key(session, key, owner)
+        raise
+
+
 # ---------------------------------------------------------------------------
 # Routes: AI triage and knowledge base
 
 
 def _load_ticket(session: Session, ticket_id: str) -> db.TicketRecord:
-    if not ticket_id.isdigit():
+    if not re.fullmatch(r"-?[0-9]+", ticket_id):
         raise HTTPException(status_code=404, detail="Ticket not found.")
     record = session.get(db.TicketRecord, ticket_id)
     if record is None:
@@ -917,6 +1004,11 @@ def list_tickets(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     tenant: Optional[str] = Query(default=None, max_length=64),
+    search: Optional[str] = Query(default=None, max_length=200),
+    status: Optional[str] = Query(default=None, max_length=64),
+    priority: Optional[str] = Query(default=None, max_length=64),
+    queue: Optional[str] = Query(default=None, max_length=128),
+    category: Optional[str] = Query(default=None, max_length=128),
 ) -> list[Ticket]:
     """List stored tickets with bounded database pagination."""
     query = select(db.TicketRecord).order_by(cast(db.TicketRecord.ticket_id, Integer))
@@ -927,24 +1019,92 @@ def list_tickets(
         query = query.where(db.TicketRecord.tenant_key == actor_tenant)
     elif tenant is not None:
         query = query.where(db.TicketRecord.tenant_key == tenant)
+    for column, value in (
+        (db.TicketRecord.status, status),
+        (db.TicketRecord.priority, priority),
+        (db.TicketRecord.queue, queue),
+        (db.TicketRecord.category, category),
+    ):
+        if value:
+            query = query.where(column == value)
+    if search:
+        query = query.where(or_(
+            db.TicketRecord.title.icontains(search, autoescape=True),
+            db.TicketRecord.queue.icontains(search, autoescape=True),
+        ))
     records = session.execute(query.offset(offset).limit(limit)).scalars().all()
     return [Ticket.model_validate(record, from_attributes=True) for record in records]
 
 
-@app.get("/tickets/{ticket_id}", response_model=Ticket)
+class DashboardSummaryOut(BaseModel):
+    open_tickets: int
+    urgent_tickets: int
+    pending_approvals: int
+    active_runs: int
+    overdue_steps: int
+    recorded_closed_today: int
+
+
+@app.get("/command-center/summary", response_model=DashboardSummaryOut)
+def command_center_summary(
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> DashboardSummaryOut:
+    tenant = _actor_tenant(actor)
+    tickets = select(func.count()).select_from(db.TicketRecord)
+    runs = select(func.count()).select_from(db.WorkflowRunRecord).join(
+        db.OnboardingRequestRecord, db.OnboardingRequestRecord.id == db.WorkflowRunRecord.request_id
+    )
+    items = select(func.count()).select_from(db.ChecklistItemRecord).join(
+        db.OnboardingRequestRecord, db.OnboardingRequestRecord.id == db.ChecklistItemRecord.request_id
+    ).join(db.WorkflowRunRecord, db.WorkflowRunRecord.request_id == db.OnboardingRequestRecord.id)
+    if tenant is not None:
+        tickets = tickets.where(db.TicketRecord.tenant_key == tenant)
+        runs = runs.where(db.OnboardingRequestRecord.tenant_key == tenant)
+        items = items.where(db.OnboardingRequestRecord.tenant_key == tenant)
+    active = db.WorkflowRunRecord.status.in_(("pending", "running"))
+    now = datetime.now(timezone.utc)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    overdue = items.where(active, db.ChecklistItemRecord.status.in_(("pending", "approved"))).where(
+        select(db.WorkflowTimerRecord.id).where(
+            db.WorkflowTimerRecord.item_id == db.ChecklistItemRecord.id,
+            db.WorkflowTimerRecord.request_id == db.ChecklistItemRecord.request_id,
+            db.WorkflowTimerRecord.status == "pending",
+            db.WorkflowTimerRecord.due_at <= now,
+        ).exists()
+    )
+    return DashboardSummaryOut(
+        open_tickets=session.scalar(tickets.where(db.TicketRecord.status == "open")) or 0,
+        urgent_tickets=session.scalar(tickets.where(db.TicketRecord.status == "open", db.TicketRecord.priority == "urgent")) or 0,
+        pending_approvals=session.scalar(items.where(active, db.ChecklistItemRecord.requires_approval.is_(True), db.ChecklistItemRecord.status == "pending")) or 0,
+        active_runs=session.scalar(runs.where(active)) or 0,
+        overdue_steps=session.scalar(overdue) or 0,
+        recorded_closed_today=session.scalar(tickets.where(db.TicketRecord.status == "closed", db.TicketRecord.closed_at >= midnight, db.TicketRecord.closed_at < midnight + timedelta(days=1))) or 0,
+    )
+
+
+@app.get("/tickets/{ticket_id}", response_model=TicketDetailOut)
 def get_ticket(
     ticket_id: str,
     session: Session = Depends(db.get_session),
     actor: Actor = Depends(_operator_actor),
-) -> Ticket:
+) -> TicketDetailOut:
     """Return one stored ticket."""
-    if not ticket_id.isdigit():
+    if not re.fullmatch(r"-?[0-9]+", ticket_id):
         raise HTTPException(status_code=404, detail="Ticket not found.")
     record = session.get(db.TicketRecord, ticket_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Ticket not found.")
     _require_ticket_access(actor, record)
-    return Ticket.model_validate(record, from_attributes=True)
+    detail = TicketDetailOut.model_validate(record, from_attributes=True)
+    query = select(db.ExecutionLogRecord).where(
+        db.ExecutionLogRecord.ticket_id == ticket_id,
+        or_(db.ExecutionLogRecord.action.like("ticket.%"), db.ExecutionLogRecord.action.like("ai.%")),
+    )
+    query = _scope_execution_log_query(query, actor)
+    history = session.execute(query.order_by(db.ExecutionLogRecord.id.desc()).limit(50)).scalars().all()
+    detail.history = [TicketHistoryOut.model_validate(row, from_attributes=True) for row in history]
+    return detail
 
 
 @app.post("/webhooks/actions/approve")
@@ -1114,10 +1274,44 @@ def _request_out(
                 sla_minutes=item.sla_minutes,
                 overdue=bool(getattr(item, "overdue", False)),
                 sla_remaining_minutes=getattr(item, "sla_remaining_minutes", None),
+                sla_due_at=getattr(item, "sla_due_at", None),
             )
             for item in sorted(items, key=lambda i: i.id)
         ],
     )
+
+
+def _load_checklists(
+    session: Session, request_ids: list[int],
+) -> dict[int, list[db.ChecklistItemRecord]]:
+    grouped: dict[int, list[db.ChecklistItemRecord]] = defaultdict(list)
+    if not request_ids:
+        return grouped
+    now = db.utcnow()
+    # Keep parameter counts bounded for existing unpaginated callers.
+    for offset in range(0, len(request_ids), 500):
+        batch = request_ids[offset:offset + 500]
+        items = session.execute(
+            select(db.ChecklistItemRecord).where(db.ChecklistItemRecord.request_id.in_(batch))
+        ).scalars().all()
+        timers_by_item = {
+            row.item_id: row for row in session.execute(
+                select(db.WorkflowTimerRecord).where(
+                    db.WorkflowTimerRecord.request_id.in_(batch),
+                    db.WorkflowTimerRecord.status == "pending",
+                ).order_by(db.WorkflowTimerRecord.due_at.desc())
+            ).scalars().all()
+        }
+        for item in items:
+            timer = timers_by_item.get(item.id)
+            due = timer.due_at if timer else None
+            if due is not None and due.tzinfo is None:
+                due = due.replace(tzinfo=timezone.utc)
+            item.sla_due_at = due
+            item.overdue = due is not None and due <= now
+            item.sla_remaining_minutes = max(0, int((due - now).total_seconds() // 60)) if due is not None else None
+            grouped[item.request_id].append(item)
+    return grouped
 
 
 def _load_request(
@@ -1126,31 +1320,7 @@ def _load_request(
     record = session.get(db.OnboardingRequestRecord, request_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Onboarding request not found.")
-    items = session.execute(
-        select(db.ChecklistItemRecord).where(db.ChecklistItemRecord.request_id == request_id)
-    ).scalars().all()
-    timer_rows = session.execute(
-        select(db.WorkflowTimerRecord).where(
-            db.WorkflowTimerRecord.request_id == request_id,
-            db.WorkflowTimerRecord.status == "pending",
-        )
-    ).scalars().all()
-    by_item = {row.item_id: row for row in timer_rows}
-    now = db.utcnow()
-    for item in items:
-        timer = by_item.get(item.id)
-        if timer is not None:
-            due = timer.due_at
-            if due.tzinfo is None:
-                due = due.replace(tzinfo=timezone.utc)
-            item.overdue = due <= now
-            item.sla_remaining_minutes = max(
-                0, int((due - now).total_seconds() // 60)
-            )
-        else:
-            item.overdue = False
-            item.sla_remaining_minutes = None
-    return record, list(items)
+    return record, _load_checklists(session, [request_id]).get(request_id, [])
 
 
 def _definition_out(
@@ -1339,6 +1509,29 @@ def list_workflow_definitions(
     ]
 
 
+@app.get("/workflow-definitions/{key}/diff")
+def compare_workflow_definition_versions(
+    key: str,
+    from_version: int = Query(alias="from", ge=1),
+    to_version: int = Query(alias="to", ge=1),
+    actor: Actor = Depends(_global_admin_actor),
+    session: Session = Depends(db.get_session),
+) -> dict[str, Any]:
+    previous = definitions.get_version(session, key, from_version)
+    current = definitions.get_version(session, key, to_version)
+    if previous is None or current is None:
+        raise HTTPException(404, "Definition version not found.")
+    before = {step["key"]: step for step in json.loads(previous.steps_json)}
+    after = {step["key"]: step for step in json.loads(current.steps_json)}
+    return {
+        "from_version": from_version,
+        "to_version": to_version,
+        "added": sorted(after.keys() - before.keys()),
+        "removed": sorted(before.keys() - after.keys()),
+        "changed": sorted(k for k in before.keys() & after.keys() if before[k] != after[k]),
+    }
+
+
 @app.get("/workflow-definitions/{key}", response_model=WorkflowDefinitionOut)
 def get_workflow_definition(
     key: str,
@@ -1505,11 +1698,8 @@ def list_onboarding_requests(
     if tenant_key is not None:
         query = query.where(db.OnboardingRequestRecord.tenant_key == tenant_key)
     records = session.execute(query).scalars().all()
-    results = []
-    for record in records:
-        _, items = _load_request(session, record.id)
-        results.append(_request_out(record, items))
-    return results
+    grouped = _load_checklists(session, [record.id for record in records])
+    return [_request_out(record, grouped.get(record.id, [])) for record in records]
 
 
 @app.get("/onboarding-requests/{request_id}", response_model=OnboardingRequestOut)
@@ -1554,18 +1744,23 @@ def get_onboarding_request_status(
 
 
 def _workflow_run_out(
-    session: Session, run: db.WorkflowRunRecord
+    session: Session, run: db.WorkflowRunRecord, *,
+    loaded: Optional[tuple] = None,
 ) -> WorkflowRunOut:
-    steps = session.execute(
-        select(db.WorkflowStepRunRecord)
-        .where(db.WorkflowStepRunRecord.run_id == run.id)
-        .order_by(db.WorkflowStepRunRecord.id)
-    ).scalars().all()
-    events = session.execute(
-        select(db.WorkflowEventRecord)
-        .where(db.WorkflowEventRecord.run_id == run.id)
-        .order_by(db.WorkflowEventRecord.id)
-    ).scalars().all()
+    if loaded is None:
+        request, items = _load_request(session, run.request_id)
+        steps = session.execute(
+            select(db.WorkflowStepRunRecord)
+            .where(db.WorkflowStepRunRecord.run_id == run.id)
+            .order_by(db.WorkflowStepRunRecord.id)
+        ).scalars().all()
+        events = session.execute(
+            select(db.WorkflowEventRecord)
+            .where(db.WorkflowEventRecord.run_id == run.id)
+            .order_by(db.WorkflowEventRecord.id)
+        ).scalars().all()
+    else:
+        request, items, steps, events = loaded
     return WorkflowRunOut(
         id=run.id,
         request_id=run.request_id,
@@ -1575,6 +1770,9 @@ def _workflow_run_out(
         created_at=run.created_at,
         started_at=run.started_at,
         completed_at=run.completed_at,
+        checklist=_request_out(request, items).checklist,
+        definition_key=request.definition_key,
+        employee_name=request.employee_name,
         steps=[
             WorkflowStepRunOut(
                 id=row.id,
@@ -1637,6 +1835,40 @@ def get_workflow_run(
     return _workflow_run_out(session, run)
 
 
+@app.get("/workflow-runs/{run_id}", response_model=WorkflowRunOut)
+def get_workflow_run_by_id(
+    run_id: int,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowRunOut:
+    run = session.get(db.WorkflowRunRecord, run_id)
+    if run is None:
+        raise HTTPException(404, "Workflow run not found.")
+    _require_workflow_run_access(session, actor, run)
+    return _workflow_run_out(session, run)
+
+
+@app.get("/command-center/session")
+def command_center_session(
+    request: Request,
+    response: Response,
+    actor: Actor = Depends(_operator_actor),
+) -> dict[str, Any]:
+    """Verify the caller at the backend, never accept proxy-supplied roles."""
+    if os.environ.get("FLOWOPS_AUTH_REQUIRED", "false").lower() != "true":
+        raise HTTPException(401, "Protected authentication is required.")
+    if actor.source not in ("session", "bearer"):
+        raise HTTPException(401, "Authentication required.")
+    response.headers["Cache-Control"] = "no-store"
+    browser_session = ui_session.read_session(request) if actor.source == "session" else None
+    return {
+        "subject": actor.subject,
+        "role": "admin" if "automation.admin" in actor.roles else "operator",
+        "tenant_key": actor.tenant_key,
+        "csrf_token": browser_session.csrf_token if browser_session else None,
+    }
+
+
 @app.get("/workflow-runs", response_model=list[WorkflowRunOut])
 def list_workflow_runs(
     status_filter: Optional[str] = Query(default=None, alias="status"),
@@ -1671,7 +1903,28 @@ def list_workflow_runs(
     if created_before is not None:
         query = query.where(db.WorkflowRunRecord.created_at <= created_before)
     runs = session.execute(query.offset(offset).limit(limit)).scalars().all()
-    return [_workflow_run_out(session, run) for run in runs]
+    if not runs:
+        return []
+    request_ids = [run.request_id for run in runs]
+    run_ids = [run.id for run in runs]
+    requests = {row.id: row for row in session.execute(
+        select(db.OnboardingRequestRecord).where(db.OnboardingRequestRecord.id.in_(request_ids))
+    ).scalars().all()}
+    checklist = _load_checklists(session, request_ids)
+    attempts = defaultdict(list)
+    for row in session.execute(select(db.WorkflowStepRunRecord).where(
+        db.WorkflowStepRunRecord.run_id.in_(run_ids)
+    ).order_by(db.WorkflowStepRunRecord.id)).scalars():
+        attempts[row.run_id].append(row)
+    events = defaultdict(list)
+    for row in session.execute(select(db.WorkflowEventRecord).where(
+        db.WorkflowEventRecord.run_id.in_(run_ids)
+    ).order_by(db.WorkflowEventRecord.id)).scalars():
+        events[row.run_id].append(row)
+    return [_workflow_run_out(session, run, loaded=(
+        requests[run.request_id], checklist.get(run.request_id, []),
+        attempts[run.id], events[run.id],
+    )) for run in runs]
 
 
 def _run_action(
@@ -1690,6 +1943,63 @@ def _run_action(
             run = scheduler.cancel_run(session, run_id, actor.subject)
     except LookupError as error:
         raise HTTPException(404, str(error)) from error
+    session.commit()
+    session.refresh(run)
+    return _workflow_run_out(session, run)
+
+
+class ApprovalDecisionIn(BaseModel):
+    reason: str = Field(min_length=3, max_length=1000)
+
+
+@app.post("/workflow-runs/{run_id}/steps/{item_id}/{action}", response_model=WorkflowRunOut)
+def decide_workflow_step(
+    run_id: int,
+    item_id: int,
+    action: Literal["approve", "reject"],
+    payload: ApprovalDecisionIn,
+    actor: Actor = Depends(_admin_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowRunOut:
+    reason = payload.reason.strip()
+    if len(reason) < 3:
+        raise HTTPException(422, "A decision reason is required.")
+    run = session.execute(
+        select(db.WorkflowRunRecord).where(db.WorkflowRunRecord.id == run_id).with_for_update()
+    ).scalar_one_or_none()
+    if run is None:
+        raise HTTPException(404, "Workflow run not found.")
+    _require_workflow_run_access(session, actor, run)
+    if run.status not in ("pending", "running"):
+        raise HTTPException(409, "Workflow run is not active.")
+    target = "approved" if action == "approve" else "rejected"
+    item = session.get(db.ChecklistItemRecord, item_id)
+    if item is None or item.request_id != run.request_id:
+        raise HTTPException(404, "Checklist item not found.")
+    if not item.requires_approval or item.status != "pending":
+        raise HTTPException(409, "Checklist item is not awaiting approval.")
+    changed = session.execute(
+        update(db.ChecklistItemRecord).where(
+            db.ChecklistItemRecord.id == item_id,
+            db.ChecklistItemRecord.request_id == run.request_id,
+            db.ChecklistItemRecord.requires_approval.is_(True),
+            db.ChecklistItemRecord.status == "pending",
+        ).values(status=target)
+    )
+    if changed.rowcount != 1:
+        raise HTTPException(409, "Checklist item state changed; refresh and retry.")
+    session.refresh(item)
+    _, items = _load_request(session, run.request_id)
+    workflow.apply_graph_transitions(
+        session, items, request_id=run.request_id, actor_subject=actor.subject, reason=reason
+    )
+    timers.sync_timers(session, run.request_id)
+    db.log_execution(
+        session, run_id=_new_run_id(), action=f"onboarding.item.{target}",
+        status="success", ticket_id=str(run.request_id), duration_ms=0,
+        detail=f"step '{item.step}'; reason={reason}", actor_subject=actor.subject,
+    )
+    scheduler.tick(session, run.id, worker_id="console-transition", commit=False)
     session.commit()
     session.refresh(run)
     return _workflow_run_out(session, run)

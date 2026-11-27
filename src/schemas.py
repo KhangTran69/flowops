@@ -39,6 +39,33 @@ class Ticket(BaseModel):
     queue: Optional[str] = None
 
 
+class ManualTicketIn(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    requester_id: StrictInt = Field(ge=1, le=2147483647)
+    title: StrictStr = Field(min_length=3, max_length=500)
+    description: StrictStr = Field(min_length=3, max_length=10000)
+    requester_email: Optional[StrictStr] = Field(default=None, max_length=254, pattern=r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+
+class TicketHistoryOut(BaseModel):
+    id: int
+    action: str
+    status: str
+    actor_subject: Optional[str] = None
+    detail: Optional[str] = None
+    created_at: datetime
+
+
+class TicketDetailOut(Ticket):
+    description: Optional[str] = None
+    requester_email: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    closed_at: Optional[datetime] = None
+    resolution_note: Optional[str] = None
+    history: list[TicketHistoryOut] = Field(default_factory=list)
+
+
 class KnowledgeBaseArticleOut(BaseModel):
     id: str
     title: str
@@ -163,6 +190,7 @@ class ChecklistItemOut(BaseModel):
     sla_minutes: Optional[int] = None
     overdue: bool = False
     sla_remaining_minutes: Optional[int] = None
+    sla_due_at: Optional[datetime] = None
 
 
 class DefinitionCreateIn(BaseModel):
@@ -303,6 +331,9 @@ class WorkflowRunOut(BaseModel):
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     steps: list[WorkflowStepRunOut] = []
+    checklist: list[ChecklistItemOut] = Field(default_factory=list)
+    definition_key: Optional[str] = None
+    employee_name: Optional[str] = None
     events: list[WorkflowEventOut] = []
 
 

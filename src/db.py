@@ -64,6 +64,8 @@ class TicketRecord(Base):
     tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     # Ticket closing (v1.0 preview): both columns are nullable, so rows
     # written before this change stay valid (NULL = never closed).
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    requester_email: Mapped[Optional[str]] = mapped_column(String(254), nullable=True)
     resolution_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     closed_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True

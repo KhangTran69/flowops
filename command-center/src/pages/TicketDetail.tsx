@@ -7,15 +7,16 @@ import { DataState } from '../components/DataState'
 import { BackLink, JsonView, PageHeader } from '../components/Basics'
 import { StatusBadge } from '../components/StatusBadge'
 import { Confirm } from '../components/Confirm'
+import type { TicketDetail as TicketDetailContract } from '../lib/contracts'
 
 export default function TicketDetail() {
   const { id } = useParams()
-  const { data: ticket, error, status, loading, reload } = usePoll<any>(`/tickets/${id}`)
+  const { data: ticket, error, status, loading, reload } = usePoll<TicketDetailContract>(`/tickets/${id}`)
   const [triage, setTriage] = useState<any>(null)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [busy, setBusy] = useState(false)
-  const recommendations = triage?.recommendations || ticket?.ai_triage?.recommendations || []
+  const recommendations = triage?.recommendations || []
   const eligible = useMemo(() => recommendations.filter((r: any) =>
     ['queue', 'priority'].includes(String(r.kind || '').toLowerCase()) && r.applicable !== false &&
     String(r.suggested ?? '') !== String(r.current ?? ''),), [recommendations])
@@ -32,7 +33,7 @@ export default function TicketDetail() {
     setBusy(true); const r = await mutate('POST', `/tickets/${id}/ai-recommendations/apply`, { recommendation_ids: ids, fields }, 'AI recommendations applied.')
     setBusy(false); if (r.ok) { setConfirmOpen(false); setTriage(null); setSelected(new Set()); reload() }
   }
-  const history = ticket?.history || ticket?.events || ticket?.execution_logs || []
+  const history = ticket?.history || []
   return <>
     <BackLink to="/tickets">Tickets</BackLink>
     <PageHeader title={titleOf(ticket)} description={`Ticket #${id} · ${ticket?.requester_email || ticket?.requester_id || 'unknown requester'}`} actions={<StatusBadge status={ticket?.status || 'open'} />} />
@@ -46,7 +47,7 @@ export default function TicketDetail() {
           <div className="mt-5"><div className="label">Description</div><p className="whitespace-pre-wrap">{ticket?.description || 'No description.'}</p></div>
           {ticket?.resolution_note && <div className="mt-4"><div className="label">Resolution</div><p>{ticket.resolution_note}</p></div>}
         </section>
-        <aside className="card p-4"><h2 className="mb-3 font-semibold">History</h2>{history.length ? <ol className="space-y-3">{history.map((h: any, i: number) => <li key={h.id ?? i} className="border-l-2 border-[var(--primary)] pl-3"><div className="text-sm font-medium">{h.action || h.event || h.status || 'event'}</div><div className="muted text-xs">{fmtDate(h.created_at || h.timestamp)} · {h.actor_subject || h.actor || 'system'}</div>{h.detail && <div className="muted mt-1 text-xs">{txt(h.detail)}</div>}</li>)}</ol> : <p className="muted">No history available.</p>}</aside>
+        <aside className="card p-4"><h2 className="mb-3 font-semibold">History</h2>{history.length ? <ol className="space-y-3">{history.map((h, i) => <li key={h.id ?? i} className="border-l-2 border-[var(--primary)] pl-3"><div className="text-sm font-medium">{h.action || h.status || 'event'}</div><div className="muted text-xs">{fmtDate(h.created_at)} · {h.actor_subject || 'system'}</div>{h.detail && <div className="muted mt-1 text-xs">{txt(h.detail)}</div>}</li>)}</ol> : <p className="muted">No history available.</p>}</aside>
       </div>
 
       <section className="card mt-5 p-4">

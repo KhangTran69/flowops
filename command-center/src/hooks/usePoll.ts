@@ -9,26 +9,32 @@ export function usePoll<T = any>(path: string, query?: Record<string, unknown>, 
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null)
   const lastGood = useRef<T | null>(null)
   const inFlight = useRef(false)
+  const generation = useRef(0)
 
   const reload = useCallback(async () => {
     if (inFlight.current) return
     inFlight.current = true
+    const requestGeneration = generation.current
     try {
       const r = await api<T>('GET', path, { query })
+      if (requestGeneration !== generation.current) return
       setStatus(r.status)
       if (r.ok) { setData(r.data ?? null); lastGood.current = r.data ?? null; setError(null); setUpdatedAt(new Date()) }
       else { setError(r.error || 'Request failed.'); setData(lastGood.current) }
-    } finally { inFlight.current = false; setLoading(false) }
+    } finally {
+      if (requestGeneration === generation.current) { inFlight.current = false; setLoading(false) }
+    }
   }, [path, JSON.stringify(query || {})])
 
   useEffect(() => {
-    setLoading(true); setData(null); lastGood.current = null; setError(null)
+    generation.current += 1; inFlight.current = false
+    setLoading(true); setData(null); lastGood.current = null; setError(null); setStatus(0); setUpdatedAt(null)
     reload()
     const tick = () => { if (document.visibilityState === 'visible') reload() }
     const id = window.setInterval(tick, intervalMs)
     const onVis = () => { if (document.visibilityState === 'visible') reload() }
     document.addEventListener('visibilitychange', onVis)
-    return () => { window.clearInterval(id); document.removeEventListener('visibilitychange', onVis) }
+    return () => { generation.current += 1; inFlight.current = false; window.clearInterval(id); document.removeEventListener('visibilitychange', onVis) }
   }, [reload, intervalMs])
 
   return { data, error, status, loading, updatedAt, reload }
