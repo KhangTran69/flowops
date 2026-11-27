@@ -7,13 +7,13 @@ import { PageHeader, ProgressBar } from '../components/Basics'
 import { RecordTable } from '../components/RecordTable'
 import { StatusBadge } from '../components/StatusBadge'
 
-type DashboardSummary = { open_tickets: number; urgent_tickets: number; pending_approvals: number; active_runs: number; overdue_steps: number; recorded_closed_today: number }
+import type { DashboardSummary, Ticket, WorkflowRun } from '../lib/contracts'
 
 export default function Dashboard() {
-  const tickets = usePoll<any>('/tickets')
-  const runs = usePoll<any>('/workflow-runs')
+  const tickets = usePoll<Ticket[]>('/tickets')
+  const runs = usePoll<WorkflowRun[]>('/workflow-runs')
   const summary = usePoll<DashboardSummary>('/command-center/summary')
-  const ts = asList<any>(tickets.data), rs = asList<any>(runs.data)
+  const ts = tickets.data || [], rs = runs.data || []
   const active = rs.filter((r) => ['running', 'pending', 'queued', 'active'].includes(String(r.status || '').toLowerCase()))
   const overdue = collect(rs, isOverdue)
   const kpis = [
@@ -38,10 +38,10 @@ export default function Dashboard() {
       <div className="grid gap-5 xl:grid-cols-3">
         <section className="xl:col-span-2">
           <div className="mb-2 flex items-center justify-between"><h2 className="font-semibold">Ticket sample</h2><Link className="text-sm underline" to="/tickets">All tickets <ArrowRight className="inline" size={13} /></Link></div>
-          <RecordTable rows={ts.slice(0, 8)} rowHref={(r) => `/tickets/${r.ticket_id ?? r.id}`} columns={[
+          <RecordTable rows={ts.slice(0, 8)} rowHref={(r) => `/tickets/${r.ticket_id}`} columns={[
             { key: 'title', header: 'Ticket', render: (r) => <div><div className="font-medium">{titleOf(r)}</div><div className="muted text-xs">{r.category || 'unclassified'}</div></div> },
             { key: 'priority', header: 'Priority', render: (r) => <StatusBadge status={r.priority} /> },
-            { key: 'status', header: 'Status', render: (r) => <StatusBadge status={r.status || 'open'} /> },
+            { key: 'status', header: 'Status', render: (r) => <StatusBadge status={r.status} /> },
             { key: 'queue', header: 'Queue', render: (r) => r.queue || '—' },
           ]} empty="No tickets yet." />
         </section>
