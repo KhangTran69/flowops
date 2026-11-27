@@ -6,6 +6,7 @@ onboarding/offboarding checklists, idempotency keys, and delivery retries;
 the v1.0 preview keeps failed webhook deliveries in a retryable outbox.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -63,6 +64,7 @@ from src.schemas import (
     TicketIntakeRequest,
     Ticket,
     TicketDetailOut,
+    ManualTicketIn,
     KnowledgeBaseArticleOut,
     KnowledgeBaseMatchOut,
     AISummaryOut,
@@ -660,12 +662,83 @@ def create_ticket(
         raise
 
 
+@app.post("/tickets/manual", response_model=Ticket, status_code=201)
+def create_manual_ticket(
+    payload: ManualTicketIn,
+    response: Response,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+    idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=128),
+) -> Ticket:
+    """Create, never upsert, an operator-entered ticket in a separate ID namespace."""
+    tenant = _actor_tenant(actor)
+    # Positive integer IDs belong to the upstream intake contract. Negative
+    # integer IDs are reserved for local creation and remain sortable by the
+    # existing Jinja and API ticket lists.
+    scope = idempotency.SCOPE_MANUAL_TICKET
+    key = "manual:" + hashlib.sha256(
+        json.dumps([tenant, actor.subject, idempotency_key], separators=(",", ":")).encode()
+    ).hexdigest()
+    fingerprint = _request_fingerprint(payload)
+    owner, replay = _reserve_idempotency_key(
+        session, response, key, fingerprint, scope, "manual"
+    )
+    if replay is not None:
+        result = Ticket.model_validate(replay["ticket"])
+        existing = session.get(db.TicketRecord, result.ticket_id)
+        if existing is None:
+            raise HTTPException(404, "Ticket not found.")
+        _require_ticket_access(actor, existing)
+        return result
+    if owner is None:
+        raise HTTPException(409, "Unable to reserve manual ticket.")
+    try:
+        for _ in range(10):
+            ticket_id = str(-(uuid.uuid4().int % 2147483647 + 1))
+            if session.get(db.TicketRecord, ticket_id) is None:
+                break
+        else:
+            raise HTTPException(503, "Unable to allocate a ticket ID; retry.")
+        decision = route_ticket(payload.title)
+        ticket = Ticket(
+            ticket_id=ticket_id, requester_id=payload.requester_id,
+            title=payload.title, status="open", priority=decision.priority,
+            category=decision.category, queue=decision.queue,
+        )
+        session.add(db.TicketRecord(
+            **ticket.model_dump(), tenant_key=tenant, description=payload.description,
+            requester_email=payload.requester_email,
+        ))
+        session.flush()
+        run_id = _new_run_id()
+        db.log_execution(
+            session, run_id=run_id, action="ticket.created", status="success",
+            ticket_id=ticket_id, duration_ms=0,
+            detail=f"manual intake routed to {decision.queue}", actor_subject=actor.subject,
+        )
+        _notify("ticket.created", ticket, run_id, session)
+        if not _complete_idempotency_key(
+            session, key, owner, fingerprint, scope, ticket_id,
+            {"ticket": ticket.model_dump()},
+        ):
+            raise HTTPException(409, "Ticket reservation changed; retry.")
+        return ticket
+    except IntegrityError as error:
+        session.rollback()
+        _release_idempotency_key(session, key, owner)
+        raise HTTPException(409, "Ticket ID allocation conflicted; retry.") from error
+    except Exception:
+        session.rollback()
+        _release_idempotency_key(session, key, owner)
+        raise
+
+
 # ---------------------------------------------------------------------------
 # Routes: AI triage and knowledge base
 
 
 def _load_ticket(session: Session, ticket_id: str) -> db.TicketRecord:
-    if not ticket_id.isdigit():
+    if not re.fullmatch(r"-?[0-9]+", ticket_id):
         raise HTTPException(status_code=404, detail="Ticket not found.")
     record = session.get(db.TicketRecord, ticket_id)
     if record is None:
@@ -1004,7 +1077,7 @@ def get_ticket(
     actor: Actor = Depends(_operator_actor),
 ) -> TicketDetailOut:
     """Return one stored ticket."""
-    if not ticket_id.isdigit():
+    if not re.fullmatch(r"-?[0-9]+", ticket_id):
         raise HTTPException(status_code=404, detail="Ticket not found.")
     record = session.get(db.TicketRecord, ticket_id)
     if record is None:
