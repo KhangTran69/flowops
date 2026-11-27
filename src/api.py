@@ -242,7 +242,7 @@ async def correlation_and_metrics(request: Request, call_next):
     response = await call_next(request)
     duration = time.perf_counter() - started
     route = request.scope.get("route")
-    route_path = getattr(route, "path", request.url.path)
+    route_path = getattr(route, "path", "<unmatched>")
     _record_request(request.method, route_path, response.status_code, duration)
     response.headers["X-Correlation-ID"] = correlation_id
     return response
@@ -917,6 +917,11 @@ def list_tickets(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     tenant: Optional[str] = Query(default=None, max_length=64),
+    search: Optional[str] = Query(default=None, max_length=200),
+    status: Optional[str] = Query(default=None, max_length=64),
+    priority: Optional[str] = Query(default=None, max_length=64),
+    queue: Optional[str] = Query(default=None, max_length=128),
+    category: Optional[str] = Query(default=None, max_length=128),
 ) -> list[Ticket]:
     """List stored tickets with bounded database pagination."""
     query = select(db.TicketRecord).order_by(cast(db.TicketRecord.ticket_id, Integer))
@@ -927,6 +932,19 @@ def list_tickets(
         query = query.where(db.TicketRecord.tenant_key == actor_tenant)
     elif tenant is not None:
         query = query.where(db.TicketRecord.tenant_key == tenant)
+    for column, value in (
+        (db.TicketRecord.status, status),
+        (db.TicketRecord.priority, priority),
+        (db.TicketRecord.queue, queue),
+        (db.TicketRecord.category, category),
+    ):
+        if value:
+            query = query.where(column == value)
+    if search:
+        query = query.where(or_(
+            db.TicketRecord.title.icontains(search, autoescape=True),
+            db.TicketRecord.queue.icontains(search, autoescape=True),
+        ))
     records = session.execute(query.offset(offset).limit(limit)).scalars().all()
     return [Ticket.model_validate(record, from_attributes=True) for record in records]
 
@@ -1634,6 +1652,19 @@ def get_workflow_run(
     run = scheduler.get_run_for_request(session, request_id)
     if run is None:
         raise HTTPException(404, "Workflow run not found.")
+    return _workflow_run_out(session, run)
+
+
+@app.get("/workflow-runs/{run_id}", response_model=WorkflowRunOut)
+def get_workflow_run_by_id(
+    run_id: int,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> WorkflowRunOut:
+    run = session.get(db.WorkflowRunRecord, run_id)
+    if run is None:
+        raise HTTPException(404, "Workflow run not found.")
+    _require_workflow_run_access(session, actor, run)
     return _workflow_run_out(session, run)
 
 
