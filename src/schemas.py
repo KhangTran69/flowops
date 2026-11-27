@@ -37,9 +37,13 @@ class Ticket(BaseModel):
     priority: str
     category: Optional[str] = None
     queue: Optional[str] = None
+
+
+class TicketDetailOut(Ticket):
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     closed_at: Optional[datetime] = None
+    resolution_note: Optional[str] = None
 
 
 class KnowledgeBaseArticleOut(BaseModel):
