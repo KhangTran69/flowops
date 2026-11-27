@@ -639,9 +639,15 @@ def create_ticket(
         request_hash,
         IDEMPOTENCY_SCOPE_TICKET,
         str(request.id),
+        actor_subject=actor.subject,
     )
     if replay is not None:
-        return Ticket.model_validate(replay["ticket"])
+        result = Ticket.model_validate(replay["ticket"])
+        record = session.get(db.TicketRecord, result.ticket_id)
+        if record is None:
+            raise HTTPException(404, "Ticket not found.")
+        _require_ticket_access(actor, record)
+        return result
 
     ownership_lost = False
     try:
@@ -700,7 +706,7 @@ def create_manual_ticket(
     ).hexdigest()
     fingerprint = _request_fingerprint(payload)
     owner, replay = _reserve_idempotency_key(
-        session, response, key, fingerprint, scope, "manual"
+        session, response, key, fingerprint, scope, "manual", actor_subject=actor.subject
     )
     if replay is not None:
         result = Ticket.model_validate(replay["ticket"])
@@ -1368,7 +1374,7 @@ def _definition_mutation(
         sort_keys=True, separators=(",", ":")
     ).encode()).hexdigest()
     owner, replay = _reserve_idempotency_key(
-        session, response, key, fingerprint, scope, definition_key
+        session, response, key, fingerprint, scope, definition_key, actor_subject=actor.subject
     )
     if replay is not None:
         return WorkflowDefinitionOut.model_validate(replay["definition"])
@@ -1722,9 +1728,15 @@ def create_onboarding_request(
         request_hash,
         IDEMPOTENCY_SCOPE_ONBOARDING,
         "0",
+        actor_subject=actor.subject,
     )
     if replay is not None:
-        return OnboardingRequestOut.model_validate(replay["onboarding_request"])
+        result = OnboardingRequestOut.model_validate(replay["onboarding_request"])
+        record = session.get(db.OnboardingRequestRecord, result.id)
+        if record is None:
+            raise HTTPException(404, "Onboarding request not found.")
+        _require_request_access(actor, record)
+        return result
 
     ownership_lost = False
     try:
@@ -2049,7 +2061,7 @@ def decide_workflow_step(
         run_id, item_id, action, payload.reason.strip()
     ], separators=(",", ":")).encode()).hexdigest()
     owner, replay = _reserve_idempotency_key(
-        session, response, key, fingerprint, scope, str(run.request_id)
+        session, response, key, fingerprint, scope, str(run.request_id), actor_subject=actor.subject
     )
     if replay is not None:
         return WorkflowRunOut.model_validate(replay["workflow_run"])
