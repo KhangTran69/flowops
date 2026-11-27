@@ -41,7 +41,7 @@ Evidence-based; each one is addressed by a phase below.
 | 1 | **Five release gates are open** and block any real deployment: production identity provider/gateway, workforce browser sign-in, backup/restore rehearsal, full WCAG audit, live (credentialed) connectors. Staging latency + migration validation are also pending. | PR #51–#53 bodies; `docs/console-monitoring.md`; `command-center/README.md` ("No production workforce browser release is authorized") |
 | 2 | **Two parallel operator UIs are drifting.** 23 Jinja templates vs 11 React pages. Analytics, triggers, workflow jobs, notifications, knowledge base, and the whole workforce module exist only in Jinja; the Jinja console is kept "while validating React parity" with no parity checklist. | `src/templates/` vs `command-center/src/pages/`; `command-center/README.md` |
 | 3 | **`src/api.py` is a 3,158-line monolith** with a ~1,430-line onboarding/offboarding section. Router extraction stopped at tickets/AI/monitoring. It is the highest-conflict file in the repo for parallel bot/IDE work. | `grep -c "@app." src/api.py` → 53 app-level routes; section banners at lines 289–2860 |
-| 4 | **Offboarding DAG parity is still open** — the documented follow-up since v1.1: the completion ledger authorises by approval state, not graph edges, so `OFFBOARDING_DAG_SHAPE` remains unselectable. | `docs/architecture.md` ("Teaching the ledger about edges is the follow-up") |
+| 4 | ~~Offboarding DAG parity~~ **resolved during planning**: the ledger already consults the graph resolver (`workflow.missing_prerequisites` + skipped guard) and `offboarding-dag` is selectable; only the docs and edge-order tests were missing (now added). | `tests/test_offboarding.py::test_dag_ledger_rejects_out_of_order_completion` |
 | 5 | **Docs actively mislead.** README claims "321 passed" (real: 459), its project-structure section omits 16 shipped modules (`analytics.py`, `connectors.py`, `triggers.py`, `idempotency.py`, `workforce_worker.py`, …), and `docs/dev-notes/HANDOFF_PROMPT.md` still says "no migration framework yet" and "the API has no auth yet". Anyone (human or IDE agent) starting from the handoff prompt gets a wrong model of the system. | `grep` counts vs suite output; `docs/dev-notes/HANDOFF_PROMPT.md` |
 | 6 | **Documented reliability limits have no scheduled owner**: at-least-once webhook delivery outside the reservation transaction, wall-clock lease staleness, in-process rate limiting that is not multi-process safe. | `docs/dev-notes/HANDOFF_PROMPT.md` "Known reliability limits"; README auth section |
 | 7 | **Monitoring exists but is not operated.** Alert rules ship with provisional thresholds and are "not installed or activated"; alert thresholds have never seen a representative workload. | `docs/console-monitoring.md`; `monitoring/flowops-alerts.yml` |
@@ -118,19 +118,20 @@ One API, one workflow engine, one operator console trajectory.
       owns the callable — including `original = api.X` attribute reads and
       PostgreSQL-only variants that only CI exercises.
 
-### 1b. Offboarding DAG parity (closes gap 4)
+### 1b. Offboarding DAG parity (closes gap 4) — verified, docs corrected
 
-- [ ] Teach the offboarding completion ledger about graph edges: consult the
-      same resolver as onboarding (unknown key → 422, unmet prerequisites →
-      409, skipped-by-predicate → 409 with reason) while keeping every
-      existing guarantee (admin-only, claim-first, idempotent replay,
-      stale-claim takeover).
-- [ ] Then register `offboarding-dag` as selectable and delete the
-      "offboarding keeps its flat template on purpose" caveat from
-      architecture.md.
-- [ ] Tests: out-of-order completion parity paths (409), skipped-dependent
-      semantics for `all`/`any` joins, ledger replay after a migration,
-      PostgreSQL variants.
+Found already implemented during execution: the ledger consults
+`workflow.missing_prerequisites` and rejects skipped steps, and
+`offboarding-dag` is registered in `TEMPLATES`. What was missing is now done:
+
+- [x] Edge-order tests on the ledger: out-of-order completion returns 409
+      naming the blocker and leaves no ledger row; a skipped step returns 409
+      (`tests/test_offboarding.py`).
+- [x] Stale "flat template on purpose" caveat removed from
+      `docs/architecture.md` and the `src/onboarding.py` comment; flat
+      templates remain the defaults for backward compatibility.
+- [ ] Optional deepening: ledger replay after a runtime definition migration,
+      and PostgreSQL variants of the two new tests.
 
 ### 1c. One operator console (closes gap 2, sets up Phase 2)
 

@@ -121,11 +121,11 @@ ONBOARDING_DAG_STEPS: tuple[ChecklistStep, ...] = (
     {"step": "Configure email mailbox", "key": "configure_mailbox", "queue": "it-messaging", "requires_approval": False, "action": "none", "depends_on": ["create_user_account"]},
 )
 
-#: Offboarding keeps the flat v0.5 template on purpose. Its completion path
-#: goes through the idempotent ``offboarding_completions`` ledger, which does
-#: not consult the dependency graph yet; offering a DAG template there would
-#: advertise prerequisites that the ledger endpoint cannot enforce. The graph
-#: shape is kept here for the follow-up that teaches the ledger about edges.
+#: Offboarding DAG shape. The flat v0.5 template stays the default for
+#: backward compatibility, but ``offboarding-dag`` is selectable and the
+#: completion ledger enforces the same edge rules as onboarding: unmet
+#: prerequisites and skipped steps return 409 (see
+#: ``complete_offboarding_step`` and ``tests/test_offboarding.py``).
 OFFBOARDING_DAG_SHAPE: tuple[ChecklistStep, ...] = (
     {"step": "Disable user account", "key": "disable_user_account", "queue": "it-access-management", "requires_approval": True, "action": "none", "depends_on": []},
     {"step": "Recover laptop and peripherals", "key": "recover_laptop", "queue": "it-hardware", "requires_approval": False, "action": "none", "depends_on": []},
