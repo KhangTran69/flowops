@@ -107,3 +107,4 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: node --check server/index.mjs
+      - run: node --test server/*.test.mjs
