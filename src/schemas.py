@@ -47,6 +47,15 @@ class ManualTicketIn(BaseModel):
     requester_email: Optional[StrictStr] = Field(default=None, max_length=254, pattern=r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 
+class TicketHistoryOut(BaseModel):
+    id: int
+    action: str
+    status: str
+    actor_subject: Optional[str] = None
+    detail: Optional[str] = None
+    created_at: datetime
+
+
 class TicketDetailOut(Ticket):
     description: Optional[str] = None
     requester_email: Optional[str] = None
@@ -54,6 +63,7 @@ class TicketDetailOut(Ticket):
     updated_at: Optional[datetime] = None
     closed_at: Optional[datetime] = None
     resolution_note: Optional[str] = None
+    history: list[TicketHistoryOut] = Field(default_factory=list)
 
 
 class KnowledgeBaseArticleOut(BaseModel):
