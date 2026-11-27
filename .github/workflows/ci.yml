@@ -155,3 +155,21 @@ jobs:
           trap 'kill "$api_pid" "$console_pid" 2>/dev/null || true; cat /tmp/flowops-api.log /tmp/flowops-console.log' EXIT
           curl --fail --retry 20 --retry-delay 1 --retry-all-errors http://127.0.0.1:8000/ready
           python command-center/tests/browser_smoke.py
+
+
+  vite-patch-probe:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: command-center
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Resolve compatible Vite security update without running scripts
+        run: |
+          npm update vite --package-lock-only --ignore-scripts
+          git diff -- package-lock.json package.json
+      - name: Check resolved dependency advisories
+        run: npm audit --json
