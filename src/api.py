@@ -1414,6 +1414,29 @@ def _definition_mutation(
         raise
 
 
+class DefinitionValidationIn(BaseModel):
+    request_type: Literal["onboarding", "offboarding"]
+    steps: list[dict[str, Any]] = Field(min_length=1, max_length=200)
+
+
+class DefinitionValidationOut(BaseModel):
+    steps: list[dict[str, Any]]
+    checksum: str
+
+
+@app.post("/workflow-definitions/validate", response_model=DefinitionValidationOut)
+def validate_workflow_definition(
+    payload: DefinitionValidationIn,
+    actor: Actor = Depends(_global_admin_actor),
+) -> DefinitionValidationOut:
+    """Preview the authoritative DAG validator without writing any records."""
+    try:
+        steps = definitions.validate_steps(payload.steps, payload.request_type)
+    except definitions.DefinitionError as error:
+        raise HTTPException(422, str(error)) from error
+    return DefinitionValidationOut(steps=steps, checksum=definitions.checksum_for(steps))
+
+
 @app.post("/workflow-definitions", response_model=WorkflowDefinitionOut)
 def create_workflow_definition(
     payload: DefinitionCreateIn,
