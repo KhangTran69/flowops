@@ -246,3 +246,22 @@ def test_session_config_requires_secret_and_auth_source():
                 "FLOWOPS_ENVIRONMENT": "production",
             }
         )
+
+
+def test_console_identity_ignores_forged_headers_and_requires_authentication(client):
+    assert client.get("/command-center/session", headers={
+        "X-User-Email": "forged@example.test", "X-User-Role": "admin"
+    }).status_code == 401
+    session = _operator_cookie(client)
+    response = client.get("/command-center/session", headers={"X-User-Role": "admin"})
+    assert response.status_code == 200
+    assert response.json() == {
+        "subject": "operator-test", "role": "operator", "tenant_key": "tenant-a",
+        "csrf_token": session.csrf_token,
+    }
+    assert response.headers["Cache-Control"] == "no-store"
+    assert client.post("/tickets/manual", json={"title": "VPN issue", "description": "Test issue", "requester_id": 7},
+                       headers={"Idempotency-Key": "csrf-test"}).status_code == 403
+    client.cookies.clear()
+    client.cookies.set(ui_session.SESSION_COOKIE, "invalid-signature")
+    assert client.get("/command-center/session").status_code == 401
