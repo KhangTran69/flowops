@@ -110,13 +110,16 @@ One API, one workflow engine, one operator console trajectory.
       on every matrix leg. The command-center `contracts.ts` and runtime
       validators (#51/#52 work) prove the frontend still agrees.
       Intentional API changes regenerate the snapshot in the same PR.
-- [ ] Extract the remaining tickets/intake section (~460 lines) as
-      `src/routes/tickets.py`; `src/api.py` then holds app assembly,
-      middleware, idempotency aliases, and service routes only (~500 lines).
-      Lesson from #56/#58, applied going forward: after moving code, tests
-      that monkeypatch module attributes must repoint at the module that now
-      owns the callable — including `original = api.X` attribute reads and
-      PostgreSQL-only variants that only CI exercises.
+- [x] Extract the remaining tickets/intake section as `src/routes/tickets.py`
+      (#60), consolidating the tenant access/scoping helpers into
+      `src/deps.py` and moving `AI_ADAPTER` beside its only consumer.
+      `src/api.py`: 3,158 -> 605 lines — app assembly, middleware,
+      idempotency aliases, service routes, and the durable-jobs section.
+      Lesson from #56/#58/#60, applied going forward: after moving code,
+      tests that monkeypatch module attributes must repoint at the module
+      that now owns the callable — including `original = api.X` attribute
+      reads and PostgreSQL-only variants that only CI exercises (the
+      postgres outbox test missed exactly this until CI caught it).
 
 ### 1b. Offboarding DAG parity (closes gap 4) — verified, docs corrected
 
