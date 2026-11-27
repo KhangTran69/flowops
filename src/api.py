@@ -64,6 +64,7 @@ from src.schemas import (
     TicketIntakeRequest,
     Ticket,
     TicketDetailOut,
+    TicketHistoryOut,
     ManualTicketIn,
     KnowledgeBaseArticleOut,
     KnowledgeBaseMatchOut,
@@ -1083,7 +1084,15 @@ def get_ticket(
     if record is None:
         raise HTTPException(status_code=404, detail="Ticket not found.")
     _require_ticket_access(actor, record)
-    return TicketDetailOut.model_validate(record, from_attributes=True)
+    detail = TicketDetailOut.model_validate(record, from_attributes=True)
+    query = select(db.ExecutionLogRecord).where(
+        db.ExecutionLogRecord.ticket_id == ticket_id,
+        or_(db.ExecutionLogRecord.action.like("ticket.%"), db.ExecutionLogRecord.action.like("ai.%")),
+    )
+    query = _scope_execution_log_query(query, actor)
+    history = session.execute(query.order_by(db.ExecutionLogRecord.id.desc()).limit(50)).scalars().all()
+    detail.history = [TicketHistoryOut.model_validate(row, from_attributes=True) for row in history]
+    return detail
 
 
 @app.post("/webhooks/actions/approve")
@@ -1821,6 +1830,7 @@ def get_workflow_run_by_id(
 @app.get("/command-center/session")
 def command_center_session(
     request: Request,
+    response: Response,
     actor: Actor = Depends(_operator_actor),
 ) -> dict[str, Any]:
     """Verify the caller at the backend, never accept proxy-supplied roles."""
@@ -1828,6 +1838,7 @@ def command_center_session(
         raise HTTPException(401, "Protected authentication is required.")
     if actor.source not in ("session", "bearer"):
         raise HTTPException(401, "Authentication required.")
+    response.headers["Cache-Control"] = "no-store"
     browser_session = ui_session.read_session(request) if actor.source == "session" else None
     return {
         "subject": actor.subject,
