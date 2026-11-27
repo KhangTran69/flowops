@@ -86,6 +86,11 @@ jobs:
         env:
           FLOWOPS_DATABASE_URL: postgresql+psycopg://flowops:flowops@127.0.0.1:5432/flowops
         run: alembic upgrade head
+      - name: Validate manual ticket migration rollback
+        env:
+          FLOWOPS_DATABASE_URL: postgresql+psycopg://flowops:flowops@127.0.0.1:5432/flowops
+          FLOWOPS_DISPOSABLE_MIGRATION_CHECK: '1'
+        run: python -m scripts.check_manual_ticket_migration
       - name: Run PostgreSQL reliability tests
         env:
           FLOWOPS_TEST_POSTGRES_URL: postgresql+psycopg://flowops:flowops@127.0.0.1:5432/flowops
@@ -93,6 +98,20 @@ jobs:
           pytest -q tests/test_idempotency_postgres.py tests/test_outbox_postgres.py \
             tests/test_jobs_postgres.py tests/test_outbox_worker_postgres.py \
             tests/test_offboarding_postgres.py tests/test_ai_postgres.py tests/test_orchestrator_postgres.py tests/test_v13_postgres.py tests/test_triggers_postgres.py
+
+      - name: Benchmark disposable PostgreSQL workload
+        env:
+          FLOWOPS_DATABASE_URL: postgresql+psycopg://flowops:flowops@127.0.0.1:5432/flowops
+          FLOWOPS_DISPOSABLE_BENCHMARK: '1'
+          FLOWOPS_AUTH_REQUIRED: 'false'
+          FLOWOPS_UI_AUTH_REQUIRED: 'false'
+          FLOWOPS_ENVIRONMENT: development
+          FLOWOPS_ACTION_ADAPTER: simulated
+          FLOWOPS_AI_ADAPTER: simulated
+          FLOWOPS_AUTOMATION_ADAPTER: simulated
+        run: |
+          alembic upgrade head
+          python -m scripts.benchmark_console
 
   command-center:
     runs-on: ubuntu-latest
