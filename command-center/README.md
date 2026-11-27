@@ -97,6 +97,38 @@ actual production identity gateway must be validated before a release.
 The backend's HTTP latency histogram is process-local; a multi-replica
 deployment needs external scraping/aggregation.
 
-Keep the existing Jinja console available while validating React parity.
+## Operator-console parity (plan of record)
+
+The React console is the operator console; the Jinja `/ui/*` pages are frozen
+(no new features) and will be retired after parity lands. `/dashboard` and
+the landing page stay server-rendered — they are monitoring surfaces, not
+operator surfaces.
+
+Coverage today (React pages: Approvals, Audit, Dashboard, Definitions,
+DefinitionDetail, Deliveries, Requests, RequestDetail, Runs, RunDetail,
+Tickets, TicketDetail). Still Jinja-only, in port order by operator value:
+
+- [ ] **Workflow jobs** (`/ui/workflow-jobs`, job detail) — queue health,
+  retry/cancel controls, attempt history
+- [ ] **Notifications / outbox** (`/ui/notifications`) — pending + dead-letter
+  tables, requeue/retry actions
+- [ ] **Analytics** (`/ui/analytics`) — summary cards, step bottlenecks,
+  tenant/window filters
+- [ ] **Triggers** (`/ui/triggers`, trigger detail) — source config, delivery
+  history, test-fire
+- [ ] **Knowledge base** (`/ui/knowledge-base`) — read-only search
+- [ ] **Workforce module** (`/workforce/ui`) — gated behind the browser
+  release gate until production identity ships
+
+Every port must, in the same PR:
+
+1. add the typed contract to `src/lib/contracts.ts` and runtime response
+   validation (incompatible payloads are rejected, not rendered);
+2. add a browser-smoke journey step covering the page's primary action;
+3. keep the backend contract unchanged — the Jinja pages and the React
+   console consume the same API, so this is a client swap, not a redesign.
+
+Retirement rule: once the checklist is empty, hide `/ui/*` behind a feature
+flag for one release, then delete the Jinja templates and their routes.
 Apply the additive Alembic manual-ticket migration in a non-production
 representative database first. No production deployment is part of this branch.
