@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from src import api, db
 from src.auth import AuthenticationError, authenticate_bearer
+from src.routes import onboarding as onboarding_routes
 from src.actions import ActionResult, MicrosoftGraphAdapter, adapter_from_environment
 
 
@@ -107,7 +108,7 @@ def test_execute_requires_auth_when_enabled(client, monkeypatch):
         def execute(self, action, context):
             assert context["actor_subject"] == "configured-bearer"
             return ActionResult(action, "captured")
-    monkeypatch.setattr(api, "ACTION_ADAPTER", CapturingAdapter())
+    monkeypatch.setattr(onboarding_routes, "ACTION_ADAPTER", CapturingAdapter())
     assert client.post(f"/onboarding-requests/{request['id']}/items/{item['id']}/execute", headers={"Authorization": "Bearer dev-secret"}).status_code == 200
 
 

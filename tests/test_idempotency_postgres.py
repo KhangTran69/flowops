@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import inspect, text
 
 from src import api, db
+from src.routes import onboarding as onboarding_routes
 
 POSTGRES_URL = os.environ.get("FLOWOPS_TEST_POSTGRES_URL")
 
@@ -259,7 +260,7 @@ def test_postgres_onboarding_stale_owner_cannot_finalize_after_takeover(
     release_a = threading.Event()
     calls = 0
     call_lock = threading.Lock()
-    original_create = api._create_onboarding_request
+    original_create = onboarding_routes._create_onboarding_request
 
     def pause_first(request, session, actor_subject=None):
         nonlocal calls
@@ -271,7 +272,7 @@ def test_postgres_onboarding_stale_owner_cannot_finalize_after_takeover(
             assert release_a.wait(timeout=5), "test did not release the stale owner"
         return original_create(request, session, actor_subject)
 
-    monkeypatch.setattr(api, "_create_onboarding_request", pause_first)
+    monkeypatch.setattr(onboarding_routes, "_create_onboarding_request", pause_first)
     key = "pg-onboarding-takeover"
     headers = {"Idempotency-Key": key}
 
