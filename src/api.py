@@ -13,7 +13,7 @@ import re
 import threading
 import time
 import uuid
-from collections import Counter, defaultdict
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator, Literal, Optional
@@ -425,8 +425,11 @@ def metrics_endpoint(
         lines.append(f'flowops_http_request_duration_seconds_count{{{labels}}} {total}')
         lines.append(f'flowops_http_request_duration_seconds_sum{{{labels}}} {seconds}')
 
-    job_records = session.execute(select(db.WorkflowJobRecord)).scalars().all()
-    job_counts = Counter(job.status for job in job_records)
+    job_rows = session.execute(
+        select(db.WorkflowJobRecord.status, func.count(), func.coalesce(func.sum(db.WorkflowJobRecord.attempts), 0))
+        .group_by(db.WorkflowJobRecord.status)
+    ).all()
+    job_counts = {state: count for state, count, _ in job_rows}
     lines.extend(
         [
             "# HELP flowops_workflow_jobs Workflow jobs by state",
@@ -437,10 +440,11 @@ def metrics_endpoint(
         lines.append(f'flowops_workflow_jobs{{status="{state}"}} {job_counts.get(state, 0)}')
     lines.append("# HELP flowops_workflow_job_attempts_total Total workflow job attempts")
     lines.append("# TYPE flowops_workflow_job_attempts_total counter")
-    lines.append(f"flowops_workflow_job_attempts_total {sum(job.attempts for job in job_records)}")
+    lines.append(f"flowops_workflow_job_attempts_total {sum(attempts for _, _, attempts in job_rows)}")
 
-    outbox = session.execute(select(db.NotificationOutboxRecord)).scalars().all()
-    outbox_counts = Counter(item.status for item in outbox)
+    outbox_counts = dict(session.execute(
+        select(db.NotificationOutboxRecord.status, func.count()).group_by(db.NotificationOutboxRecord.status)
+    ).all())
     lines.extend(
         [
             "# HELP flowops_notification_outbox Notification deliveries by state",
@@ -480,8 +484,9 @@ def metrics_endpoint(
         lines.append(
             f'flowops_ai_provider_errors_total{{provider="{provider}"}} {provider_errors[provider]}'
         )
-    runs = session.execute(select(db.WorkflowRunRecord)).scalars().all()
-    run_counts = Counter(run.status for run in runs)
+    run_counts = dict(session.execute(
+        select(db.WorkflowRunRecord.status, func.count()).group_by(db.WorkflowRunRecord.status)
+    ).all())
     lines.extend(
         [
             "# HELP flowops_dag_runs Workflow runs by status",
@@ -490,8 +495,9 @@ def metrics_endpoint(
     )
     for state in scheduler.RUN_STATUSES:
         lines.append(f'flowops_dag_runs{{status="{state}"}} {run_counts.get(state, 0)}')
-    steps = session.execute(select(db.WorkflowStepRunRecord)).scalars().all()
-    step_counts = Counter(step.status for step in steps)
+    step_counts = dict(session.execute(
+        select(db.WorkflowStepRunRecord.status, func.count()).group_by(db.WorkflowStepRunRecord.status)
+    ).all())
     lines.extend(
         [
             "# HELP flowops_dag_steps Workflow step attempts by status",
