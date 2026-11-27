@@ -266,7 +266,7 @@ def ui_ticket_detail(
             ticket_id=ticket_id,
             duration_ms=int((time.perf_counter() - started) * 1000),
             detail=f"adapter={analysis.adapter}; source=operator-ui",
-            actor_subject="operator-ui",
+            actor_subject=actor.subject,
             correlation_id=correlation_id,
         )
         db.log_execution(
@@ -277,7 +277,7 @@ def ui_ticket_detail(
             ticket_id=ticket_id,
             duration_ms=int((time.perf_counter() - started) * 1000),
             detail=f"adapter={analysis.adapter}; source=operator-ui",
-            actor_subject="operator-ui",
+            actor_subject=actor.subject,
             correlation_id=correlation_id,
         )
         session.commit()
