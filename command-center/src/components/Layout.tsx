@@ -15,6 +15,7 @@ const nav = [
   { to: '/approvals', label: 'Approvals', icon: ShieldCheck },
   { to: '/definitions', label: 'Definitions', icon: GitBranch },
   { to: '/audit', label: 'Audit', icon: FileText },
+  { to: '/deliveries', label: 'Deliveries', icon: Activity },
 ]
 
 export function Layout({ children }: { children: ReactNode }) {
