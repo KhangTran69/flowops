@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from src import ai_agent, chatops, db, scheduler, timers, workflow
 from src.auth import Actor
-from src.deps import _new_run_id, _operator_actor
+from src.deps import _new_run_id, _operator_actor, _require_ticket_access
 from src.schemas import (
     AIApplyOut,
     AIApplyRequest,
@@ -26,16 +26,15 @@ from src.schemas import (
     Ticket,
 )
 
-from src.api import (  # noqa: E402
+from src.routes.tickets import (  # noqa: E402
     _analyze_ticket,
     _article_out,
     _load_ticket,
-    _record_ai_apply,
-    _record_ai_triage,
-    _require_ticket_access,
     _ticket_history,
     _triage_out,
 )
+
+from src.api import _record_ai_apply, _record_ai_triage  # noqa: E402
 
 
 router = APIRouter()

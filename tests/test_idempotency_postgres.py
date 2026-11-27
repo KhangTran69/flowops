@@ -18,6 +18,7 @@ from sqlalchemy import inspect, text
 
 from src import api, db
 from src.routes import onboarding as onboarding_routes
+from src.routes import tickets
 
 POSTGRES_URL = os.environ.get("FLOWOPS_TEST_POSTGRES_URL")
 
@@ -174,7 +175,7 @@ def test_postgres_stale_owner_cannot_finalize_after_takeover(client, monkeypatch
     release_a = threading.Event()
     calls = 0
     call_lock = threading.Lock()
-    original_process = api._process_intake
+    original_process = tickets._process_intake
 
     def pause_first_request(request, session, actor_subject=None):
         nonlocal calls
@@ -186,7 +187,7 @@ def test_postgres_stale_owner_cannot_finalize_after_takeover(client, monkeypatch
             assert release_a.wait(timeout=5), "test did not release the stale owner"
         return original_process(request, session, actor_subject)
 
-    monkeypatch.setattr(api, "_process_intake", pause_first_request)
+    monkeypatch.setattr(tickets, "_process_intake", pause_first_request)
     key = "pg-takeover-key"
     headers = {"Idempotency-Key": key}
 

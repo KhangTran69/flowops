@@ -17,25 +17,33 @@ from fastapi import APIRouter
 
 from src import metrics as _metrics
 from src.auth import Actor
-from src.deps import _actor_tenant, _global_admin_actor, _new_run_id, _operator_actor
+from src.deps import (
+    _actor_tenant,
+    _global_admin_actor,
+    _new_run_id,
+    _operator_actor,
+    _require_request_access,
+    _require_ticket_access,
+    _require_workflow_job_access,
+    _scope_execution_log_query,
+    _scope_ticket_or_request_keyed_query,
+)
 from src.routes.onboarding import (  # noqa: E402
     _definition_out,
     _load_request,
     _workflow_run_out,
 )
 
+from src.routes.tickets import (  # noqa: E402
+    _analyze_ticket,
+    _load_ticket,
+    _ticket_history,
+    _triage_out,
+)
+
 from src.api import (
     AITriageOut,
     Ticket,
-    _analyze_ticket,
-    _load_ticket,
-    _require_request_access,
-    _require_ticket_access,
-    _require_workflow_job_access,
-    _scope_execution_log_query,
-    _scope_ticket_or_request_keyed_query,
-    _ticket_history,
-    _triage_out,
 )
 
 router = APIRouter()

@@ -34,7 +34,15 @@ from src import db, definitions, idempotency, scheduler, timers, ui_session, wor
 from src.onboarding import checklist_for, initial_status_for
 from src.actions import ActionAdapter, ActionError, action_for_step, adapter_from_environment
 from src.auth import Actor
-from src.deps import _admin_actor, _global_admin_actor, _new_run_id, _operator_actor
+from src.deps import (
+    _admin_actor,
+    _actor_tenant,
+    _global_admin_actor,
+    _new_run_id,
+    _operator_actor,
+    _require_request_access,
+    _require_workflow_run_access,
+)
 from src.m365_simulator import M365Simulator
 from src.schemas import (
     ActionExecutionOut,
@@ -60,13 +68,10 @@ from src.api import (  # noqa: E402
     IDEMPOTENCY_PROCESSING_TIMEOUT,
     IDEMPOTENCY_SCOPE_ONBOARDING,
     _action_attempts,
-    _actor_tenant,
     _complete_idempotency_key,
     _notify_action_failure,
     _release_idempotency_key,
     _request_fingerprint,
-    _require_request_access,
-    _require_workflow_run_access,
     _reserve_idempotency_key,
     _validate_idempotency_key,
 )

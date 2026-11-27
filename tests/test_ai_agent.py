@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src import ai_agent, api, db
+from src.routes import tickets
 
 TICKET = {
     "userId": 7,
@@ -428,7 +429,7 @@ def test_ai_metrics_and_provider_error_log(client, monkeypatch):
         def analyze(self, ticket, history=()):
             raise ai_agent.AIAvailabilityError("provider unavailable")
 
-    monkeypatch.setattr(api, "AI_ADAPTER", BrokenAdapter())
+    monkeypatch.setattr(tickets, "AI_ADAPTER", BrokenAdapter())
     failed = client.post("/tickets/42/ai-triage")
     assert failed.status_code == 503
     logs = client.get("/execution-logs").json()

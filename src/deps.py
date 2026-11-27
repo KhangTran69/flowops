@@ -10,6 +10,12 @@ from typing import Optional
 
 from fastapi import Depends, Header, HTTPException, Request
 
+from sqlalchemy import String, and_, cast, or_, select
+from sqlalchemy.orm import Session
+
+from sqlalchemy import String, and_, cast, or_, select
+from sqlalchemy.orm import Session
+
 from src import db, ui_session
 from src.auth import (
     AuthenticationError,
@@ -248,6 +254,166 @@ def _enforce_rate_limit(actor_key: str) -> None:
                 headers={"Retry-After": "60"},
             )
         _RATE_LIMIT_BUCKETS[actor_key] = (window_start, count + 1)
+
+
+def _require_ticket_access(actor: Actor, record: db.TicketRecord) -> None:
+    """404 on cross-tenant reads so existence outside the tenant is not leaked."""
+    tenant_key = _actor_tenant(actor)
+    if tenant_key and record.tenant_key != tenant_key:
+        raise HTTPException(status_code=404, detail="Ticket not found.")
+
+
+def _scope_ticket_or_request_keyed_query(query, key_column, actor: Actor):
+    """Limit rows keyed by a ticket or onboarding request to the actor's tenant."""
+    tenant_key = _actor_tenant(actor)
+    if tenant_key is None:
+        return query
+    foreign_request_ids = select(cast(db.OnboardingRequestRecord.id, String)).where(
+        or_(
+            db.OnboardingRequestRecord.tenant_key != tenant_key,
+            db.OnboardingRequestRecord.tenant_key.is_(None),
+        )
+    )
+    foreign_ticket_ids = select(db.TicketRecord.ticket_id).where(
+        or_(
+            db.TicketRecord.tenant_key != tenant_key,
+            db.TicketRecord.tenant_key.is_(None),
+        )
+    )
+    ticket_ids = select(db.TicketRecord.ticket_id).where(
+        db.TicketRecord.tenant_key == tenant_key
+    ).where(db.TicketRecord.ticket_id.not_in(foreign_request_ids))
+    request_ids = select(cast(db.OnboardingRequestRecord.id, String)).where(
+        db.OnboardingRequestRecord.tenant_key == tenant_key
+    ).where(cast(db.OnboardingRequestRecord.id, String).not_in(foreign_ticket_ids))
+    return query.where(key_column.in_(ticket_ids) | key_column.in_(request_ids))
+
+
+def _scope_execution_log_query(query, actor: Actor):
+    """Scope linked logs by tenant and retain only the actor's unlinked audit events."""
+    tenant_key = _actor_tenant(actor)
+    if tenant_key is None:
+        return query
+    linked_scope = _scope_ticket_or_request_keyed_query(
+        select(db.ExecutionLogRecord.id), db.ExecutionLogRecord.ticket_id, actor
+    ).subquery()
+    return query.where(
+        or_(
+            db.ExecutionLogRecord.id.in_(select(linked_scope.c.id)),
+            and_(
+                db.ExecutionLogRecord.ticket_id.is_(None),
+                db.ExecutionLogRecord.actor_subject == actor.subject,
+            ),
+        )
+    )
+
+
+def _require_request_access(actor: Actor, record: db.OnboardingRequestRecord) -> None:
+    tenant_key = _actor_tenant(actor)
+    if tenant_key and record.tenant_key != tenant_key:
+        raise HTTPException(status_code=404, detail="Onboarding request not found.")
+
+
+def _require_workflow_run_access(
+    session: Session, actor: Actor, run: db.WorkflowRunRecord
+) -> None:
+    request = session.get(db.OnboardingRequestRecord, run.request_id)
+    if request is None:
+        raise HTTPException(status_code=404, detail="Workflow run not found.")
+    _require_request_access(actor, request)
+
+
+def _require_workflow_job_access(
+    session: Session, actor: Actor, job: db.WorkflowJobRecord
+) -> None:
+    tenant_key = _actor_tenant(actor)
+    if tenant_key is None:
+        return
+    if job.resource_type != "onboarding" or not job.resource_id or not job.resource_id.isdecimal():
+        raise HTTPException(status_code=404, detail="Workflow job not found.")
+    request = session.get(db.OnboardingRequestRecord, int(job.resource_id))
+    if request is None or request.tenant_key != tenant_key:
+        raise HTTPException(status_code=404, detail="Workflow job not found.")
+
+
+def _require_ticket_access(actor: Actor, record: db.TicketRecord) -> None:
+    """404 on cross-tenant reads so existence outside the tenant is not leaked."""
+    tenant_key = _actor_tenant(actor)
+    if tenant_key and record.tenant_key != tenant_key:
+        raise HTTPException(status_code=404, detail="Ticket not found.")
+
+
+def _scope_ticket_or_request_keyed_query(query, key_column, actor: Actor):
+    """Limit rows keyed by a ticket or onboarding request to the actor's tenant."""
+    tenant_key = _actor_tenant(actor)
+    if tenant_key is None:
+        return query
+    foreign_request_ids = select(cast(db.OnboardingRequestRecord.id, String)).where(
+        or_(
+            db.OnboardingRequestRecord.tenant_key != tenant_key,
+            db.OnboardingRequestRecord.tenant_key.is_(None),
+        )
+    )
+    foreign_ticket_ids = select(db.TicketRecord.ticket_id).where(
+        or_(
+            db.TicketRecord.tenant_key != tenant_key,
+            db.TicketRecord.tenant_key.is_(None),
+        )
+    )
+    ticket_ids = select(db.TicketRecord.ticket_id).where(
+        db.TicketRecord.tenant_key == tenant_key
+    ).where(db.TicketRecord.ticket_id.not_in(foreign_request_ids))
+    request_ids = select(cast(db.OnboardingRequestRecord.id, String)).where(
+        db.OnboardingRequestRecord.tenant_key == tenant_key
+    ).where(cast(db.OnboardingRequestRecord.id, String).not_in(foreign_ticket_ids))
+    return query.where(key_column.in_(ticket_ids) | key_column.in_(request_ids))
+
+
+def _scope_execution_log_query(query, actor: Actor):
+    """Scope linked logs by tenant and retain only the actor's unlinked audit events."""
+    tenant_key = _actor_tenant(actor)
+    if tenant_key is None:
+        return query
+    linked_scope = _scope_ticket_or_request_keyed_query(
+        select(db.ExecutionLogRecord.id), db.ExecutionLogRecord.ticket_id, actor
+    ).subquery()
+    return query.where(
+        or_(
+            db.ExecutionLogRecord.id.in_(select(linked_scope.c.id)),
+            and_(
+                db.ExecutionLogRecord.ticket_id.is_(None),
+                db.ExecutionLogRecord.actor_subject == actor.subject,
+            ),
+        )
+    )
+
+
+def _require_request_access(actor: Actor, record: db.OnboardingRequestRecord) -> None:
+    tenant_key = _actor_tenant(actor)
+    if tenant_key and record.tenant_key != tenant_key:
+        raise HTTPException(status_code=404, detail="Onboarding request not found.")
+
+
+def _require_workflow_run_access(
+    session: Session, actor: Actor, run: db.WorkflowRunRecord
+) -> None:
+    request = session.get(db.OnboardingRequestRecord, run.request_id)
+    if request is None:
+        raise HTTPException(status_code=404, detail="Workflow run not found.")
+    _require_request_access(actor, request)
+
+
+def _require_workflow_job_access(
+    session: Session, actor: Actor, job: db.WorkflowJobRecord
+) -> None:
+    tenant_key = _actor_tenant(actor)
+    if tenant_key is None:
+        return
+    if job.resource_type != "onboarding" or not job.resource_id or not job.resource_id.isdecimal():
+        raise HTTPException(status_code=404, detail="Workflow job not found.")
+    request = session.get(db.OnboardingRequestRecord, int(job.resource_id))
+    if request is None or request.tenant_key != tenant_key:
+        raise HTTPException(status_code=404, detail="Workflow job not found.")
 
 
 def _new_run_id() -> str:
