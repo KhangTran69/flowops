@@ -231,28 +231,37 @@ rehearsal log, audit report, measured thresholds) linked from
 
 Scheduled owners for the documented limits (gap 6), in priority order:
 
-- [ ] **Multi-process rate limiting.** Replace the in-process limiter with a
-      DB-backed token bucket (no new infra: reuse SQLAlchemy + the existing
-      `FLOWOPS_RATE_LIMIT_PER_MINUTE` knob; a tiny `rate_limits` table with
-      conditional updates, same fencing pattern as jobs). Keep the in-process
-      path for single-process dev.
+- [ ] **Multi-process rate limiting — decision recorded 2026-11-28: deferred
+      until a multi-replica deployment exists.** The limiter is off by
+      default (`FLOWOPS_RATE_LIMIT_PER_MINUTE` unset) and single-process by
+      design; Phase 2's staging deployment is the earliest point where the
+      limitation becomes real. Implement then: a DB-backed token bucket
+      (no new infra — SQLAlchemy + conditional updates, same fencing pattern
+      as jobs), keeping the in-process path for single-process dev.
 - [ ] **Delivery reconciliation ledger.** At-least-once webhook delivery is
       fine, but make duplicates *visible*: record delivery attempts keyed by
       event fingerprint (the `events.fingerprint` column already exists) so
       operators can query "what did we actually send?" and receivers get a
-      documented dedupe key per event type.
+      documented dedupe key per event type. Sequencing note: land this with
+      the Phase 2e live-connector work, where real delivery traffic first
+      makes duplicate visibility matter.
 - [ ] **Clock-skew-tolerant leases.** Documented limit: wall-clock takeover.
       Evaluate DB-time (`now()`) lease comparisons for Postgres and
       monotonic-heartbeat staleness for the worker; if adopted, note it as
       the one place SQLite/Postgres semantics intentionally differ.
-- [ ] **Chaos drills in CI.** Extend `tests/test_worker_recovery.py`:
-      scheduler killed mid-tick, outbox worker killed mid-delivery, takeover
-      storm (three workers, one job). Gate: a simulated crash never loses a
-      committed side effect and never double-fires a lease.
-- [ ] **Coverage instrumentation.** Add `pytest-cov` to `requirements-dev.in`
-      with a measured floor (`--cov-fail-under` set from the actual baseline,
-      raised over time). Today coverage is unmeasured; the 14
-      `pragma: no cover` markers are unaudited.
+- [x] **Chaos drills.** `tests/test_chaos_drills.py`: takeover storm (eight
+      concurrent claimers, exactly one winner, recovery completes at
+      attempts == 2), scheduler killed mid-tick (lease takeover enqueues each
+      ready step exactly once), outbox worker killed mid-delivery (claimed
+      row is skipped until its lease expires, then delivered exactly once).
+      Gate held: a simulated crash never loses a committed side effect and
+      never double-fires a lease.
+- [x] **Coverage instrumentation.** `pytest-cov` added to
+      `requirements-dev.in`; floor measured from the real baseline and
+      enforced by the CI `coverage` job plus `scripts/coverage.sh`:
+      **83%** (baseline 83.6% on 2026-11-28). Raise the floor as coverage
+      improves; never lower it to make a PR pass. The 14 `pragma: no cover`
+      markers are still unaudited — review them when touching those files.
 
 ---
 
