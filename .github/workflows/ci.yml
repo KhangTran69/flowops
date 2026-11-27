@@ -110,3 +110,44 @@ jobs:
       - run: npm run build
       - run: node --check server/index.mjs
       - run: node --test server/*.test.mjs
+
+
+  console-browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: command-center/package-lock.json
+      - run: python -m pip install -r requirements-dev.txt playwright==1.51.0
+      - run: python -m playwright install --with-deps chromium
+      - run: npm ci && npm run build
+        working-directory: command-center
+      - name: Exercise isolated browser and backend
+        env:
+          FLOWOPS_DATABASE_URL: sqlite:///data/console-browser.db
+          FLOWOPS_ENVIRONMENT: development
+          FLOWOPS_AUTH_REQUIRED: 'false'
+          FLOWOPS_UI_AUTH_REQUIRED: 'false'
+          FLOWOPS_ACTION_ADAPTER: simulated
+          FLOWOPS_AI_ADAPTER: simulated
+          FLOWOPS_AUTOMATION_ADAPTER: simulated
+          FLOWOPS_API_URL: http://127.0.0.1:8000
+          FLOWOPS_API_TOKEN: local-browser-test
+          FLOWOPS_COMMAND_CENTER_DEV: 'true'
+          DEV_USER_ROLE: admin
+          SERVE_STATIC: 'true'
+        run: |
+          alembic upgrade head
+          python -m uvicorn src.api:app --host 127.0.0.1 --port 8000 > /tmp/flowops-api.log 2>&1 &
+          api_pid=$!
+          node command-center/server/index.mjs > /tmp/flowops-console.log 2>&1 &
+          console_pid=$!
+          trap 'kill "$api_pid" "$console_pid" 2>/dev/null || true; cat /tmp/flowops-api.log /tmp/flowops-console.log' EXIT
+          curl --fail --retry 20 --retry-delay 1 --retry-all-errors http://127.0.0.1:8000/ready
+          python command-center/tests/browser_smoke.py
