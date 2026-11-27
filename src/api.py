@@ -25,7 +25,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import Integer, String, and_, cast, delete, or_, select, text, update
+from sqlalchemy import Integer, String, and_, cast, delete, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -62,6 +62,7 @@ from src.deps import (
 from src.schemas import (
     TicketIntakeRequest,
     Ticket,
+    TicketDetailOut,
     KnowledgeBaseArticleOut,
     KnowledgeBaseMatchOut,
     AISummaryOut,
@@ -949,12 +950,59 @@ def list_tickets(
     return [Ticket.model_validate(record, from_attributes=True) for record in records]
 
 
-@app.get("/tickets/{ticket_id}", response_model=Ticket)
+class DashboardSummaryOut(BaseModel):
+    open_tickets: int
+    urgent_tickets: int
+    pending_approvals: int
+    active_runs: int
+    overdue_steps: int
+    recorded_closed_today: int
+
+
+@app.get("/command-center/summary", response_model=DashboardSummaryOut)
+def command_center_summary(
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+) -> DashboardSummaryOut:
+    tenant = _actor_tenant(actor)
+    tickets = select(func.count()).select_from(db.TicketRecord)
+    runs = select(func.count()).select_from(db.WorkflowRunRecord).join(
+        db.OnboardingRequestRecord, db.OnboardingRequestRecord.id == db.WorkflowRunRecord.request_id
+    )
+    items = select(func.count()).select_from(db.ChecklistItemRecord).join(
+        db.OnboardingRequestRecord, db.OnboardingRequestRecord.id == db.ChecklistItemRecord.request_id
+    ).join(db.WorkflowRunRecord, db.WorkflowRunRecord.request_id == db.OnboardingRequestRecord.id)
+    if tenant is not None:
+        tickets = tickets.where(db.TicketRecord.tenant_key == tenant)
+        runs = runs.where(db.OnboardingRequestRecord.tenant_key == tenant)
+        items = items.where(db.OnboardingRequestRecord.tenant_key == tenant)
+    active = db.WorkflowRunRecord.status.in_(("pending", "running"))
+    now = datetime.now(timezone.utc)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    overdue = items.where(active, db.ChecklistItemRecord.status.in_(("pending", "approved"))).where(
+        select(db.WorkflowTimerRecord.id).where(
+            db.WorkflowTimerRecord.item_id == db.ChecklistItemRecord.id,
+            db.WorkflowTimerRecord.request_id == db.ChecklistItemRecord.request_id,
+            db.WorkflowTimerRecord.status == "pending",
+            db.WorkflowTimerRecord.due_at <= now,
+        ).exists()
+    )
+    return DashboardSummaryOut(
+        open_tickets=session.scalar(tickets.where(db.TicketRecord.status == "open")) or 0,
+        urgent_tickets=session.scalar(tickets.where(db.TicketRecord.status == "open", db.TicketRecord.priority == "urgent")) or 0,
+        pending_approvals=session.scalar(items.where(active, db.ChecklistItemRecord.requires_approval.is_(True), db.ChecklistItemRecord.status == "pending")) or 0,
+        active_runs=session.scalar(runs.where(active)) or 0,
+        overdue_steps=session.scalar(overdue) or 0,
+        recorded_closed_today=session.scalar(tickets.where(db.TicketRecord.status == "closed", db.TicketRecord.closed_at >= midnight, db.TicketRecord.closed_at < midnight + timedelta(days=1))) or 0,
+    )
+
+
+@app.get("/tickets/{ticket_id}", response_model=TicketDetailOut)
 def get_ticket(
     ticket_id: str,
     session: Session = Depends(db.get_session),
     actor: Actor = Depends(_operator_actor),
-) -> Ticket:
+) -> TicketDetailOut:
     """Return one stored ticket."""
     if not ticket_id.isdigit():
         raise HTTPException(status_code=404, detail="Ticket not found.")
@@ -962,7 +1010,7 @@ def get_ticket(
     if record is None:
         raise HTTPException(status_code=404, detail="Ticket not found.")
     _require_ticket_access(actor, record)
-    return Ticket.model_validate(record, from_attributes=True)
+    return TicketDetailOut.model_validate(record, from_attributes=True)
 
 
 @app.post("/webhooks/actions/approve")
