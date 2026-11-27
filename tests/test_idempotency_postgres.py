@@ -331,3 +331,44 @@ def test_postgres_manual_ticket_idempotent_create(client):
     assert client.get(f"/tickets/{ticket_id}").json()["description"] == "Manual ticket"
     assert len(client.get("/tickets").json()) == 1
     assert client.get("/command-center/summary").json()["open_tickets"] == 1
+
+
+def test_postgres_concurrent_definition_versions_and_replay(client):
+    from concurrent.futures import ThreadPoolExecutor
+    step = {"key": "first", "step": "First step", "queue": "it-hardware",
+            "requires_approval": False, "action": "none"}
+    payload = {"key": "retry-def", "name": "Retry", "request_type": "onboarding", "steps": [step]}
+    headers = {"Idempotency-Key": "definition-create"}
+    created = client.post("/workflow-definitions", json=payload, headers=headers)
+    assert created.status_code == 200, created.text
+    replay = client.post("/workflow-definitions", json=payload, headers=headers)
+    assert replay.json() == created.json()
+    assert replay.headers["Idempotency-Replayed"] == "true"
+
+    def version(key):
+        return client.put("/workflow-definitions/retry-def", json={"steps": [step]},
+                          headers={"Idempotency-Key": key})
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(version, ["version-a", "version-b"]))
+    assert all(r.status_code == 200 for r in results), [r.text for r in results]
+    detail = client.get("/workflow-definitions/retry-def").json()
+    assert [v["version"] for v in detail["versions"]] == [1, 2, 3]
+    replay = version("version-a")
+    assert replay.status_code == 200
+    assert replay.headers["Idempotency-Replayed"] == "true"
+    assert client.put("/workflow-definitions/retry-def", json={"steps": [{**step, "step": "Changed"}]},
+                      headers={"Idempotency-Key": "version-a"}).status_code == 409
+    assert len(client.get("/workflow-definitions/retry-def").json()["versions"]) == 3
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        duplicate = list(pool.map(version, ["same-version", "same-version"]))
+    assert any(r.status_code == 200 for r in duplicate)
+    assert all(r.status_code in (200, 409) for r in duplicate)
+    assert version("same-version").headers["Idempotency-Replayed"] == "true"
+    assert len(client.get("/workflow-definitions/retry-def").json()["versions"]) == 4
+    publish_headers = {"Idempotency-Key": "publish-4"}
+    published = client.post("/workflow-definitions/retry-def/publish", json={"version": 4}, headers=publish_headers)
+    assert published.status_code == 200, published.text
+    repeated = client.post("/workflow-definitions/retry-def/publish", json={"version": 4}, headers=publish_headers)
+    assert repeated.headers["Idempotency-Replayed"] == "true"
+    assert repeated.json() == published.json()
