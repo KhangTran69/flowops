@@ -576,6 +576,10 @@ a live local API (not a benchmark).
 
 ## Roadmap status
 
+> **What's next:** the working plan for future phases — release gates, API
+> decomposition, console consolidation, and the public demo — lives in
+> [`docs/ROADMAP.md`](docs/ROADMAP.md). This section records what has shipped.
+
 - ✅ v0.1–v0.5 and the monitoring dashboard (see table above)
 - ✅ v0.6 — Microsoft Graph + Exchange Online PowerShell behind the onboarding checklists (offline-tested; live demo needs tenant credentials)
 - ✅ v1.4 — Multi-tenant/GDAP, ConnectWise Manage, Claude, MCP server, n8n workflows, SQL views, runbooks
