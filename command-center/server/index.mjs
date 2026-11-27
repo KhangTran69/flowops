@@ -143,4 +143,7 @@ if (process.env.NODE_ENV === 'production' || process.env.SERVE_STATIC === 'true'
 }
 const port = Number(process.env.PORT || 8787)
 const host = DEV ? '127.0.0.1' : (process.env.HOST || '127.0.0.1')
-app.listen(port, host, () => console.log(`Command Center proxy on ${host}:${port}`))
+export { app }
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  app.listen(port, host, () => console.log(`Command Center proxy on ${host}:${port}`))
+}
