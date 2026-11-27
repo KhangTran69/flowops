@@ -1,20 +1,26 @@
 import { toast } from 'sonner'
+import { responseSchema } from './validation'
 
 export type ApiResult<T = unknown> = { ok: boolean; status: number; data?: T; error?: string }
 
 export async function api<T = unknown>(
   method: 'GET' | 'POST' | 'PUT',
   path: string,
-  opts: { query?: Record<string, unknown>; body?: unknown; idempotencyKey?: string } = {},
+  opts: { query?: Record<string, unknown>; body?: unknown; idempotencyKey?: string; signal?: AbortSignal } = {},
 ): Promise<ApiResult<T>> {
   try {
     const r = await fetch('/api/flowops', {
       method: 'POST',
+      signal: opts.signal,
       headers: { 'Content-Type': 'application/json', 'X-FlowOps-Request': '1', ...(opts.idempotencyKey ? { 'Idempotency-Key': opts.idempotencyKey } : {}) },
       body: JSON.stringify({ method, path, query: opts.query, body: opts.body }),
     })
     const json = (await r.json()) as ApiResult<T>
     if (typeof json?.ok !== 'boolean') return { ok: false, status: r.status, error: 'Unexpected proxy response.' }
+    if (json.ok) {
+      const schema = responseSchema(method, path)
+      if (schema && !schema.safeParse(json.data).success) return { ok: false, status: 502, error: 'FlowOps response does not match the console API contract.' }
+    }
     return json
   } catch {
     return { ok: false, status: 503, error: 'Command Center proxy is unreachable.' }

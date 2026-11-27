@@ -8,16 +8,18 @@ import { BackLink, JsonView, PageHeader } from '../components/Basics'
 import { StatusBadge } from '../components/StatusBadge'
 import { Confirm } from '../components/Confirm'
 
+import type { WorkflowDefinition, DefinitionDiff } from '../lib/contracts'
+
 export default function DefinitionDetail() {
   const { key } = useParams()
-  const { data, error, status, loading, reload } = usePoll<any>(`/workflow-definitions/${key}`)
+  const { data, error, status, loading, reload } = usePoll<WorkflowDefinition>(`/workflow-definitions/${key}`)
   const { role } = useSession()
   const versions = data?.versions || []
   const [selected, setSelected] = useState<number | null>(null)
   const [editor, setEditor] = useState(''); const [open, setOpen] = useState(false); const [busy, setBusy] = useState(false)
   const [publishOpen, setPublishOpen] = useState(false)
-  const [from, setFrom] = useState(''); const [to, setTo] = useState(''); const [diff, setDiff] = useState<any>(null); const [diffError, setDiffError] = useState('')
-  useEffect(() => { if (versions.length && selected === null) { const v = versions.find((x: any) => x.version === data.current_version) || versions[versions.length - 1]; setSelected(v.version); setEditor(JSON.stringify(v.steps, null, 2)); setFrom(String(versions[0].version)); setTo(String(v.version)) } }, [data])
+  const [from, setFrom] = useState(''); const [to, setTo] = useState(''); const [diff, setDiff] = useState<DefinitionDiff | null>(null); const [diffError, setDiffError] = useState('')
+  useEffect(() => { if (versions.length && selected === null) { const v = versions.find((x: any) => x.version === data?.current_version) || versions[versions.length - 1]; setSelected(v.version); setEditor(JSON.stringify(v.steps, null, 2)); setFrom(String(versions[0].version)); setTo(String(v.version)) } }, [data])
   const current = useMemo(() => versions.find((v: any) => v.version === selected), [versions, selected])
   async function newVersion() {
     let steps: any
@@ -27,8 +29,8 @@ export default function DefinitionDetail() {
   }
   async function publish() { setBusy(true); const r = await mutate('POST', `/workflow-definitions/${key}/publish`, { version: selected }, 'Definition published.'); setBusy(false); if (r.ok) { setPublishOpen(false); reload() } }
   async function compare() {
-    setDiffError(''); const r = await api('GET', `/workflow-definitions/${key}/diff`, { query: { from: Number(from), to: Number(to) } })
-    if (r.ok) setDiff(r.data); else setDiffError(r.error || 'Diff failed.')
+    setDiff(null); setDiffError(''); const r = await api<DefinitionDiff>('GET', `/workflow-definitions/${key}/diff`, { query: { from: Number(from), to: Number(to) } })
+    if (r.ok) setDiff(r.data ?? null); else setDiffError(r.error || 'Diff failed.')
   }
   return <>
     <BackLink to="/definitions">Definitions</BackLink>

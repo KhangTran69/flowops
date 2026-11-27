@@ -17,9 +17,9 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from src import db
+from src import db, ui_session
 from src.auth import Actor
-from src.deps import _actor_from_header
+from src.deps import _actor_from_header, _enforce_csrf
 from src import web
 
 router = APIRouter(prefix="/workforce", tags=["employee onboarding and IT assets"])
@@ -39,10 +39,17 @@ CALLBACK_TIMEOUT = timedelta(minutes=10)
 def role_actor(*required: str):
     allowed = {item.upper() for item in required}
 
-    def dependency(actor: Actor = Depends(_actor_from_header),
+    def dependency(request: Request, actor: Actor = Depends(_actor_from_header),
                    session: Session = Depends(db.get_session)) -> Actor:
         roles = {role.upper() for role in actor.roles}
-        if actor.source == "local" and os.environ.get("FLOWOPS_ENVIRONMENT", "development").lower() != "development":
+        production = os.environ.get("FLOWOPS_ENVIRONMENT", "development").lower() != "development"
+        # Workforce browser login is still development-only. The API can
+        # serve independently authenticated bearer callers in protected mode.
+        if production and (request.url.path == "/workforce/ui" or request.url.path.startswith("/workforce/ui/") or actor.source == "session"):
+            raise HTTPException(403, "Production workforce browser access has not been released.")
+        if ui_session.ui_auth_required():
+            _enforce_csrf(request, actor)
+        if actor.source == "local" and production:
             raise HTTPException(403, "Local workforce access is available only in development.")
         # Existing FlowOps operators keep access during the incremental rollout.
         if "AUTOMATION.ADMIN" in roles or roles.intersection(allowed):

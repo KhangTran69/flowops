@@ -25,6 +25,14 @@ export function Confirm({ open, onOpenChange, title, description, onConfirm, bus
   return (
     <dialog ref={dialog} aria-labelledby={titleId} aria-describedby={description ? descriptionId : undefined} aria-modal="true"
       className="m-auto w-[calc(100%-2rem)] max-w-lg overflow-auto rounded-lg bg-transparent p-0 backdrop:bg-black/50"
+      onKeyDown={e => {
+        if (e.key !== 'Tab') return
+        const focusable = Array.from(e.currentTarget.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href], [tabindex="0"]')).filter(el => el.getClientRects().length > 0)
+        const first = focusable[0], last = focusable[focusable.length - 1]
+        if (!first || !last) { e.preventDefault(); return }
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus() }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus() }
+      }}
       onCancel={e => { e.preventDefault(); if (!busy) onOpenChange(false) }}
       onMouseDown={e => { if (e.target === e.currentTarget && !busy) onOpenChange(false) }}>
       <div className="card w-full p-5">

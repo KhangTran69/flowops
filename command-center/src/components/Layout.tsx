@@ -5,6 +5,8 @@ import { useSession } from '../lib/session'
 import { usePoll } from '../hooks/usePoll'
 import { cn } from '../lib/utils'
 
+import type { Readiness } from '../lib/contracts'
+
 const nav = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard },
   { to: '/tickets', label: 'Tickets', icon: Ticket },
@@ -20,7 +22,7 @@ export function Layout({ children }: { children: ReactNode }) {
   const [mobile, setMobile] = useState(false)
   const [dark, setDark] = useState(() => localStorage.getItem('flowops-theme') === 'dark')
   const location = useLocation()
-  const ready = usePoll<any>('/ready', undefined, 15000)
+  const ready = usePoll<Readiness>('/ready', undefined, 15000)
   useEffect(() => { document.documentElement.classList.toggle('dark', dark); localStorage.setItem('flowops-theme', dark ? 'dark' : 'light') }, [dark])
   useEffect(() => { setMobile(false) }, [location.pathname])
   const healthLabel = ready.loading && !ready.updatedAt ? 'checking backend' : ready.error ? (ready.updatedAt ? 'backend stale' : 'backend unavailable') : ready.data?.status === 'ready' && ready.status === 200 ? 'backend ready' : 'backend unavailable'

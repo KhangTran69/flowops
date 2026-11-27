@@ -13,7 +13,7 @@ import re
 import threading
 import time
 import uuid
-from collections import Counter, defaultdict
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator, Literal, Optional
@@ -425,8 +425,11 @@ def metrics_endpoint(
         lines.append(f'flowops_http_request_duration_seconds_count{{{labels}}} {total}')
         lines.append(f'flowops_http_request_duration_seconds_sum{{{labels}}} {seconds}')
 
-    job_records = session.execute(select(db.WorkflowJobRecord)).scalars().all()
-    job_counts = Counter(job.status for job in job_records)
+    job_rows = session.execute(
+        select(db.WorkflowJobRecord.status, func.count(), func.coalesce(func.sum(db.WorkflowJobRecord.attempts), 0))
+        .group_by(db.WorkflowJobRecord.status)
+    ).all()
+    job_counts = {state: count for state, count, _ in job_rows}
     lines.extend(
         [
             "# HELP flowops_workflow_jobs Workflow jobs by state",
@@ -437,10 +440,11 @@ def metrics_endpoint(
         lines.append(f'flowops_workflow_jobs{{status="{state}"}} {job_counts.get(state, 0)}')
     lines.append("# HELP flowops_workflow_job_attempts_total Total workflow job attempts")
     lines.append("# TYPE flowops_workflow_job_attempts_total counter")
-    lines.append(f"flowops_workflow_job_attempts_total {sum(job.attempts for job in job_records)}")
+    lines.append(f"flowops_workflow_job_attempts_total {sum(attempts for _, _, attempts in job_rows)}")
 
-    outbox = session.execute(select(db.NotificationOutboxRecord)).scalars().all()
-    outbox_counts = Counter(item.status for item in outbox)
+    outbox_counts = dict(session.execute(
+        select(db.NotificationOutboxRecord.status, func.count()).group_by(db.NotificationOutboxRecord.status)
+    ).all())
     lines.extend(
         [
             "# HELP flowops_notification_outbox Notification deliveries by state",
@@ -480,8 +484,9 @@ def metrics_endpoint(
         lines.append(
             f'flowops_ai_provider_errors_total{{provider="{provider}"}} {provider_errors[provider]}'
         )
-    runs = session.execute(select(db.WorkflowRunRecord)).scalars().all()
-    run_counts = Counter(run.status for run in runs)
+    run_counts = dict(session.execute(
+        select(db.WorkflowRunRecord.status, func.count()).group_by(db.WorkflowRunRecord.status)
+    ).all())
     lines.extend(
         [
             "# HELP flowops_dag_runs Workflow runs by status",
@@ -490,8 +495,9 @@ def metrics_endpoint(
     )
     for state in scheduler.RUN_STATUSES:
         lines.append(f'flowops_dag_runs{{status="{state}"}} {run_counts.get(state, 0)}')
-    steps = session.execute(select(db.WorkflowStepRunRecord)).scalars().all()
-    step_counts = Counter(step.status for step in steps)
+    step_counts = dict(session.execute(
+        select(db.WorkflowStepRunRecord.status, func.count()).group_by(db.WorkflowStepRunRecord.status)
+    ).all())
     lines.extend(
         [
             "# HELP flowops_dag_steps Workflow step attempts by status",
@@ -1958,8 +1964,57 @@ def decide_workflow_step(
     item_id: int,
     action: Literal["approve", "reject"],
     payload: ApprovalDecisionIn,
+    response: Response,
     actor: Actor = Depends(_admin_actor),
     session: Session = Depends(db.get_session),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+) -> WorkflowRunOut:
+    # Authenticate and authorize before a reservation can be replayed.
+    run = session.get(db.WorkflowRunRecord, run_id)
+    if run is None:
+        raise HTTPException(404, "Workflow run not found.")
+    _require_workflow_run_access(session, actor, run)
+    item = session.get(db.ChecklistItemRecord, item_id)
+    if item is None or item.request_id != run.request_id:
+        raise HTTPException(404, "Checklist item not found.")
+    _validate_idempotency_key(idempotency_key)
+    scope = idempotency.SCOPE_APPROVAL
+    key = ("approval:" + hashlib.sha256(json.dumps([
+        _actor_tenant(actor), actor.subject, idempotency_key
+    ], separators=(",", ":")).encode()).hexdigest()) if idempotency_key else None
+    fingerprint = hashlib.sha256(json.dumps([
+        run_id, item_id, action, payload.reason.strip()
+    ], separators=(",", ":")).encode()).hexdigest()
+    owner, replay = _reserve_idempotency_key(
+        session, response, key, fingerprint, scope, str(run.request_id)
+    )
+    if replay is not None:
+        return WorkflowRunOut.model_validate(replay["workflow_run"])
+    try:
+        result = _decide_workflow_step(session, run_id, item_id, action, payload, actor)
+        if key and owner:
+            if not _complete_idempotency_key(
+                session, key, owner, fingerprint, scope, str(result.request_id),
+                {"workflow_run": result.model_dump(mode="json")},
+            ):
+                raise HTTPException(409, "Decision reservation changed; retry.")
+        else:
+            session.commit()
+        return result
+    except Exception:
+        session.rollback()
+        if key and owner:
+            _release_idempotency_key(session, key, owner)
+        raise
+
+
+def _decide_workflow_step(
+    session: Session,
+    run_id: int,
+    item_id: int,
+    action: Literal["approve", "reject"],
+    payload: ApprovalDecisionIn,
+    actor: Actor,
 ) -> WorkflowRunOut:
     reason = payload.reason.strip()
     if len(reason) < 3:
@@ -2000,8 +2055,7 @@ def decide_workflow_step(
         detail=f"step '{item.step}'; reason={reason}", actor_subject=actor.subject,
     )
     scheduler.tick(session, run.id, worker_id="console-transition", commit=False)
-    session.commit()
-    session.refresh(run)
+    session.flush()
     return _workflow_run_out(session, run)
 
 
@@ -3046,6 +3100,10 @@ def list_audit_trail(
     session: Session = Depends(db.get_session),
     status_filter: Optional[str] = Query(default=None, alias="status"),
     actor_filter: Optional[str] = Query(default=None, alias="actor"),
+    action: Optional[str] = Query(default=None, max_length=64),
+    ticket_id: Optional[str] = Query(default=None, max_length=64),
+    created_from: Optional[datetime] = Query(default=None, alias="from"),
+    created_to: Optional[datetime] = Query(default=None, alias="to"),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> list[ExecutionLogOut]:
@@ -3060,6 +3118,14 @@ def list_audit_trail(
         query = query.where(db.ExecutionLogRecord.status == status_filter)
     if actor_filter:
         query = query.where(db.ExecutionLogRecord.actor_subject == actor_filter)
+    if action:
+        query = query.where(db.ExecutionLogRecord.action.startswith(action, autoescape=True))
+    if ticket_id:
+        query = query.where(db.ExecutionLogRecord.ticket_id == ticket_id)
+    if created_from is not None:
+        query = query.where(db.ExecutionLogRecord.created_at >= created_from)
+    if created_to is not None:
+        query = query.where(db.ExecutionLogRecord.created_at < created_to)
     records = session.execute(
         query.order_by(db.ExecutionLogRecord.id.desc()).offset(offset).limit(limit)
     ).scalars().all()

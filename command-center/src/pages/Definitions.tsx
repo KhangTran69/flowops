@@ -8,6 +8,8 @@ import { RecordTable } from '../components/RecordTable'
 import { StatusBadge } from '../components/StatusBadge'
 import { Confirm } from '../components/Confirm'
 
+import type { WorkflowDefinition } from '../lib/contracts'
+
 const template = `{
   "key": "my-workflow",
   "name": "My workflow",
@@ -28,10 +30,10 @@ const template = `{
 }`
 
 export default function Definitions() {
-  const { data, error, status, loading, reload } = usePoll<any>('/workflow-definitions')
+  const { data, error, status, loading, reload } = usePoll<WorkflowDefinition[]>('/workflow-definitions')
   const { role } = useSession()
   const [open, setOpen] = useState(false); const [json, setJson] = useState(template); const [busy, setBusy] = useState(false)
-  const rows = asList<any>(data)
+  const rows = data || []
   async function create() {
     let payload: any
     try { payload = JSON.parse(json) } catch { alert('Invalid JSON.'); return }

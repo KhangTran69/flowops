@@ -8,12 +8,14 @@ import { BackLink, PageHeader, ProgressBar } from '../components/Basics'
 import { StatusBadge } from '../components/StatusBadge'
 import { Confirm } from '../components/Confirm'
 
+import type { OnboardingRequest, WorkflowRun } from '../lib/contracts'
+
 export default function RequestDetail() {
   const { id } = useParams()
-  const request = usePoll<any>(`/onboarding-requests/${id}`)
-  const run = usePoll<any>(`/onboarding-requests/${id}/run`)
+  const request = usePoll<OnboardingRequest>(`/onboarding-requests/${id}`)
+  const run = usePoll<WorkflowRun>(`/onboarding-requests/${id}/run`)
   const [open, setOpen] = useState(false); const [busy, setBusy] = useState(false)
-  const noRun = run.status === 404 || (!run.loading && !run.data && run.error)
+  const noRun = run.status === 404
   async function start() {
     setBusy(true); const r = await mutate('POST', `/onboarding-requests/${id}/run`, {}, 'Workflow run started.'); setBusy(false)
     if (r.ok) { setOpen(false); run.reload() }
@@ -24,7 +26,7 @@ export default function RequestDetail() {
     <DataState loading={request.loading} error={request.error} status={request.status} onRetry={request.reload}>
       <div className="grid gap-5 lg:grid-cols-3">
         <section className="card p-4 lg:col-span-2"><h2 className="mb-3 font-semibold">Request</h2><dl className="grid gap-3 sm:grid-cols-2">
-          {[['Employee', request.data?.employee_name], ['Email', request.data?.employee_email], ['Department', request.data?.department], ['Type', request.data?.request_type], ['Effective date', request.data?.start_date], ['Created', fmtDate(request.data?.created_at)]].map(([k, v]) => <div key={String(k)}><dt className="label">{k}</dt><dd>{v || '—'}</dd></div>)}
+          {[['Employee', request.data?.employee_name], ['Email', request.data?.employee_email], ['Department', request.data?.department], ['Type', request.data?.request_type], ['Effective date', request.data?.start_date]].map(([k, v]) => <div key={String(k)}><dt className="label">{k}</dt><dd>{v || '—'}</dd></div>)}
         </dl></section>
         <section className="card p-4"><h2 className="mb-3 font-semibold">Workflow run</h2>
           {noRun ? <><p className="muted mb-3">No run has been started for this request.</p><button className="btn btn-primary" onClick={() => setOpen(true)}><Play size={14} /> Start run</button></> :
