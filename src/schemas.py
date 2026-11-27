@@ -39,7 +39,17 @@ class Ticket(BaseModel):
     queue: Optional[str] = None
 
 
+class ManualTicketIn(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    requester_id: StrictInt = Field(ge=1, le=2147483647)
+    title: StrictStr = Field(min_length=3, max_length=500)
+    description: StrictStr = Field(min_length=3, max_length=10000)
+    requester_email: Optional[StrictStr] = Field(default=None, max_length=254, pattern=r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+
 class TicketDetailOut(Ticket):
+    description: Optional[str] = None
+    requester_email: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     closed_at: Optional[datetime] = None
