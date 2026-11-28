@@ -668,3 +668,20 @@ def test_workforce_abandoned_claims_consume_attempt_budget(workforce_client, mon
     with db.SessionLocal() as session:
         row = session.execute(select(db.WorkforceAutomationEventRecord)).scalar_one()
         assert row.delivery_status == "FAILED" and row.attempts == MAX_ATTEMPTS
+
+
+def test_workforce_retry_does_not_replace_active_delivery_lease(workforce_client):
+    client, set_actor = workforce_client
+    _, _ = _approved_request(client, set_actor)
+    with db.SessionLocal() as session:
+        row = session.execute(select(db.WorkforceAutomationEventRecord)).scalar_one()
+        event_id = row.event_id
+        row.workflow_status = "FAILED"
+        row.lease_token = "active-worker"
+        row.lease_until = db.utcnow() + timedelta(seconds=60)
+        session.commit()
+    response = client.post(f"/workforce/automation/events/{event_id}/retry")
+    assert response.status_code == 409
+    with db.SessionLocal() as session:
+        row = session.execute(select(db.WorkforceAutomationEventRecord)).scalar_one()
+        assert row.lease_token == "active-worker" and row.workflow_status == "FAILED"

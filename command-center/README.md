@@ -161,3 +161,9 @@ browser release gate remains open.
 Workforce preview now supports task assignment, due dates, completion notes and status, draft employee changes, employee status, asset return notes and inventory status. Provisioning completion is restricted to automation outcomes; simulation requires the simulated adapter. Production browser access and real delivery retries remain disabled.
 
 Workforce lifecycle follow-up adds employee profile edits and approval comments; existing role and tenant boundaries still apply. The API rejects cross-tenant draft transfers, serializes workforce state changes and rejects conflicting provider callbacks. Abandoned outbox claims consume the retry budget; live HTTP redirects are not accepted. A real provider-backed browser session remains a release prerequisite.
+
+Protected browser tests now verify workforce proxy and route denial for the
+signed synthetic operator. Workforce section navigation moves focus to the
+new section heading; production identity remains gated. Manual keyboard and
+screen-reader checks are still required. Failed automation retries must not
+replace an active delivery lease.
