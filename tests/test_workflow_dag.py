@@ -497,3 +497,16 @@ def test_ui_renders_dependencies_blocker_badge_and_output(client, monkeypatch):
     page = client.get(f"/ui/onboarding-requests/{request_id}").text
     assert "Step output" in page
     assert "u-42" in page
+
+
+def test_any_join_requires_one_completed_and_no_unknown_dependencies():
+    states = {
+        "a": onboarding.StepState("a", "completed"),
+        "b": onboarding.StepState("b", "pending"),
+    }
+    ready = onboarding.StepState("join", "pending", depends_on=("a", "b"), join_mode="any")
+    assert onboarding.is_step_ready(ready, states)
+    unknown = onboarding.StepState("join", "pending", depends_on=("a", "missing"), join_mode="any")
+    assert not onboarding.is_step_ready(unknown, states)
+    states["a"] = onboarding.StepState("a", "failed")
+    assert not onboarding.is_step_ready(ready, states)

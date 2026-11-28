@@ -255,3 +255,50 @@ def test_postgres_definition_migration_cannot_race_offboarding_claim(client, mon
     assert rejected.status_code == 409
     assert "execution rules" in rejected.json()["detail"]
     assert client.get(f"/onboarding-requests/{request_id}").json()["definition_version"] == 2
+
+
+def test_postgres_offboarding_definition_honors_any_join_and_root_predicate(client, monkeypatch):
+    calls = []
+
+    def fake(step_key, email):
+        calls.append(step_key)
+        return {"action": step_key}
+
+    monkeypatch.setattr(onboarding_routes, "offboarding_executor", fake)
+    key = "offboarding-conditional-join"
+    steps = [
+        {"key": "recover_laptop", "step": "Recover laptop", "queue": "it-hardware"},
+        {"key": "disable_user_account", "step": "Disable account", "queue": "it-access-management", "requires_approval": True},
+        {"key": "revoke_licenses", "step": "Revoke licenses", "queue": "it-software",
+         "depends_on": ["recover_laptop", "disable_user_account"], "join": "any"},
+        {"key": "archive_mailbox", "step": "Archive mailbox", "queue": "it-messaging",
+         "when": ["output.user_id is not null"]},
+    ]
+    definition = client.post(
+        "/workflow-definitions",
+        json={"key": key, "name": "Conditional offboarding", "request_type": "offboarding", "steps": steps},
+    )
+    assert definition.status_code == 200, definition.text
+    assert client.post(f"/workflow-definitions/{key}/publish", json={"version": 1}).status_code == 200
+    assert client.put(f"/workflow-definitions/{key}", json={"steps": steps}).status_code == 200
+    draft_request = client.post(
+        "/onboarding-requests", json={**OFFBOARDING, "definition_key": key, "definition_version": 2},
+    )
+    assert draft_request.status_code == 409
+    created = client.post("/onboarding-requests", json={**OFFBOARDING, "definition_key": key})
+    assert created.status_code == 201, created.text
+    body = created.json()
+    statuses = {item["step_key"]: item["status"] for item in body["checklist"]}
+    assert statuses["archive_mailbox"] == "skipped"
+    assert statuses["revoke_licenses"] == "blocked"
+    prefix = f"/offboarding-requests/{body['id']}/steps"
+    assert client.post(f"{prefix}/archive_mailbox/complete").status_code == 409
+    assert client.post(f"{prefix}/revoke_licenses/complete").status_code == 409
+    assert calls == []
+    assert client.post(f"{prefix}/recover_laptop/complete").status_code == 201
+    current = client.get(f"/onboarding-requests/{body['id']}").json()
+    statuses = {item["step_key"]: item["status"] for item in current["checklist"]}
+    assert statuses["disable_user_account"] == "pending"
+    assert statuses["revoke_licenses"] == "pending"
+    assert client.post(f"{prefix}/revoke_licenses/complete").status_code == 201
+    assert calls == ["recover_laptop", "revoke_licenses"]

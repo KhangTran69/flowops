@@ -189,16 +189,19 @@ def step_dependencies(step: Mapping[str, Any]) -> list[str]:
 def initial_status_for(step: Mapping[str, Any]) -> str:
     """Status a freshly created step starts in.
 
-    Steps without prerequisites are immediately actionable; steps with
-    prerequisites wait in ``blocked`` until the graph resolver promotes them.
+    Steps with prerequisites or predicates wait in ``blocked`` until the
+    graph resolver determines whether they are actionable or skipped.
     """
-    return STATUS_BLOCKED if step_dependencies(step) else STATUS_PENDING
+    return STATUS_BLOCKED if step_dependencies(step) or step.get("when") else STATUS_PENDING
 
 
 def unmet_prerequisites(
     step: StepState, states: Mapping[str, StepState]
 ) -> list[str]:
-    """Prerequisite keys that have not reached ``completed`` yet."""
+    """Return unsatisfied prerequisites according to the declared join."""
+    if step.join_mode == "any" and all(key in states for key in step.depends_on):
+        if any(states[key].status == STATUS_COMPLETED for key in step.depends_on):
+            return []
     return [
         key
         for key in step.depends_on
@@ -207,7 +210,7 @@ def unmet_prerequisites(
 
 
 def is_step_ready(step: StepState, states: Mapping[str, StepState]) -> bool:
-    """True when every prerequisite step is ``completed``.
+    """True when the declared prerequisite join is satisfied.
 
     Unknown prerequisites are treated as unsatisfied (fail closed): a graph
     referencing a missing node must never accidentally unblock work.

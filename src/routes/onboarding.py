@@ -259,6 +259,12 @@ def migrate_definition(
             )
             session.add(item)
         else:
+            if item.status in ("pending", "blocked"):
+                old_rules = (json.loads(item.depends_on_json or "[]"), item.join_mode or "all",
+                             json.loads(item.when_json or "[]"))
+                new_rules = (step["depends_on"], step["join"], step["when"])
+                if old_rules != new_rules:
+                    item.status = initial_status_for(step)
             item.step = step["step"]
             item.queue = step["queue"]
             item.requires_approval = bool(step.get("requires_approval", False))
@@ -850,6 +856,16 @@ def complete_offboarding_step(
             f"(current status: '{item.status}'). Approve it via "
             "POST /onboarding-requests/{request_id}/items/{item_id}/approve.",
         )
+
+    if not item.requires_approval and item.status != "pending":
+        log("rejected", "failure", f"step is not pending (status '{item.status}')")
+        session.execute(
+            delete(table).where(
+                table.id == claim.id, table.status == "running", table.owner_token == owner_token,
+            )
+        )
+        session.commit()
+        raise HTTPException(409, f"Step '{step_key}' must be pending before completion (status '{item.status}').")
 
     try:
         result_payload = offboarding_executor(step_key, record.employee_email)
