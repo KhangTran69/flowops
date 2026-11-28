@@ -47,6 +47,11 @@ PY
 
 cleanup() {
   local code=$?
+  if [[ $code -ne 0 ]]; then
+    docker inspect --format 'Rehearsal container state: {{.State.Status}} (exit {{.State.ExitCode}})' "$REHEARSAL_CONTAINER" >&2 || true
+    # Only the disposable restore container: do not dump source DB logs or SQL.
+    docker logs --tail 60 "$REHEARSAL_CONTAINER" >&2 || true
+  fi
   docker rm -f "$REHEARSAL_CONTAINER" >/dev/null 2>&1 || true
   docker compose unpause "${WRITER_SERVICES[@]}" >/dev/null 2>&1 || true
   rm -rf -- "$WORK_DIR"
@@ -127,14 +132,21 @@ docker run -d --name "$REHEARSAL_CONTAINER" --network "$COMPOSE_NETWORK" \
   -e POSTGRES_DB=flowops -e POSTGRES_USER=flowops -e POSTGRES_PASSWORD=flowops \
   ${REHEARSAL_HOST_PORT:+-p "127.0.0.1:${REHEARSAL_HOST_PORT}:5432"} \
   postgres:16-alpine >/dev/null
-for _ in $(seq 1 60); do
-  if docker exec "$REHEARSAL_CONTAINER" pg_isready -U flowops -d flowops >/dev/null 2>&1; then
+# Probe the final TCP listener with an authenticated query. The official
+# PostgreSQL image uses a socket-only temporary init server, which may answer
+# both pg_isready and local-socket queries before shutting down.
+server_ready() {
+  docker exec -e PGPASSWORD=flowops "$REHEARSAL_CONTAINER" \
+    psql -h 127.0.0.1 -U flowops -d flowops -v ON_ERROR_STOP=1 -tAc "SELECT 1" >/dev/null 2>&1
+}
+for _ in $(seq 1 120); do
+  if server_ready; then
     break
   fi
   sleep 1
 done
-docker exec "$REHEARSAL_CONTAINER" pg_isready -U flowops -d flowops >/dev/null
-docker exec -i "$REHEARSAL_CONTAINER" psql -U flowops -d flowops \
+server_ready || { echo "Rehearsal postgres never became ready." >&2; exit 1; }
+docker exec -i -e PGPASSWORD=flowops "$REHEARSAL_CONTAINER" psql -h 127.0.0.1 -U flowops -d flowops \
   -v ON_ERROR_STOP=1 -q < "${WORK_DIR}/dump.sql" > /dev/null
 stage "restore" "$START"
 
