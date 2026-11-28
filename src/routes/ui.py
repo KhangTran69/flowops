@@ -204,7 +204,11 @@ def ui_tickets(
         query = query.where(db.TicketRecord.tenant_key == tenant_key)
     records = session.execute(query).scalars().all()
     tickets = [Ticket.model_validate(row, from_attributes=True) for row in records]
-    tickets.sort(key=lambda ticket: int(ticket.ticket_id))
+    # Ticket IDs are opaque strings (the API contract is String(64); trigger
+    # deliveries mint ids like "trig-<key>-<hex>"), so numeric-looking ids
+    # sort numerically and everything else sorts lexically after them.
+    tickets.sort(key=lambda ticket: (0, int(ticket.ticket_id), "")
+                 if ticket.ticket_id.isdigit() else (1, 0, ticket.ticket_id))
     return web.render(
         request,
         "tickets.html",

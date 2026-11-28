@@ -44,6 +44,23 @@ def test_landing_renders_design_and_live_counts(client):
     assert "/ui/onboarding-requests" in page
 
 
+def test_ticket_ui_sorts_non_numeric_ids_without_erroring(client):
+    """Ticket ids are opaque strings; the UI must not 500 on them."""
+    assert client.post("/tickets", json=TICKET).status_code == 201
+    with db.SessionLocal() as session:
+        session.add(db.TicketRecord(
+            ticket_id="trig-demo-source-abcd1234", requester_id=7,
+            title="Triggered ticket", status="open", priority="normal",
+        ))
+        session.commit()
+    response = client.get("/ui/tickets")
+    assert response.status_code == 200
+    page = response.text
+    assert "Laptop will not start" in page
+    assert "Triggered ticket" in page
+    assert page.index("Laptop will not start") < page.index("Triggered ticket")
+
+
 def test_static_assets_are_served(client):
     css = client.get("/static/css/app.css")
     js = client.get("/static/js/app.js")
