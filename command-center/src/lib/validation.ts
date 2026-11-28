@@ -40,6 +40,12 @@ const analyticsHealth = z.object({
   stuck_runs: z.array(z.object({ run_id: integer, request_id: integer, tenant_key: nullableText, definition_key: text, heartbeat_at: text, age_seconds: z.number().nonnegative(), reason: text })),
 })
 
+const eventSource = z.object({ key: text, name: text, active: z.boolean(), created_at: text, tenant_key: nullableText, global_scope: z.boolean(), secret_generated: z.boolean() })
+const trigger = z.object({ key: text, name: text, source_key: text, event_type: text, target_type: text, definition_key: nullableText, mapping_json: z.record(text, z.unknown()), schedule_kind: text, interval_seconds: integer.nullable(), daily_at_utc: nullableText, active: z.boolean(), last_fired_at: nullableText, created_at: text, updated_at: text })
+const triggerDelivery = z.object({ id: integer, trigger_key: text, event_id: text, status: text, request_id: nullableText, received_at: text, processed_at: nullableText })
+const triggerPreview = z.object({ trigger_key: text, target_type: text, mapped_payload: z.record(text, z.unknown()) })
+const knowledgeArticle = z.object({ id: text, title: text, category: text, keywords: z.array(text), steps: z.array(text), summary: text })
+
 export type Triage = z.infer<typeof triage>
 
 export function responseSchema(method: string, path: string): z.ZodType | undefined {
@@ -48,6 +54,12 @@ export function responseSchema(method: string, path: string): z.ZodType | undefi
   if (path === '/analytics/summary') return analyticsSummary
   if (path === '/analytics/steps') return z.array(analyticsStep)
   if (path === '/analytics/health') return analyticsHealth
+  if (path === '/event-sources') return z.array(eventSource)
+  if (path === '/triggers') return method === 'GET' ? z.array(trigger) : trigger
+  if (/^\/triggers\/[^/]+\/deliveries$/.test(path)) return z.array(triggerDelivery)
+  if (/^\/triggers\/[^/]+\/test$/.test(path)) return triggerPreview
+  if (/^\/triggers\/[^/]+$/.test(path)) return trigger
+  if (path === '/knowledge-base') return z.array(knowledgeArticle)
   if (path === '/command-center/deliveries') return z.array(z.object({ id: integer, ticket_id: nullableText, status: z.enum(['pending', 'failed']), attempts: integer.nonnegative(), created_at: text }))
   if (path === '/tickets') return method === 'GET' ? z.array(ticket) : ticket
   if (path === '/tickets/manual') return ticket

@@ -23,7 +23,8 @@ const GET_PATHS = [
   rr('/workflow-definitions'),
   rr(`/workflow-definitions/${SEG}`), rr(`/workflow-definitions/${SEG}/diff`),
   rr('/execution-logs'), rr('/audit'),
-  rr('/analytics/summary'), rr('/analytics/steps'), rr('/analytics/health'),
+  rr('/analytics/summary'), rr('/analytics/steps'), rr('/analytics/health'), rr('/knowledge-base'),
+  rr('/event-sources'), rr('/triggers'), rr(`/triggers/${SEG}`), rr(`/triggers/${SEG}/deliveries`),
 ]
 const OPERATOR_POST = [
   rr('/tickets'), rr('/tickets/manual'), rr(`/tickets/${SEG}/ai-triage`),
@@ -38,8 +39,10 @@ const ADMIN_POST = [
   rr(`/workflow-jobs/${SEG}/cancel`),
   rr(`/notifications/${SEG}/requeue`),
   rr('/workflow-definitions'), rr('/workflow-definitions/validate'), rr(`/workflow-definitions/${SEG}/publish`),
+  rr('/triggers'), rr(`/triggers/${SEG}/test`),
 ]
-const ADMIN_PUT = [rr(`/workflow-definitions/${SEG}`)]
+const ADMIN_PUT = [rr(`/workflow-definitions/${SEG}`), rr(`/triggers/${SEG}`)]
+const GLOBAL_ADMIN_PATHS = [rr('/event-sources'), rr('/triggers'), rr(`/triggers/${SEG}`), rr(`/triggers/${SEG}/(deliveries|test)`)]
 
 function configured() { return Boolean(API_URL && (!DEV || API_TOKEN)) }
 
@@ -116,6 +119,7 @@ app.post('/api/flowops', async (req, res) => {
   try { actor = await identity(req) } catch { return res.status(503).json({ ok: false, status: 503, error: 'Identity verification unavailable.' }) }
   if (!actor) return res.status(401).json({ ok: false, status: 401, error: 'Authentication required.' })
   const { role } = actor
+  if (GLOBAL_ADMIN_PATHS.some(r => r.test(p)) && (role !== 'admin' || actor.tenant_key != null)) return res.status(403).json({ ok: false, status: 403, error: 'Global administrator access required.' })
   if (method !== 'GET' && role === 'viewer') return res.status(403).json({ ok: false, status: 403, error: 'Viewers cannot perform this action.' })
   if (adminOnly(method, p) && role !== 'admin') return res.status(403).json({ ok: false, status: 403, error: 'Admin role required.' })
   const url = new URL(API_URL + p)
