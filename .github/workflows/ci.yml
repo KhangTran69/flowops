@@ -185,6 +185,7 @@ jobs:
         env:
           FLOWOPS_DATABASE_URL: postgresql+psycopg://flowops:flowops@127.0.0.1:5432/flowops
           FLOWOPS_DISPOSABLE_BENCHMARK: '1'
+          FLOWOPS_BENCHMARK_REPORT: benchmark-console.json
           FLOWOPS_AUTH_REQUIRED: 'false'
           FLOWOPS_UI_AUTH_REQUIRED: 'false'
           FLOWOPS_ENVIRONMENT: development
@@ -193,7 +194,19 @@ jobs:
           FLOWOPS_AUTOMATION_ADAPTER: simulated
         run: |
           alembic upgrade head
+          python -m scripts.benchmark_queue
+          python -m scripts.benchmark_queue_arrivals
           python -m scripts.benchmark_console
+      - name: Upload PostgreSQL benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: postgres-console-benchmark
+          path: |
+            benchmark-console.json
+            benchmark-queue.json
+            benchmark-queue-arrivals.json
+          if-no-files-found: warn
 
   command-center:
     runs-on: ubuntu-latest
