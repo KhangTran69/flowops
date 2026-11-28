@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Link, NavLink, useLocation } from 'react-router-dom'
-import { Activity, BookOpen, ClipboardList, FileText, GitBranch, LayoutDashboard, ListTree, Menu, Moon, ShieldCheck, Sun, Ticket, Workflow, X } from 'lucide-react'
+import { Activity, BarChart3, BookOpen, ClipboardList, FileText, GitBranch, LayoutDashboard, ListTree, Menu, Moon, ShieldCheck, Sun, Ticket, Workflow, X } from 'lucide-react'
 import { useSession } from '../lib/session'
 import { usePoll } from '../hooks/usePoll'
 import { cn } from '../lib/utils'
@@ -17,6 +17,7 @@ const nav = [
   { to: '/definitions', label: 'Definitions', icon: GitBranch },
   { to: '/audit', label: 'Audit', icon: FileText },
   { to: '/deliveries', label: 'Deliveries', icon: Activity },
+  { to: '/analytics', label: 'Analytics', icon: BarChart3 },
 ]
 
 export function Layout({ children }: { children: ReactNode }) {

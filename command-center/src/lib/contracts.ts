@@ -138,3 +138,24 @@ export type ActionExecution = {
 }
 export type ExecutionLog = { id: number; run_id: string; action: string; status: string; ticket_id: string | null; duration_ms: number; detail: string | null; actor_subject: string | null; correlation_id: string | null; created_at: string }
 export type Readiness = { status: string; database: string }
+
+export type AnalyticsCounts = { total: number; by_status: Record<string, number> }
+export type AnalyticsSummary = {
+  window: { days: number; tenant_key: string | null }
+  runs: AnalyticsCounts & {
+    completion_rate: number | null; failure_rate: number | null; active: number
+    oldest_active_seconds: number | null; median_duration_seconds: number | null; p95_duration_seconds: number | null
+  }
+  approvals: AnalyticsCounts
+  sla: AnalyticsCounts & { breached: number; overdue_pending: number; breach_rate: number | null; median_overrun_seconds: number | null }
+  by_definition: { definition_key: string; request_type: string; runs: number; completed: number; failed: number; median_seconds: number | null; p95_seconds: number | null }[]
+  by_tenant: { tenant_key: string; requests: number }[]
+}
+export type AnalyticsStep = {
+  step: string; succeeded: number; failed: number; attempts: number; failure_rate: number | null
+  median_seconds: number | null; p95_seconds: number | null; sample: number; ranked: boolean
+}
+export type AnalyticsHealth = {
+  threshold_minutes: number; tenant_key: string | null; stuck_count: number
+  stuck_runs: { run_id: number; request_id: number; tenant_key: string | null; definition_key: string; heartbeat_at: string; age_seconds: number; reason: string }[]
+}

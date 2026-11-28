@@ -181,9 +181,22 @@ def main():
         expect(dialog).not_to_be_visible(timeout=15000)
         expect(page.get_by_text('cancelled', exact=True)).to_be_visible(timeout=15000)
         print('JOBS_PORT_PASS /jobs', flush=True)
+        page.goto(base + '/analytics')
+        expect(page.get_by_role('heading', name='Run analytics and SLA reporting')).to_be_visible()
+        expect(page.get_by_text('History: 30 days', exact=True)).to_be_visible(timeout=15000)
+        expect(page.get_by_role('heading', name='Workflow health')).to_be_visible()
+        expect(page.get_by_role('heading', name='Step bottlenecks')).to_be_visible()
+        page.get_by_label('History window').select_option('7')
+        page.get_by_label('Stale threshold').select_option('15')
+        page.get_by_role('button', name='Update view').click()
+        expect(page.get_by_text('History: 7 days', exact=True)).to_be_visible(timeout=15000)
+        expect(page.get_by_text('Stale after 15 minutes', exact=True)).to_be_visible(timeout=15000)
+        page.set_viewport_size({'width': 390, 'height': 844})
+        expect(page.get_by_role('heading', name='Run analytics and SLA reporting')).to_be_visible()
+        print('ANALYTICS_PORT_PASS /analytics', flush=True)
         axe_path = os.environ.get('FLOWOPS_AXE_PATH')
         if axe_path:
-            for route, heading in [('/tickets', 'Tickets'), ('/definitions', 'Workflow definitions'), ('/deliveries', 'Notification deliveries'), ('/jobs', 'Workflow jobs')]:
+            for route, heading in [('/tickets', 'Tickets'), ('/definitions', 'Workflow definitions'), ('/deliveries', 'Notification deliveries'), ('/jobs', 'Workflow jobs'), ('/analytics', 'Run analytics and SLA reporting')]:
                 page.set_viewport_size({'width': 1280, 'height': 900})
                 page.goto(base + route)
                 expect(page.get_by_role('heading', name=heading, exact=True)).to_be_visible()

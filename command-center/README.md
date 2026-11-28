@@ -122,7 +122,7 @@ operator value:
   operator action, and per-row admin `Requeue` with confirm; typed
   `NotificationDelivery` contract + runtime validation + browser-smoke
   journey seeding real dead-letter/pending fixtures)
-- [ ] **Analytics** (`/ui/analytics`) — summary cards, step bottlenecks,
+- [x] **Analytics** (`/ui/analytics`) — summary cards, step bottlenecks,
   tenant/window filters
 - [ ] **Triggers** (`/ui/triggers`, trigger detail) — source config, delivery
   history, test-fire

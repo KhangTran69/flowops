@@ -22,11 +22,32 @@ const job = z.object({ id: integer, job_type: text, status: text, attempts: inte
 const actionExecution = z.object({ id: integer, request_id: integer, checklist_item_id: integer, action: text, actor_subject: nullableText, adapter: text, correlation_id: text, attempt: integer, status: text, error_category: nullableText, error_detail: nullableText, external_reference: nullableText, started_at: text, completed_at: nullableText, duration_ms: integer.nullable() }).passthrough()
 const triage = z.object({ ticket_id: text, summary: z.object({ text, urgency_signals: z.array(text) }).passthrough(), recommendations: z.array(z.object({ id: text, kind: text, title: text, current: nullableText, suggested: nullableText, rationale: text, confidence: integer, applicable: z.boolean() }).passthrough()), knowledge_base: z.array(z.object({ score: integer, article: z.object({ id: text, title: text, summary: text, category: text }).passthrough() }).passthrough()), adapter: text, generated_at: text }).passthrough()
 
+const count = integer.nonnegative()
+const duration = z.number().nonnegative().nullable()
+const rate = z.number().min(0).max(1).nullable()
+const analyticsCounts = z.object({ total: count, by_status: z.record(text, count) })
+const analyticsSummary = z.object({
+  window: z.object({ days: integer.positive(), tenant_key: nullableText }),
+  runs: analyticsCounts.extend({ completion_rate: rate, failure_rate: rate, active: count, oldest_active_seconds: duration, median_duration_seconds: duration, p95_duration_seconds: duration }),
+  approvals: analyticsCounts,
+  sla: analyticsCounts.extend({ breached: count, overdue_pending: count, breach_rate: rate, median_overrun_seconds: duration }),
+  by_definition: z.array(z.object({ definition_key: text, request_type: text, runs: count, completed: count, failed: count, median_seconds: duration, p95_seconds: duration })),
+  by_tenant: z.array(z.object({ tenant_key: text, requests: count })),
+})
+const analyticsStep = z.object({ step: text, succeeded: count, failed: count, attempts: count, failure_rate: rate, median_seconds: duration, p95_seconds: duration, sample: count, ranked: z.boolean() })
+const analyticsHealth = z.object({
+  threshold_minutes: integer.positive(), tenant_key: nullableText, stuck_count: count,
+  stuck_runs: z.array(z.object({ run_id: integer, request_id: integer, tenant_key: nullableText, definition_key: text, heartbeat_at: text, age_seconds: z.number().nonnegative(), reason: text })),
+})
+
 export type Triage = z.infer<typeof triage>
 
 export function responseSchema(method: string, path: string): z.ZodType | undefined {
   if (path === '/ready') return z.object({ status: text, database: text })
   if (path === '/command-center/summary') return summary
+  if (path === '/analytics/summary') return analyticsSummary
+  if (path === '/analytics/steps') return z.array(analyticsStep)
+  if (path === '/analytics/health') return analyticsHealth
   if (path === '/command-center/deliveries') return z.array(z.object({ id: integer, ticket_id: nullableText, status: z.enum(['pending', 'failed']), attempts: integer.nonnegative(), created_at: text }))
   if (path === '/tickets') return method === 'GET' ? z.array(ticket) : ticket
   if (path === '/tickets/manual') return ticket
