@@ -248,6 +248,8 @@ def update_connector(
     _validate_connector_config(
         payload.connector_type, payload.config, payload.tenant_key
     )
+    if record.tenant_key != payload.tenant_key or record.connector_type != payload.connector_type:
+        raise HTTPException(409, "Connector tenant and provider type are immutable; create a new connector.")
     record.name = payload.name
     record.connector_type = payload.connector_type
     record.kind = cls.kind
@@ -327,7 +329,10 @@ async def connector_webhook(
     except (_json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise HTTPException(400, "Request body is not valid JSON.") from exc
 
-    events = connector.parse_webhook(payload)
+    try:
+        events = connector.parse_webhook(payload)
+    except (TypeError, ValueError) as error:
+        raise HTTPException(422, "Invalid connector event envelope.") from error
     if len(events) > MAX_EVENTS_PER_BATCH:
         raise HTTPException(
             status_code=413, detail="Event batch exceeds the 100-event limit."
