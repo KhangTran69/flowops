@@ -23,6 +23,7 @@ const GET_PATHS = [
   rr('/workflow-definitions'),
   rr(`/workflow-definitions/${SEG}`), rr(`/workflow-definitions/${SEG}/diff`),
   rr('/execution-logs'), rr('/audit'),
+  rr('/analytics/summary'), rr('/analytics/steps'), rr('/analytics/health'),
 ]
 const OPERATOR_POST = [
   rr('/tickets'), rr('/tickets/manual'), rr(`/tickets/${SEG}/ai-triage`),

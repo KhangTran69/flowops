@@ -18,6 +18,7 @@ import Definitions from './pages/Definitions'
 import DefinitionDetail from './pages/DefinitionDetail'
 import Audit from './pages/Audit'
 import Deliveries from './pages/Deliveries'
+import Analytics from './pages/Analytics'
 import './index.css'
 
 createRoot(document.getElementById('root')!).render(
@@ -40,6 +41,7 @@ createRoot(document.getElementById('root')!).render(
             <Route path="/definitions/:key" element={<DefinitionDetail />} />
             <Route path="/audit" element={<Audit />} />
             <Route path="/deliveries" element={<Deliveries />} />
+            <Route path="/analytics" element={<Analytics />} />
             <Route path="*" element={<div className="card p-6">Page not found.</div>} />
           </Routes>
         </Layout>
