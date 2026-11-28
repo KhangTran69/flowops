@@ -48,7 +48,8 @@ def _claim(session):
             or_(db.WorkforceAutomationEventRecord.lease_until.is_(None),
                 db.WorkforceAutomationEventRecord.lease_until < now),
         ).values(delivery_status="FAILED", lease_token=None, lease_until=None,
-                 last_error="Attempt budget exhausted after abandoned ownership; reconcile before retry."))
+                 last_error="Attempt budget exhausted after abandoned ownership; reconcile before retry.")
+            .execution_options(synchronize_session=False))
         session.commit()
         return None
     lease_token = uuid.uuid4().hex
@@ -179,10 +180,11 @@ def run_once(*, timeout: float = 10.0) -> dict | None:
             db.WorkforceAutomationEventRecord.delivery_status == "PENDING",
             db.WorkforceAutomationEventRecord.lease_token == lease_token,
             db.WorkforceAutomationEventRecord.lease_until > now,
-        ).values(**values))
+        ).values(**values).execution_options(synchronize_session=False))
         if updated.rowcount != 1:
             session.rollback()
             return {"event_id": event_id, "status": "lease_lost"}
+        session.refresh(event)
         if success and mode == "simulated":
             from src.routes.workforce import _complete_provisioning
             event = session.get(db.WorkforceAutomationEventRecord, event_row_id)

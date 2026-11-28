@@ -322,7 +322,8 @@ def update_employee(employee_id: int, payload: EmployeeIn,
 def update_employee_status(employee_id: int, payload: EmployeeStatusIn,
     actor: Actor = Depends(role_actor("HR")), session: Session = Depends(db.get_session)):
     employee = session.execute(_scope(select(db.EmployeeRecord).where(
-        db.EmployeeRecord.id == employee_id).with_for_update().execution_options(populate_existing=True), db.EmployeeRecord, actor)).scalar_one_or_none()
+        db.EmployeeRecord.id == employee_id).with_for_update().execution_options(populate_existing=True),
+        db.EmployeeRecord, actor)).scalar_one_or_none()
     if employee is None:
         raise HTTPException(404, "Employee not found.")
     if payload.status == "TERMINATED":
@@ -345,7 +346,8 @@ def update_employee_status(employee_id: int, payload: EmployeeStatusIn,
 @router.post("/onboarding-requests", status_code=201)
 def create_request(payload: RequestIn, actor: Actor = Depends(role_actor("HR")), session: Session = Depends(db.get_session)):
     employee = session.execute(_scope(select(db.EmployeeRecord).where(
-        db.EmployeeRecord.id == payload.employee_id).with_for_update().execution_options(populate_existing=True), db.EmployeeRecord, actor)).scalar_one_or_none()
+        db.EmployeeRecord.id == payload.employee_id).with_for_update().execution_options(populate_existing=True),
+        db.EmployeeRecord, actor)).scalar_one_or_none()
     if not employee or employee.status != "ACTIVE":
         raise HTTPException(404, "Active employee not found.")
     existing = session.execute(_scope(select(db.StaffOnboardingRecord.id).where(
@@ -419,7 +421,8 @@ def update_draft(request_id: int, payload: DraftUpdateIn,
     # Lock the target employee before the request, matching approval and
     # termination ordering. Never transfer an existing request across tenants.
     employee = session.execute(_scope(select(db.EmployeeRecord).where(
-        db.EmployeeRecord.id == payload.employee_id).with_for_update().execution_options(populate_existing=True), db.EmployeeRecord, actor)).scalar_one_or_none()
+        db.EmployeeRecord.id == payload.employee_id).with_for_update().execution_options(populate_existing=True),
+        db.EmployeeRecord, actor)).scalar_one_or_none()
     row = _request_row(session, request_id, actor, lock=True)
     if row is None or row.employee_id != original_employee_id:
         raise HTTPException(409, "Draft changed concurrently.")
@@ -447,7 +450,8 @@ def update_draft(request_id: int, payload: DraftUpdateIn,
 def submit_request(request_id: int, actor: Actor = Depends(role_actor("HR")), session: Session = Depends(db.get_session)):
     initial, _ = _request(session, request_id, actor)
     employee = session.execute(_scope(select(db.EmployeeRecord).where(
-        db.EmployeeRecord.id == initial.employee_id).with_for_update().execution_options(populate_existing=True), db.EmployeeRecord, actor)).scalar_one_or_none()
+        db.EmployeeRecord.id == initial.employee_id).with_for_update().execution_options(populate_existing=True),
+        db.EmployeeRecord, actor)).scalar_one_or_none()
     row = _request_row(session, request_id, actor, lock=True)
     if row is None or employee is None or row.employee_id != employee.id or row.tenant_key != employee.tenant_key:
         raise HTTPException(409, "Draft changed concurrently.")
@@ -473,7 +477,8 @@ def _decide(request_id: int, actor: Actor, session: Session, decision: str, comm
     if initial is None:
         raise HTTPException(404, "Onboarding request not found.")
     employee = session.execute(_scope(select(db.EmployeeRecord).where(
-        db.EmployeeRecord.id == initial.employee_id).with_for_update().execution_options(populate_existing=True), db.EmployeeRecord, actor)).scalar_one_or_none()
+        db.EmployeeRecord.id == initial.employee_id).with_for_update().execution_options(populate_existing=True),
+        db.EmployeeRecord, actor)).scalar_one_or_none()
     row = _request_row(session, request_id, actor, lock=True)
     if row is None or employee is None or row.employee_id != employee.id:
         raise HTTPException(404, "Onboarding request not found.")
@@ -548,7 +553,8 @@ def cancel_request(request_id: int, actor: Actor = Depends(role_actor("HR")), se
 def copy_rejected(request_id: int, actor: Actor = Depends(role_actor("HR")), session: Session = Depends(db.get_session)):
     source, employee = _request(session, request_id, actor)
     employee = session.execute(_scope(select(db.EmployeeRecord).where(
-        db.EmployeeRecord.id == employee.id).with_for_update().execution_options(populate_existing=True), db.EmployeeRecord, actor)).scalar_one_or_none()
+        db.EmployeeRecord.id == employee.id).with_for_update().execution_options(populate_existing=True),
+        db.EmployeeRecord, actor)).scalar_one_or_none()
     if employee is None or employee.status != "ACTIVE":
         raise HTTPException(409, "Only active employees can be copied to a draft.")
     if source.status != "REJECTED":
@@ -700,7 +706,8 @@ def update_asset_status(asset_id: int, payload: AssetStatusIn,
 def assign_asset(asset_id: int, payload: AssignIn,
                  actor: Actor = Depends(role_actor("IT_ADMIN")), session: Session = Depends(db.get_session)):
     employee = session.execute(_scope(select(db.EmployeeRecord).where(
-        db.EmployeeRecord.id == payload.employee_id).with_for_update().execution_options(populate_existing=True), db.EmployeeRecord, actor)).scalar_one_or_none()
+        db.EmployeeRecord.id == payload.employee_id).with_for_update().execution_options(populate_existing=True),
+        db.EmployeeRecord, actor)).scalar_one_or_none()
     if employee is None or employee.status != "ACTIVE":
         raise HTTPException(404, "Active employee not found.")
     asset_update = update(db.ITAssetRecord).where(
