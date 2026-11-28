@@ -8,8 +8,8 @@ overwrite a takeover or double-finalize the row.
 import json
 import os
 import uuid
-from typing import Any
 from datetime import datetime, timedelta
+from typing import Any
 
 from sqlalchemy import and_, or_, select, true, update
 from sqlalchemy.orm import Session
