@@ -376,3 +376,40 @@ def test_worker_does_not_adopt_replacement_claim_after_rollback(client, monkeypa
         assert current.status == "running"
         assert current.attempts == 2
         assert current.last_error is None
+
+
+def test_exhausted_abandoned_claim_is_terminalized_without_another_attempt(client):
+    with db.SessionLocal() as session:
+        row = jobs.enqueue_job(session, job_type=jobs.JOB_TRIGGER_EXECUTE, payload={}, max_attempts=1)
+        session.commit()
+        job_id = row.id
+        at = db.utcnow()
+        claimed = jobs.claim_job(session, "abandoned", now=at, lease_seconds=1)
+        assert claimed is not None
+        expired = at + timedelta(seconds=2)
+        assert jobs.claim_job(session, "too-late", now=expired) is None
+        terminal = jobs.reap_exhausted_job(session, now=expired)
+        assert terminal is not None and terminal.id == job_id
+        assert terminal.attempts == 1 and terminal.status == "failed"
+        assert terminal.lease_owner_token is None
+        session.commit()
+        assert jobs.reap_exhausted_job(session, now=expired) is None
+
+
+def test_worker_recovers_exhausted_lease_without_calling_adapter(client, monkeypatch):
+    request_id, item_id = _create_onboarding_item(client)
+    adapter = FakeAdapter()
+    monkeypatch.setattr(worker, "ACTION_ADAPTER", adapter)
+    with db.SessionLocal() as session:
+        row = jobs.enqueue_job(session, job_type=jobs.JOB_ONBOARDING_ITEM,
+            payload={"request_id": request_id, "item_id": item_id}, max_attempts=1)
+        session.commit()
+        claimed = jobs.claim_job(session, "abandoned", lease_seconds=1)
+        assert claimed is not None
+        claimed.lease_expires_at = db.utcnow() - timedelta(seconds=1)
+        session.commit()
+    recovered = worker.run_once()
+    assert recovered is not None and recovered.status == "failed"
+    assert recovered.attempts == 1 and adapter.calls == []
+    item = next(row for row in client.get(f"/onboarding-requests/{request_id}").json()["checklist"] if row["id"] == item_id)
+    assert item["status"] == "failed"

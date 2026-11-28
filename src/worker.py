@@ -12,6 +12,7 @@ Or as a polling daemon:
 import argparse
 import hashlib
 import json
+import logging
 import signal
 import threading
 import time
@@ -20,6 +21,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from src import db, definitions, jobs, scheduler, triggers, workflow
@@ -255,7 +257,7 @@ def _cascade_terminal_failure(session: Session, payload: dict[str, Any]) -> None
     if item_id is None or request_id is None:
         return
     item = session.get(db.ChecklistItemRecord, int(item_id))
-    if item is None or item.status == "completed":
+    if item is None or item.request_id != int(request_id) or item.status in {"completed", "skipped", "cancelled"}:
         return
     item.status = "failed"
     items = session.execute(
@@ -570,6 +572,26 @@ def run_once(
     db._ensure_tables()
     session = db.SessionLocal()
     try:
+        exhausted = jobs.reap_exhausted_job(session)
+        if exhausted is not None:
+            try:
+                payload = json.loads(exhausted.payload_json)
+                if not isinstance(payload, dict):
+                    payload = {}
+            except (TypeError, ValueError):
+                payload = {}
+            if exhausted.job_type == JOB_ONBOARDING_ITEM:
+                _cascade_terminal_failure(session, payload)
+                scheduler.advance_from_job(session, exhausted, success=False, error=jobs.EXHAUSTED_LEASE_ERROR)
+            elif exhausted.job_type == JOB_TRIGGER_EXECUTE:
+                delivery = session.get(db.TriggerDeliveryRecord, payload.get("delivery_id"))
+                if delivery is not None and delivery.status in {"received", "queued"}:
+                    triggers.update_delivery(session, delivery, status="failed", error=jobs.EXHAUSTED_LEASE_ERROR)
+            db.log_execution(session, run_id=_new_run_id(), action="workflow.job.exhausted",
+                             status="failure", duration_ms=0, detail=f"job #{exhausted.id}; reconciliation required",
+                             actor_subject="workflow-worker")
+            session.commit()
+            return exhausted
         job = jobs.claim_job(
             session, worker_id, lease_seconds=lease_seconds
         )
@@ -627,12 +649,22 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
+    failures = 0
     while not stopping:
-        job = run_once(
-            worker_id=worker_id,
-            lease_seconds=args.lease_seconds,
-            heartbeat_interval=args.heartbeat_interval,
-        )
+        try:
+            job = run_once(
+                worker_id=worker_id,
+                lease_seconds=args.lease_seconds,
+                heartbeat_interval=args.heartbeat_interval,
+            )
+            failures = 0
+        except OperationalError as error:
+            if args.once:
+                raise
+            failures = min(failures + 1, 6)
+            logging.getLogger(__name__).warning("Workflow database temporarily unavailable: %s", type(error).__name__)
+            time.sleep(min(30.0, max(0.1, args.poll_interval) * 2 ** failures))
+            continue
         if job is not None:
             print(f"{job.id} {job.status} {job.job_type}", flush=True)
             if args.once:
