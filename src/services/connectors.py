@@ -262,7 +262,7 @@ class SlackConnector(SourceConnector):
 
     def verify_webhook(self, request, body: bytes) -> bool:
         if not self.signing_secret:
-            return True
+            return False
         signature = request.headers.get("x-slack-signature", "")
         timestamp = request.headers.get("x-slack-request-timestamp", "")
         if not signature or not timestamp:
@@ -276,11 +276,11 @@ class SlackConnector(SourceConnector):
         import hmac
         import secrets
 
-        base = f"v0:{timestamp}:{body.decode('utf-8', 'replace')}"
+        base = b"v0:" + timestamp.encode() + b":" + body
         expected = "v0=" + hmac.new(
-            self.signing_secret.encode(), base.encode(), hashlib.sha256
+            self.signing_secret.encode(), base, hashlib.sha256
         ).hexdigest()
-        return secrets.compare_digest(signature, expected)
+        return secrets.compare_digest(signature.encode(), expected.encode())
 
     def parse_webhook(self, payload: Any) -> list[NormalizedEvent]:
         if not isinstance(payload, dict):
@@ -288,13 +288,18 @@ class SlackConnector(SourceConnector):
         body = payload.get("event") if payload.get("type") == "event_callback" else payload
         if not isinstance(body, dict):
             return []
-        if body.get("type") == "url_verification" or body.get("subtype") == "bot_message":
+        if payload.get("type") == "url_verification" or body.get("type") == "url_verification" or body.get("subtype") == "bot_message":
             return []
+        identity = body.get("ts") or body.get("event_ts") or payload.get("event_id")
+        if not isinstance(identity, str) or not identity.strip() or len(identity) > 255:
+            raise ValueError("Slack delivery requires a stable event identity.")
+        if not isinstance(body.get("text") or "", str):
+            raise ValueError("Slack message text must be a string.")
         return [
             NormalizedEvent(
                 source=self.name,
                 event_type="message_posted",
-                external_id=str(body.get("ts") or body.get("event_ts") or uuid.uuid4()),
+                external_id=identity,
                 payload={
                     "channel": body.get("channel"),
                     "user": body.get("user"),
@@ -316,11 +321,14 @@ class MSTeamsConnector(SourceConnector):
         if not isinstance(payload, dict):
             return []
         text = payload.get("text") or payload.get("message") or ""
+        identity = payload.get("id")
+        if not isinstance(identity, str) or not identity.strip() or len(identity) > 255 or not isinstance(text, str):
+            raise ValueError("Teams delivery requires a stable ID and text message.")
         return [
             NormalizedEvent(
                 source=self.name,
                 event_type="message_posted",
-                external_id=str(payload.get("id") or uuid.uuid4()),
+                external_id=identity,
                 payload={
                     "summary": payload.get("summary"),
                     "themeColor": payload.get("themeColor"),
@@ -350,15 +358,22 @@ class GenericJsonConnector(SourceConnector):
             items = [payload]
         else:
             return []
+        if not isinstance(items, list):
+            raise ValueError("Connector events must be a list.")
         events = []
         for item in items:
             if not isinstance(item, dict):
-                continue
+                raise ValueError("Each connector event must be an object.")
+            identity = item.get("id")
+            if not isinstance(identity, str) or not identity.strip() or len(identity) > 255:
+                raise ValueError("Connector event requires a stable ID.")
+            if not isinstance(item.get("payload", {}), dict):
+                raise ValueError("Connector event payload must be an object.")
             events.append(
                 NormalizedEvent(
                     source=str(item.get("source") or self.name)[:40],
                     event_type=str(item.get("type") or "event")[:80],
-                    external_id=str(item.get("id") or uuid.uuid4())[:255],
+                    external_id=identity,
                     payload=item.get("payload") or {},
                     tenant_key=item.get("tenant"),
                     title=str(item.get("title") or "")[:200],

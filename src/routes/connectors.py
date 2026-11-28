@@ -327,7 +327,10 @@ async def connector_webhook(
     except (_json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise HTTPException(400, "Request body is not valid JSON.") from exc
 
-    events = connector.parse_webhook(payload)
+    try:
+        events = connector.parse_webhook(payload)
+    except (TypeError, ValueError) as error:
+        raise HTTPException(422, "Invalid connector event envelope.") from error
     if len(events) > MAX_EVENTS_PER_BATCH:
         raise HTTPException(
             status_code=413, detail="Event batch exceeds the 100-event limit."

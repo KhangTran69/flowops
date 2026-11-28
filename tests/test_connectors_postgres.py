@@ -39,3 +39,36 @@ def test_concurrent_event_insert_returns_duplicate(database):
     assert len({row["event_id"] for row in results}) == 1
     with db.SessionLocal() as session:
         assert len(session.execute(select(db.EventRecord)).scalars().all()) == 1
+
+
+def test_postgres_concurrent_poll_claims_fetch_once(database, monkeypatch):
+    from datetime import datetime, timezone
+    from threading import Event
+
+    with db.SessionLocal() as session:
+        session.add(db.ConnectorRecord(name="Synthetic polling source", connector_type="jira",
+            kind="polling", enabled=True, config_json="{}"))
+        session.commit()
+    entered, release = Event(), Event()
+    calls = []
+
+    class FakeConnector:
+        def fetch_events(self, session):
+            calls.append(1)
+            entered.set()
+            assert release.wait(timeout=10)
+            return [connectors.NormalizedEvent("jira", "issue_updated", "one", {})]
+
+    monkeypatch.setattr(connectors, "build_connector", lambda *args, **kwargs: FakeConnector())
+    at = datetime.now(timezone.utc)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(connectors.poll_all_connectors, at)
+        try:
+            assert entered.wait(timeout=10)
+            second = pool.submit(connectors.poll_all_connectors, at)
+            assert second.result(timeout=10) == 0
+        finally:
+            release.set()
+        assert first.result(timeout=10) == 1
+    assert calls == [1]
+    assert connectors.poll_all_connectors(at) == 0
