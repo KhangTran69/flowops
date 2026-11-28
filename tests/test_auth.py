@@ -316,8 +316,8 @@ def test_signed_entra_claims_fail_closed_on_ambiguous_identity(monkeypatch):
         monkeypatch.setattr(_authenticate_jwt, "cache", {}, raising=False)
 
         class BadResponse(Response):
-            def json(self):
-                return {"keys": bad_keys}
+            def json(self, keys=bad_keys):
+                return {"keys": keys}
 
         monkeypatch.setattr("src.auth.requests.get", lambda *args, **kwargs: BadResponse())
         with pytest.raises(AuthenticationError):
