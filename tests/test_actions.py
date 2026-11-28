@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from src import api, db
 from src.actions import ActionResult
 from src.notify import DeliveryResult
-from src.routes import onboarding as onboarding_routes
+from src.services import onboarding as onboarding_service
 
 VALID_REQUEST = {
     "request_type": "onboarding",
@@ -49,7 +49,7 @@ def test_action_retries_and_logs_failure(client, monkeypatch):
             calls.append(action)
             raise RuntimeError("Microsoft service unavailable")
 
-    monkeypatch.setattr(onboarding_routes, "ACTION_ADAPTER", FailingAdapter())
+    monkeypatch.setattr(onboarding_service, "ACTION_ADAPTER", FailingAdapter())
     request = client.post("/onboarding-requests", json=VALID_REQUEST).json()
     item = request["checklist"][1]
     response = client.post(f"/onboarding-requests/{request['id']}/items/{item['id']}/execute")
@@ -70,7 +70,7 @@ def test_action_adapter_can_succeed_after_retries(client, monkeypatch):
                 raise RuntimeError("temporary failure")
             return ActionResult(action, "adapter succeeded")
 
-    monkeypatch.setattr(onboarding_routes, "ACTION_ADAPTER", EventuallySuccessfulAdapter())
+    monkeypatch.setattr(onboarding_service, "ACTION_ADAPTER", EventuallySuccessfulAdapter())
     request = client.post("/onboarding-requests", json=VALID_REQUEST).json()
     item = request["checklist"][1]
     response = client.post(f"/onboarding-requests/{request['id']}/items/{item['id']}/execute")
@@ -187,7 +187,7 @@ def test_per_action_retry_limit_and_failure_notification(client, monkeypatch):
         notifications.append((url, payload))
         return DeliveryResult(True, 1, None)
 
-    monkeypatch.setattr(onboarding_routes, "ACTION_ADAPTER", FailingAdapter())
+    monkeypatch.setattr(onboarding_service, "ACTION_ADAPTER", FailingAdapter())
     monkeypatch.setenv("FLOWOPS_ACTION_RETRIES", '{"provision_hardware": 2}')
     monkeypatch.setenv("FLOWOPS_ACTION_FAILURE_WEBHOOK_URL", "https://alerts.example/flowops")
     monkeypatch.setattr(api, "deliver_webhook", fake_deliver)
@@ -223,7 +223,7 @@ def test_action_execution_audit_records_retries(client, monkeypatch):
         def execute(self, action, context):
             raise RuntimeError("temporary adapter failure")
 
-    monkeypatch.setattr(onboarding_routes, "ACTION_ADAPTER", FailingAdapter())
+    monkeypatch.setattr(onboarding_service, "ACTION_ADAPTER", FailingAdapter())
     request = client.post("/onboarding-requests", json=VALID_REQUEST).json()
     item = request["checklist"][1]
     response = client.post(f"/onboarding-requests/{request['id']}/items/{item['id']}/execute")
