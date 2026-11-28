@@ -78,8 +78,9 @@ jobs:
         run: mypy src/definitions.py src/expressions.py src/graph.py src/jobs.py src/outbox.py src/ticket_processor.py
 
   docker-postgres:
-
-    runs-on: ubuntu-latest
+    # ubuntu-24.04 pin, same as console-browser: the screenshot step's
+    # Playwright 1.51 has no chromium build for ubuntu-26.04 runners.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: Validate development compose configuration
@@ -98,6 +99,32 @@ jobs:
           echo "$response"
           echo "$response" | grep -q '"priority":"urgent"'
           echo "$response" | grep -q '"queue":"it-network"'
+      - name: Seed the demo dataset and assert key rows
+        run: |
+          docker compose exec -T app python -m scripts.seed_demo
+          # A second run must be a no-op (idempotency of the seed itself).
+          docker compose exec -T app python -m scripts.seed_demo | grep -q 'already present'
+          docker compose exec -T postgres psql -U flowops -d flowops -tAc \
+            "SELECT count(*) FROM tickets WHERE tenant_key = 'demo'" | grep -qx '30'
+          docker compose exec -T postgres psql -U flowops -d flowops -tAc \
+            "SELECT count(*) FROM workflow_runs" | grep -qx '2'
+          docker compose exec -T postgres psql -U flowops -d flowops -tAc \
+            "SELECT count(*) FROM workflow_jobs WHERE status = 'failed'" | grep -qx '1'
+          docker compose exec -T postgres psql -U flowops -d flowops -tAc \
+            "SELECT count(*) FROM notification_outbox WHERE status = 'failed'" | grep -qx '1'
+      - name: Run the guided demo journey
+        run: ./scripts/demo_smoke.sh --journey
+      - name: Capture demo screenshots
+        run: |
+          python -m pip install --quiet playwright==1.51.0
+          python -m playwright install --with-deps chromium
+          python scripts/capture_demo_screenshots.py
+      - name: Upload demo screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-screenshots
+          path: docs/assets/*.png
+          if-no-files-found: error
       - name: Collect service logs
         if: always()
         run: docker compose logs

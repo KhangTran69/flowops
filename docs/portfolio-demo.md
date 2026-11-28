@@ -20,6 +20,78 @@ The tenant proof covers the direct ticket-read API boundary only; it is not a
 complete authorization audit. Microsoft Graph and external provider behavior
 remain simulated. The UI walkthrough below is an optional follow-on.
 
+## Guided journey: a day in the life
+
+With the **full compose stack** running (worker, scheduler, timers, and
+outbox services, not a bare `uvicorn`), the seeded dataset supports a
+six-stop guided journey with per-stop narration:
+
+```bash
+docker compose up -d --wait
+docker compose exec app python -m scripts.seed_demo
+./scripts/demo_smoke.sh --journey
+```
+
+The stops, in order:
+
+1. **A ticket arrives** — intake validates, classifies `network`/`urgent`,
+   routes to `it-network`, and persists an execution log; the replayed
+   request is served idempotently (`Idempotency-Replayed: true`).
+2. **An event fires a trigger** — the journey rotates the seeded
+   `demo-source` webhook secret, signs a new-hire event (HMAC over
+   `timestamp.body`), and the durable job queue turns the delivery into an
+   onboarding request pinned to `onboarding-dag`.
+3. **A workflow run takes over** — a request created through the API starts
+   a versioned DAG run; the scheduler enqueues every ready step as a
+   durable, leased job.
+4. **The human approval gate holds** — approval-required steps stay pending
+   until the journey approves them; only then do the step jobs run.
+5. **An SLA timer escalates** — the seeded paused run's first step breached
+   its SLA about 90 seconds after seeding; the timers service logs
+   `onboarding.step.overdue`, re-queues the step to `it-management`, and
+   writes an escalation notification. The run itself stays paused, awaiting
+   its operator.
+6. **Analytics reflects the day** — `/ui/analytics` shows runs by status,
+   approval counts, SLA timers, tenants, and step bottlenecks.
+
+Point the journey at a deployed stack with
+`FLOWOPS_DEMO_URL=https://… FLOWOPS_DEMO_TOKEN=… ./scripts/demo_smoke.sh
+--journey`. The screenshots in `docs/assets/` are captured from a seeded
+stack with `python scripts/capture_demo_screenshots.py` (set
+`FLOWOPS_CONSOLE_URL` to a running command-center server to include the
+React console pages).
+
+## Seeding the demo dataset
+
+An empty database shows empty dashboards. Seed a plausible dataset first:
+
+```bash
+python -m scripts.seed_demo          # no-op if the demo data already exists
+python -m scripts.seed_demo --reset  # clear every table and reseed from scratch
+```
+
+The seed writes everything through the normal SQLAlchemy models (no schema
+bypass), works on SQLite and PostgreSQL, and creates:
+
+- the `demo` tenant, six employees, and three assigned laptop assets;
+- 30 tickets routed by the real rule set (`src/routing.py`) across all six
+  queues, with a mix of open/closed and urgent/high/normal priorities;
+- one onboarding run mid-flight (two steps done, one approved and queued as a
+  durable job) and one paused run awaiting approval, with a pending SLA timer;
+- one exhausted (failed) workflow job and one dead-letter notification so the
+  jobs and notifications pages show failure handling;
+- two published workflow definitions matching the built-in DAG templates.
+
+With the compose stack running, seed it inside the app container:
+
+```bash
+docker compose exec app python -m scripts.seed_demo
+```
+
+All adapters stay simulated; no external system is contacted. The
+`docker-postgres` CI job runs the seed against the PostgreSQL stack and
+asserts the key rows exist.
+
 ## Five-minute path
 
 | Time | Show | What the viewer should notice |
