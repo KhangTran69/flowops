@@ -1,17 +1,17 @@
-"""Onboarding/offboarding workflow routes (extracted from src/api.py).
+"""Onboarding/offboarding workflow routes (v0.5-v1.3 surface).
 
-Workflow definitions CRUD/validate/publish/diff/migrate, onboarding and
-offboarding requests, run start/control, step decisions, the durable item
-transitions, the offboarding completion ledger, and M365 status. Route
-bodies, response models, status codes, and idempotency semantics are
-unchanged; ``scripts/dump_openapi.py`` + the committed
-``tests/openapi_snapshot.json`` keep the OpenAPI surface byte-identical
-across this decomposition.
+Requests and their checklists, run start/control, step decisions, the
+offboarding completion ledger, and M365 status. The business logic lives in
+``src.services.onboarding`` (item transitions, run-control idempotency,
+step decisions) and ``src.routes.definitions`` (definition CRUD/versioning);
+this module keeps the routes and the request-creation path. Route bodies,
+response models, status codes, and idempotency semantics are unchanged;
+``scripts/dump_openapi.py`` + the committed ``tests/openapi_snapshot.json``
+keep the OpenAPI surface byte-identical across this decomposition.
 
-Shared api.py helpers (idempotency protocol, tenant scoping, action
-configuration) are imported via the established ``src.routes`` late-import
-pattern: api.py registers this router at the bottom of its module, after
-those names exist.
+Shared api.py helpers (idempotency protocol, tenant scoping) are imported
+via the established ``src.api`` late-import pattern: api.py registers these
+routers at the bottom of its module, after those names exist.
 """
 
 import hashlib
@@ -25,19 +25,15 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from fastapi import status as http_status
-from pydantic import BaseModel, Field
 from sqlalchemy import delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src import db, definitions, idempotency, scheduler, timers, ui_session, workflow
-from src.actions import ActionAdapter, ActionError, action_for_step, adapter_from_environment
 from src.api import (  # noqa: E402
     IDEMPOTENCY_PROCESSING_TIMEOUT,
     IDEMPOTENCY_SCOPE_ONBOARDING,
-    _action_attempts,
     _complete_idempotency_key,
-    _notify_action_failure,
     _release_idempotency_key,
     _request_fingerprint,
     _reserve_idempotency_key,
@@ -54,253 +50,105 @@ from src.deps import (
     _require_workflow_run_access,
 )
 from src.m365_simulator import M365Simulator
-from src.onboarding import checklist_for, initial_status_for
+from src.onboarding import initial_status_for
 from src.schemas import (
     ActionExecutionOut,
-    ChecklistItemOut,
-    DefinitionCreateIn,
     DefinitionMigrationIn,
-    DefinitionPublishIn,
-    DefinitionVersionIn,
-    DefinitionVersionOut,
     M365StatusOut,
     OffboardingCompletionOut,
     OffboardingStepResultOut,
     OnboardingRequestIn,
     OnboardingRequestOut,
     OnboardingStatusSummaryOut,
-    WorkflowDefinitionOut,
-    WorkflowEventOut,
     WorkflowRunOut,
-    WorkflowStepRunOut,
+)
+from src.services.onboarding import (
+    ApprovalDecisionIn,
+    _create_onboarding_request,
+    _decide_workflow_step,
+    _execute_item,
+    _load_checklists,
+    _load_request,
+    _request_out,
+    _run_action,
+    _transition_item,
+    _workflow_run_out,
 )
 
 router = APIRouter()
 
-# v0.6 action boundary: the adapter that executes checklist actions. Tests
-# monkeypatch this module attribute with failing/succeeding doubles.
-ACTION_ADAPTER: ActionAdapter = adapter_from_environment()
-
-# Routes: onboarding/offboarding workflows
-
-
-def _request_out(
-    record: db.OnboardingRequestRecord, items: list[db.ChecklistItemRecord]
+@router.post(
+    "/onboarding-requests",
+    response_model=OnboardingRequestOut,
+    status_code=http_status.HTTP_201_CREATED,
+)
+def create_onboarding_request(
+    request: OnboardingRequestIn,
+    response: Response,
+    actor: Actor = Depends(_operator_actor),
+    session: Session = Depends(db.get_session),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> OnboardingRequestOut:
-    return OnboardingRequestOut(
-        **{c: getattr(record, c) for c in (
-            "id", "request_type", "employee_name", "employee_email",
-            "department", "requester_id", "start_date", "status",
-            "definition_key", "definition_version", "tenant_key",
-        )},
-        checklist=[
-            ChecklistItemOut(
-                **{c: getattr(item, c) for c in (
-                    "id", "step", "step_key", "queue", "requires_approval",
-                    "status", "action",
-                )},
-                result=json.loads(item.result) if item.result else None,
-                depends_on=json.loads(item.depends_on_json)
-                if item.depends_on_json
-                else [],
-                output=json.loads(item.output_json)
-                if item.output_json
-                else None,
-                join_mode=item.join_mode or "all",
-                when=json.loads(item.when_json) if item.when_json else [],
-                sla_minutes=item.sla_minutes,
-                overdue=bool(getattr(item, "overdue", False)),
-                sla_remaining_minutes=getattr(item, "sla_remaining_minutes", None),
-                sla_due_at=getattr(item, "sla_due_at", None),
+    """Create an onboarding/offboarding request and generate its checklist.
+
+    Supports ``Idempotency-Key`` with the same fenced reservation protocol as
+    ``POST /tickets``: replays are 200, changed payloads are 409, and a stale
+    owner that loses its lease cannot finalize the takeover's reservation.
+    """
+    tenant_key = _actor_tenant(actor)
+    if tenant_key:
+        if request.tenant_key and request.tenant_key != tenant_key:
+            raise HTTPException(
+                status_code=404, detail="Onboarding request not found."
             )
-            for item in sorted(items, key=lambda i: i.id)
-        ],
-    )
-
-
-def _load_checklists(
-    session: Session, request_ids: list[int],
-) -> dict[int, list[db.ChecklistItemRecord]]:
-    grouped: dict[int, list[db.ChecklistItemRecord]] = defaultdict(list)
-    if not request_ids:
-        return grouped
-    now = db.utcnow()
-    # Keep parameter counts bounded for existing unpaginated callers.
-    for offset in range(0, len(request_ids), 500):
-        batch = request_ids[offset:offset + 500]
-        items = session.execute(
-            select(db.ChecklistItemRecord).where(db.ChecklistItemRecord.request_id.in_(batch))
-        ).scalars().all()
-        timers_by_item = {
-            row.item_id: row for row in session.execute(
-                select(db.WorkflowTimerRecord).where(
-                    db.WorkflowTimerRecord.request_id.in_(batch),
-                    db.WorkflowTimerRecord.status == "pending",
-                ).order_by(db.WorkflowTimerRecord.due_at.desc())
-            ).scalars().all()
-        }
-        for item in items:
-            timer = timers_by_item.get(item.id)
-            due = timer.due_at if timer else None
-            if due is not None and due.tzinfo is None:
-                due = due.replace(tzinfo=timezone.utc)
-            item.sla_due_at = due
-            item.overdue = due is not None and due <= now
-            item.sla_remaining_minutes = max(0, int((due - now).total_seconds() // 60)) if due is not None else None
-            grouped[item.request_id].append(item)
-    return grouped
-
-
-def _load_request(
-    session: Session, request_id: int
-) -> tuple[db.OnboardingRequestRecord, list[db.ChecklistItemRecord]]:
-    record = session.get(db.OnboardingRequestRecord, request_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="Onboarding request not found.")
-    return record, _load_checklists(session, [request_id]).get(request_id, [])
-
-
-def _definition_out(
-    session: Session, definition: db.WorkflowDefinitionRecord
-) -> WorkflowDefinitionOut:
-    versions = definitions.list_versions(session, definition.key)
-    return WorkflowDefinitionOut(
-        key=definition.key,
-        name=definition.name,
-        request_type=definition.request_type,
-        status=definition.status,
-        current_version=definition.current_version,
-        versions=[
-            DefinitionVersionOut(
-                version=row.version,
-                checksum=row.checksum,
-                steps=json.loads(row.steps_json),
-                created_by=row.created_by,
-                created_at=row.created_at,
-                published_at=row.published_at,
-            )
-            for row in versions
-        ],
-    )
-
-
-def _definition_mutation(
-    session: Session, response: Response, actor: Actor, operation: str,
-    definition_key: str, payload: BaseModel, idempotency_key: str | None,
-) -> WorkflowDefinitionOut:
-    """Use the existing fenced transaction for all definition mutations."""
+        request.tenant_key = tenant_key
     _validate_idempotency_key(idempotency_key)
-    scope = idempotency.SCOPE_DEFINITION
-    key = ("definition:" + hashlib.sha256(json.dumps(
-        [actor.subject, idempotency_key], separators=(",", ":")
-    ).encode()).hexdigest()) if idempotency_key else None
-    fingerprint = hashlib.sha256(json.dumps(
-        [operation, definition_key, payload.model_dump(mode="json")],
-        sort_keys=True, separators=(",", ":")
-    ).encode()).hexdigest()
-    owner, replay = _reserve_idempotency_key(
-        session, response, key, fingerprint, scope, definition_key, actor_subject=actor.subject
+    request_hash = _request_fingerprint(request)
+    owner_token, replay = _reserve_idempotency_key(
+        session,
+        response,
+        idempotency_key,
+        request_hash,
+        IDEMPOTENCY_SCOPE_ONBOARDING,
+        "0",
+        actor_subject=actor.subject,
     )
     if replay is not None:
-        return WorkflowDefinitionOut.model_validate(replay["definition"])
-    try:
-        if operation == "create":
-            definition = definitions.create_definition(
-                session, key=payload.key, name=payload.name,
-                request_type=payload.request_type, steps=payload.steps,
-                actor=actor.subject,
-            )
-        elif operation == "version":
-            definitions.create_version(session, definition_key, payload.steps, actor=actor.subject)
-            definition = definitions.get_definition(session, definition_key)
-        else:
-            definition = definitions.publish_version(
-                session, definition_key, payload.version, actor=actor.subject
-            )
-        if definition is None:
-            raise HTTPException(404, "Definition not found.")
-        result = _definition_out(session, definition)
-        db.log_execution(
-            session, run_id=_new_run_id(), action=f"workflow.definition.{operation}",
-            status="success", detail=f"definition={definition.key}",
-            actor_subject=actor.subject,
-        )
-        if key and owner:
-            if not _complete_idempotency_key(
-                session, key, owner, fingerprint, scope, definition.key,
-                {"definition": result.model_dump(mode="json")},
-            ):
-                raise HTTPException(409, "Definition reservation changed; retry.")
-        else:
-            session.commit()
+        result = OnboardingRequestOut.model_validate(replay["onboarding_request"])
+        record = session.get(db.OnboardingRequestRecord, result.id)
+        if record is None:
+            raise HTTPException(404, "Onboarding request not found.")
+        _require_request_access(actor, record)
         return result
-    except Exception as error:
-        session.rollback()
-        if key and owner:
-            _release_idempotency_key(session, key, owner)
-        if isinstance(error, definitions.DefinitionError):
-            raise HTTPException(422, str(error)) from error
-        if isinstance(error, IntegrityError):
-            raise HTTPException(409, "Concurrent definition change; refresh and retry.") from error
-        raise
 
-
-class DefinitionValidationIn(BaseModel):
-    request_type: Literal["onboarding", "offboarding"]
-    steps: list[dict[str, Any]] = Field(min_length=1, max_length=200)
-
-
-class DefinitionValidationOut(BaseModel):
-    steps: list[dict[str, Any]]
-    checksum: str
-
-
-@router.post("/workflow-definitions/validate", response_model=DefinitionValidationOut)
-def validate_workflow_definition(
-    payload: DefinitionValidationIn,
-    actor: Actor = Depends(_global_admin_actor),
-) -> DefinitionValidationOut:
-    """Preview the authoritative DAG validator without writing any records."""
+    ownership_lost = False
     try:
-        steps = definitions.validate_steps(payload.steps, payload.request_type)
-    except definitions.DefinitionError as error:
-        raise HTTPException(422, str(error)) from error
-    return DefinitionValidationOut(steps=steps, checksum=definitions.checksum_for(steps))
-
-
-@router.post("/workflow-definitions", response_model=WorkflowDefinitionOut)
-def create_workflow_definition(
-    payload: DefinitionCreateIn,
-    response: Response,
-    actor: Actor = Depends(_global_admin_actor),
-    session: Session = Depends(db.get_session),
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-) -> WorkflowDefinitionOut:
-    return _definition_mutation(session, response, actor, "create", payload.key, payload, idempotency_key)
-
-
-@router.put("/workflow-definitions/{key}", response_model=WorkflowDefinitionOut)
-def create_workflow_definition_version(
-    key: str,
-    payload: DefinitionVersionIn,
-    response: Response,
-    actor: Actor = Depends(_global_admin_actor),
-    session: Session = Depends(db.get_session),
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-) -> WorkflowDefinitionOut:
-    return _definition_mutation(session, response, actor, "version", key, payload, idempotency_key)
-
-
-@router.post("/workflow-definitions/{key}/publish", response_model=WorkflowDefinitionOut)
-def publish_workflow_definition(
-    key: str,
-    payload: DefinitionPublishIn,
-    response: Response,
-    actor: Actor = Depends(_global_admin_actor),
-    session: Session = Depends(db.get_session),
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-) -> WorkflowDefinitionOut:
-    return _definition_mutation(session, response, actor, "publish", key, payload, idempotency_key)
+        result = _create_onboarding_request(request, session, actor.subject)
+        if idempotency_key and owner_token is not None:
+            if not _complete_idempotency_key(
+                session,
+                idempotency_key,
+                owner_token,
+                request_hash,
+                IDEMPOTENCY_SCOPE_ONBOARDING,
+                str(result.id),
+                {"onboarding_request": result.model_dump(mode="json")},
+            ):
+                session.rollback()
+                ownership_lost = True
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Another request took over this Idempotency-Key while it was "
+                        "processing; retry the request."
+                    ),
+                )
+        return result
+    except Exception:
+        if idempotency_key and owner_token is not None and not ownership_lost:
+            session.rollback()
+            _release_idempotency_key(session, idempotency_key, owner_token)
+        raise
 
 
 @router.post("/onboarding-requests/{request_id}/definition")
@@ -398,201 +246,6 @@ def migrate_definition(
     return diff
 
 
-@router.get("/workflow-definitions", response_model=list[WorkflowDefinitionOut])
-def list_workflow_definitions(
-    actor: Actor = Depends(_global_admin_actor),
-    session: Session = Depends(db.get_session),
-) -> list[WorkflowDefinitionOut]:
-    return [
-        _definition_out(session, definition)
-        for definition in definitions.list_definitions(session)
-    ]
-
-
-@router.get("/workflow-definitions/{key}/diff")
-def compare_workflow_definition_versions(
-    key: str,
-    from_version: int = Query(alias="from", ge=1),
-    to_version: int = Query(alias="to", ge=1),
-    actor: Actor = Depends(_global_admin_actor),
-    session: Session = Depends(db.get_session),
-) -> dict[str, Any]:
-    previous = definitions.get_version(session, key, from_version)
-    current = definitions.get_version(session, key, to_version)
-    if previous is None or current is None:
-        raise HTTPException(404, "Definition version not found.")
-    before = {step["key"]: step for step in json.loads(previous.steps_json)}
-    after = {step["key"]: step for step in json.loads(current.steps_json)}
-    return {
-        "from_version": from_version,
-        "to_version": to_version,
-        "added": sorted(after.keys() - before.keys()),
-        "removed": sorted(before.keys() - after.keys()),
-        "changed": sorted(k for k in before.keys() & after.keys() if before[k] != after[k]),
-    }
-
-
-@router.get("/workflow-definitions/{key}", response_model=WorkflowDefinitionOut)
-def get_workflow_definition(
-    key: str,
-    actor: Actor = Depends(_global_admin_actor),
-    session: Session = Depends(db.get_session),
-) -> WorkflowDefinitionOut:
-    definition = definitions.get_definition(session, key)
-    if definition is None:
-        raise HTTPException(404, "Definition not found.")
-    return _definition_out(session, definition)
-
-
-def _create_onboarding_request(
-    request: OnboardingRequestIn,
-    session: Session,
-    actor_subject: str | None = None,
-) -> OnboardingRequestOut:
-    """Create the record and checklist, returning the API response shape."""
-    started = time.perf_counter()
-    if request.tenant_key:
-        tenant = session.get(db.TenantRecord, request.tenant_key)
-        if tenant is None or not tenant.active:
-            raise HTTPException(422, f"Unknown or inactive tenant: {request.tenant_key}")
-    record = db.OnboardingRequestRecord(
-        request_type=request.request_type,
-        employee_name=request.employee_name,
-        employee_email=request.employee_email,
-        department=request.department,
-        requester_id=request.requester_id,
-        start_date=request.start_date,
-        tenant_key=request.tenant_key,
-    )
-    session.add(record)
-    session.flush()
-    if request.definition_key:
-        definition, version = definitions.published_version(
-            session, request.definition_key
-        )
-        if definition.request_type != request.request_type:
-            raise HTTPException(422, "Definition request_type does not match request.")
-        if request.definition_version is not None and request.definition_version != version.version:
-            selected = definitions.get_version(
-                session, request.definition_key, request.definition_version
-            )
-            if selected is None:
-                raise HTTPException(422, "Definition version not found.")
-            version = selected
-        steps = json.loads(version.steps_json)
-        record.definition_key = definition.key
-        record.definition_version = version.version
-    else:
-        steps = checklist_for(request.request_type, template=request.template)
-    for template in steps:
-        # The template's ``key`` becomes the row's ``step_key`` column;
-        # depends_on is persisted as JSON for the graph resolver.
-        session.add(
-            db.ChecklistItemRecord(
-                request_id=record.id,
-                step_key=template["key"],
-                step=template["step"],
-                queue=template["queue"],
-                requires_approval=template["requires_approval"],
-                action=template.get("action"),
-                status=initial_status_for(template),
-                depends_on_json=json.dumps(template.get("depends_on", [])),
-                join_mode=template.get("join", "all"),
-                when_json=json.dumps(template.get("when", [])),
-                sla_minutes=template.get("sla_minutes"),
-                escalation_queue=template.get("escalation_queue"),
-            )
-        )
-    session.flush()
-    timers.sync_timers(session, record.id)
-    db.log_execution(
-        session,
-        run_id=_new_run_id(),
-        action="onboarding.request.created",
-        status="success",
-        duration_ms=int((time.perf_counter() - started) * 1000),
-        detail=f"{request.request_type} for {request.employee_name}: "
-               f"{len(steps)} checklist steps generated",
-        actor_subject=actor_subject,
-    )
-    _, items = _load_request(session, record.id)
-    return _request_out(record, items)
-
-
-@router.post(
-    "/onboarding-requests",
-    response_model=OnboardingRequestOut,
-    status_code=http_status.HTTP_201_CREATED,
-)
-def create_onboarding_request(
-    request: OnboardingRequestIn,
-    response: Response,
-    actor: Actor = Depends(_operator_actor),
-    session: Session = Depends(db.get_session),
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-) -> OnboardingRequestOut:
-    """Create an onboarding/offboarding request and generate its checklist.
-
-    Supports ``Idempotency-Key`` with the same fenced reservation protocol as
-    ``POST /tickets``: replays are 200, changed payloads are 409, and a stale
-    owner that loses its lease cannot finalize the takeover's reservation.
-    """
-    tenant_key = _actor_tenant(actor)
-    if tenant_key:
-        if request.tenant_key and request.tenant_key != tenant_key:
-            raise HTTPException(
-                status_code=404, detail="Onboarding request not found."
-            )
-        request.tenant_key = tenant_key
-    _validate_idempotency_key(idempotency_key)
-    request_hash = _request_fingerprint(request)
-    owner_token, replay = _reserve_idempotency_key(
-        session,
-        response,
-        idempotency_key,
-        request_hash,
-        IDEMPOTENCY_SCOPE_ONBOARDING,
-        "0",
-        actor_subject=actor.subject,
-    )
-    if replay is not None:
-        result = OnboardingRequestOut.model_validate(replay["onboarding_request"])
-        record = session.get(db.OnboardingRequestRecord, result.id)
-        if record is None:
-            raise HTTPException(404, "Onboarding request not found.")
-        _require_request_access(actor, record)
-        return result
-
-    ownership_lost = False
-    try:
-        result = _create_onboarding_request(request, session, actor.subject)
-        if idempotency_key and owner_token is not None:
-            if not _complete_idempotency_key(
-                session,
-                idempotency_key,
-                owner_token,
-                request_hash,
-                IDEMPOTENCY_SCOPE_ONBOARDING,
-                str(result.id),
-                {"onboarding_request": result.model_dump(mode="json")},
-            ):
-                session.rollback()
-                ownership_lost = True
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "Another request took over this Idempotency-Key while it was "
-                        "processing; retry the request."
-                    ),
-                )
-        return result
-    except Exception:
-        if idempotency_key and owner_token is not None and not ownership_lost:
-            session.rollback()
-            _release_idempotency_key(session, idempotency_key, owner_token)
-        raise
-
-
 @router.get("/onboarding-requests", response_model=list[OnboardingRequestOut])
 def list_onboarding_requests(
     session: Session = Depends(db.get_session),
@@ -646,64 +299,6 @@ def get_onboarding_request_status(
         completed_steps=completed,
         pending_approval_steps=pending_approval,
         percent_complete=percent,
-    )
-
-
-def _workflow_run_out(
-    session: Session, run: db.WorkflowRunRecord, *,
-    loaded: tuple | None = None,
-) -> WorkflowRunOut:
-    if loaded is None:
-        request, items = _load_request(session, run.request_id)
-        steps = session.execute(
-            select(db.WorkflowStepRunRecord)
-            .where(db.WorkflowStepRunRecord.run_id == run.id)
-            .order_by(db.WorkflowStepRunRecord.id)
-        ).scalars().all()
-        events = session.execute(
-            select(db.WorkflowEventRecord)
-            .where(db.WorkflowEventRecord.run_id == run.id)
-            .order_by(db.WorkflowEventRecord.id)
-        ).scalars().all()
-    else:
-        request, items, steps, events = loaded
-    return WorkflowRunOut(
-        id=run.id,
-        request_id=run.request_id,
-        status=run.status,
-        max_parallel=run.max_parallel,
-        error=run.error,
-        created_at=run.created_at,
-        started_at=run.started_at,
-        completed_at=run.completed_at,
-        checklist=_request_out(request, items).checklist,
-        definition_key=request.definition_key,
-        employee_name=request.employee_name,
-        steps=[
-            WorkflowStepRunOut(
-                id=row.id,
-                checklist_item_id=row.checklist_item_id,
-                attempt=row.attempt,
-                status=row.status,
-                job_id=row.job_id,
-                scheduled_at=row.scheduled_at,
-                started_at=row.started_at,
-                completed_at=row.completed_at,
-                output=json.loads(row.output_json) if row.output_json else None,
-                error=row.error,
-            )
-            for row in steps
-        ],
-        events=[
-            WorkflowEventOut(
-                id=event.id,
-                event_type=event.event_type,
-                step_run_id=event.step_run_id,
-                payload=json.loads(event.payload_json) if event.payload_json else None,
-                created_at=event.created_at,
-            )
-            for event in events
-        ],
     )
 
 
@@ -833,65 +428,6 @@ def list_workflow_runs(
     )) for run in runs]
 
 
-def _run_action(
-    session: Session, run_id: int, actor: Actor, action: str,
-    response: Response, idempotency_key: str | None,
-) -> WorkflowRunOut:
-    run = session.get(db.WorkflowRunRecord, run_id)
-    if run is None:
-        raise HTTPException(404, "Workflow run not found.")
-    _require_workflow_run_access(session, actor, run)
-    _validate_idempotency_key(idempotency_key)
-    scope = idempotency.SCOPE_RUN_CONTROL
-    key = ("run-control:" + hashlib.sha256(json.dumps(
-        [_actor_tenant(actor), actor.subject, idempotency_key], separators=(",", ":")
-    ).encode()).hexdigest()) if idempotency_key else None
-    fingerprint = hashlib.sha256(json.dumps([run_id, action]).encode()).hexdigest()
-    owner, replay = _reserve_idempotency_key(
-        session, response, key, fingerprint, scope, str(run.request_id),
-        actor_subject=actor.subject,
-    )
-    if replay is not None:
-        return WorkflowRunOut.model_validate(replay["workflow_run"])
-    try:
-        run = scheduler._locked_run(session, run_id)
-        if run is None:
-            raise HTTPException(404, "Workflow run not found.")
-        _require_workflow_run_access(session, actor, run)
-        allowed = {"pause": {"running", "paused"}, "resume": {"paused", "running"},
-                   "cancel": {"pending", "running", "paused", "cancelled"}}
-        if run.status not in allowed[action]:
-            raise HTTPException(409, f"Cannot {action} a run with status '{run.status}'.")
-        if action == "pause":
-            run = scheduler.pause_run(session, run_id, actor.subject)
-        elif action == "resume":
-            run = scheduler.resume_run(session, run_id, actor.subject)
-        else:
-            run = scheduler.cancel_run(session, run_id, actor.subject)
-        session.flush()
-        result = _workflow_run_out(session, run)
-        if key and owner:
-            if not _complete_idempotency_key(
-                session, key, owner, fingerprint, scope, str(result.request_id),
-                {"workflow_run": result.model_dump(mode="json")},
-            ):
-                raise HTTPException(409, "Run-control reservation changed; retry.")
-        else:
-            session.commit()
-        return result
-    except Exception as error:
-        session.rollback()
-        if key and owner:
-            _release_idempotency_key(session, key, owner)
-        if isinstance(error, LookupError):
-            raise HTTPException(404, str(error)) from error
-        raise
-
-
-class ApprovalDecisionIn(BaseModel):
-    reason: str = Field(min_length=3, max_length=1000)
-
-
 @router.post("/workflow-runs/{run_id}/steps/{item_id}/{action}", response_model=WorkflowRunOut)
 def decide_workflow_step(
     run_id: int,
@@ -942,56 +478,6 @@ def decide_workflow_step(
         raise
 
 
-def _decide_workflow_step(
-    session: Session,
-    run_id: int,
-    item_id: int,
-    action: Literal["approve", "reject"],
-    payload: ApprovalDecisionIn,
-    actor: Actor,
-) -> WorkflowRunOut:
-    reason = payload.reason.strip()
-    if len(reason) < 3:
-        raise HTTPException(422, "A decision reason is required.")
-    run = session.execute(
-        select(db.WorkflowRunRecord).where(db.WorkflowRunRecord.id == run_id).with_for_update()
-    ).scalar_one_or_none()
-    if run is None:
-        raise HTTPException(404, "Workflow run not found.")
-    _require_workflow_run_access(session, actor, run)
-    if run.status not in ("pending", "running"):
-        raise HTTPException(409, "Workflow run is not active.")
-    target = "approved" if action == "approve" else "rejected"
-    item = session.get(db.ChecklistItemRecord, item_id)
-    if item is None or item.request_id != run.request_id:
-        raise HTTPException(404, "Checklist item not found.")
-    if not item.requires_approval or item.status != "pending":
-        raise HTTPException(409, "Checklist item is not awaiting approval.")
-    changed = session.execute(
-        update(db.ChecklistItemRecord).where(
-            db.ChecklistItemRecord.id == item_id,
-            db.ChecklistItemRecord.request_id == run.request_id,
-            db.ChecklistItemRecord.requires_approval.is_(True),
-            db.ChecklistItemRecord.status == "pending",
-        ).values(status=target)
-    )
-    if changed.rowcount != 1:
-        raise HTTPException(409, "Checklist item state changed; refresh and retry.")
-    session.refresh(item)
-    _, items = _load_request(session, run.request_id)
-    workflow.apply_graph_transitions(
-        session, items, request_id=run.request_id, actor_subject=actor.subject, reason=reason
-    )
-    timers.sync_timers(session, run.request_id)
-    db.log_execution(
-        session, run_id=_new_run_id(), action=f"onboarding.item.{target}",
-        status="success", ticket_id=str(run.request_id), duration_ms=0,
-        detail=f"step '{item.step}'; reason={reason}", actor_subject=actor.subject,
-    )
-    scheduler.tick(session, run.id, worker_id="console-transition", commit=False)
-    session.flush()
-    return _workflow_run_out(session, run)
-
 
 @router.post("/workflow-runs/{run_id}/pause", response_model=WorkflowRunOut)
 def pause_workflow_run(
@@ -1024,210 +510,6 @@ def cancel_workflow_run(
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> WorkflowRunOut:
     return _run_action(session, run_id, actor, "cancel", response, idempotency_key)
-
-
-def _get_item(
-    session: Session, record: db.OnboardingRequestRecord, item_id: int
-) -> db.ChecklistItemRecord:
-    item = session.get(db.ChecklistItemRecord, item_id)
-    if item is None or item.request_id != record.id:
-        raise HTTPException(status_code=404, detail="Checklist item not found.")
-    return item
-
-
-def _transition_item(
-    session: Session,
-    request_id: int,
-    item_id: int,
-    request: Request,
-    action: Literal["approve", "complete"],
-    actor_subject: str | None = None,
-) -> OnboardingRequestOut:
-    record, items = _load_request(session, request_id)
-    item = _get_item(session, record, item_id)
-
-    if action == "approve":
-        if not item.requires_approval:
-            raise HTTPException(409, "This checklist item does not require approval.")
-        if item.status != "pending":
-            raise HTTPException(409, f"Cannot approve an item with status '{item.status}'.")
-        item.status = "approved"
-    else:
-        allowed_from = "approved" if item.requires_approval else "pending"
-        missing = workflow.missing_prerequisites(item, items)
-        if missing:
-            raise HTTPException(
-                409, workflow.blocked_status_detail(item, missing)
-            )
-        if item.status != allowed_from:
-            raise HTTPException(
-                409,
-                f"Item must be '{allowed_from}' before completion "
-                f"(current status: '{item.status}').",
-            )
-        item.status = "completed"
-    session.flush()
-
-    if action == "complete":
-        workflow.apply_graph_transitions(
-            session, items, request_id=record.id, actor_subject=actor_subject
-        )
-        timers.sync_timers(session, record.id)
-
-    db.log_execution(
-        session,
-        run_id=_new_run_id(),
-        action=f"onboarding.item.{action}d",
-        status="success",
-        duration_ms=0,
-        detail=f"step '{item.step}' of request #{record.id} is now '{item.status}'",
-        actor_subject=actor_subject,
-    )
-
-    _, items = _load_request(session, record.id)
-    if all(i.status == "completed" for i in items) and record.status != "completed":
-        record.status = "completed"
-        db.log_execution(
-            session,
-            run_id=_new_run_id(),
-            action="onboarding.request.completed",
-            status="success",
-            duration_ms=0,
-            detail=f"all checklist steps done for request #{record.id}",
-            actor_subject=actor_subject,
-        )
-    _, items = _load_request(session, record.id)
-    run = scheduler.get_run_for_request(session, record.id)
-    if run is not None:
-        scheduler.tick(session, run.id, worker_id="manual-transition", commit=False)
-    return _request_out(record, items)
-
-
-def _execute_item(
-    session: Session, request_id: int, item_id: int, actor: Actor
-) -> OnboardingRequestOut:
-    """Run one approved checklist action with bounded retries."""
-    record, items = _load_request(session, request_id)
-    _require_request_access(actor, record)
-    item = _get_item(session, record, item_id)
-    missing = workflow.missing_prerequisites(item, items)
-    if missing:
-        raise HTTPException(409, workflow.blocked_status_detail(item, missing))
-    required_status = "approved" if item.requires_approval else "pending"
-    if item.status != required_status:
-        raise HTTPException(
-            409,
-            f"Item must be '{required_status}' before execution "
-            f"(current status: '{item.status}').",
-        )
-
-    action = action_for_step(item.step)
-    correlation_id = _new_run_id()
-    context = {
-        "request_id": record.id,
-        "request_type": record.request_type,
-        "employee_name": record.employee_name,
-        "employee_email": record.employee_email,
-        "department": record.department,
-        "actor_subject": actor.subject,
-        "actor_roles": list(actor.roles),
-        "tenant_key": record.tenant_key,
-        "idempotency_key": f"onboarding-action:{record.id}:{item.id}",
-        "correlation_id": correlation_id,
-        **workflow.action_context_outputs(item, items),
-    }
-    started_at = db.utcnow()
-    started = time.perf_counter()
-    last_error = ""
-    attempts_limit = _action_attempts(action)
-    for attempt in range(1, attempts_limit + 1):
-        try:
-            result = ACTION_ADAPTER.execute(action, context)
-            completed_at = db.utcnow()
-            session.add(db.ActionExecutionRecord(
-                request_id=record.id,
-                checklist_item_id=item.id,
-                action=action,
-                actor_subject=actor.subject,
-                adapter=getattr(ACTION_ADAPTER, "adapter_name", ACTION_ADAPTER.__class__.__name__),
-                correlation_id=correlation_id,
-                attempt=attempt,
-                status="succeeded",
-                external_reference=(result.external_reference or result.detail)[:256],
-                started_at=started_at,
-                completed_at=completed_at,
-                duration_ms=int((time.perf_counter() - started) * 1000),
-            ))
-            item.status = "completed"
-            workflow.record_output(item, result.output)
-            session.flush()
-            workflow.apply_graph_transitions(
-                session, items, request_id=record.id, actor_subject=actor.subject
-            )
-            db.log_execution(
-                session,
-                run_id=_new_run_id(),
-                action=f"onboarding.action.{action}",
-                status="success",
-                duration_ms=int((time.perf_counter() - started) * 1000),
-                detail=f"attempts={attempt}; {result.detail}",
-                actor_subject=actor.subject,
-            )
-            _, items = _load_request(session, record.id)
-            if all(i.status == "completed" for i in items):
-                record.status = "completed"
-                db.log_execution(
-                    session,
-                    run_id=_new_run_id(),
-                    action="onboarding.request.completed",
-                    status="success",
-                    duration_ms=0,
-                    detail=f"all checklist steps done for request #{record.id}",
-                )
-            _, items = _load_request(session, record.id)
-            return _request_out(record, items)
-        except Exception as error:  # adapter failures must be logged and classified
-            last_error = str(error)
-            retryable = not isinstance(error, ActionError) or error.retryable
-            session.add(db.ActionExecutionRecord(
-                request_id=record.id,
-                checklist_item_id=item.id,
-                action=action,
-                actor_subject=actor.subject,
-                adapter=ACTION_ADAPTER.__class__.__name__,
-                correlation_id=correlation_id,
-                attempt=attempt,
-                status="retrying" if retryable and attempt < attempts_limit else "failed",
-                error_category=getattr(error, "category", "adapter_error"),
-                error_detail=last_error[:1000],
-                started_at=started_at,
-                completed_at=db.utcnow(),
-                duration_ms=int((time.perf_counter() - started) * 1000),
-            ))
-            if not retryable:
-                attempts_limit = attempt
-                break
-
-    item.status = "failed"
-    workflow.apply_graph_transitions(
-        session, items, request_id=record.id, actor_subject=actor.subject
-    )
-    _notify_action_failure(action, context, attempts_limit, last_error, session)
-    db.log_execution(
-        session,
-        run_id=_new_run_id(),
-        action=f"onboarding.action.{action}",
-        status="failure",
-        duration_ms=int((time.perf_counter() - started) * 1000),
-        detail=f"attempts={attempts_limit}; {last_error}",
-        actor_subject=actor.subject,
-    )
-    session.flush()
-    session.commit()
-    raise HTTPException(
-        502,
-        f"Action '{action}' failed after {attempts_limit} attempts.",
-    )
 
 
 @router.post("/onboarding-requests/{request_id}/items/{item_id}/execute")
@@ -1616,6 +898,3 @@ def get_m365_status(
     This never contacts real Microsoft services; see src/m365_simulator.py.
     """
     return M365StatusOut.model_validate(M365Simulator().get_status(user_id))
-
-
-# ---------------------------------------------------------------------------

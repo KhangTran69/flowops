@@ -553,6 +553,7 @@ def cancel_workflow_job(
 from src.routes import ai as _ai_routes  # noqa: E402
 from src.routes import analytics as _analytics_routes  # noqa: E402  (v1.5)
 from src.routes import connectors as _connector_routes  # noqa: E402  (v1.4)
+from src.routes import definitions as _definitions_routes  # noqa: E402  (v1.3 definition CRUD)
 from src.routes import monitoring as _monitoring_routes  # noqa: E402
 from src.routes import onboarding as _onboarding_routes  # noqa: E402
 from src.routes import reports as _report_routes  # noqa: E402
@@ -561,12 +562,13 @@ from src.routes import tickets as _tickets_routes  # noqa: E402
 from src.routes import triggers as _trigger_routes  # noqa: E402
 from src.routes import ui as _ui_routes  # noqa: E402  (registered last: owns the /ui catch-all)
 from src.routes import workforce as _workforce_routes  # noqa: E402
-from src.routes.onboarding import _get_item, _load_request  # noqa: E402  (used by durable-job routes below)
+from src.services.onboarding import _get_item, _load_request  # noqa: E402  (used by durable-job routes below)
 
 app.include_router(_tenant_routes.router)
 app.include_router(_report_routes.router)
 app.include_router(_ai_routes.router)
 app.include_router(_onboarding_routes.router)
+app.include_router(_definitions_routes.router)
 app.include_router(_tickets_routes.router)
 app.include_router(_connector_routes.router)
 app.include_router(_trigger_routes.router)
