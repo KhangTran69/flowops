@@ -108,6 +108,8 @@ Do not automatically downgrade a live database.
 ## Authentication and remaining release gates
 
 The Fly configuration defaults to production mode with simulated adapters.
+The release candidate still must not be made publicly accessible until the
+real identity and all remaining release gates are independently validated.
 It does not permit the previous development bearer-token or password-account
 fallback. A real Entra registration and live authentication/authorization
 validation remain mandatory. Workforce browser access and a protected React
@@ -119,12 +121,10 @@ gateway deployment remain separate acceptance criteria.
 hardening. Unlike Fly, this runs a single `prod-app` container, so
 container-start migrations stay enabled.
 
-```bash
-export FLOWOPS_SESSION_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
-export FLOWOPS_DEV_BEARER_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
-docker compose --profile prod up -d prod-app
-curl --fail http://127.0.0.1:8000/ready
-```
+Configure the required Entra, session, webhook and PostgreSQL secrets through
+the operator-approved secret store. Do not set a development bearer token in
+production. Validate a synthetic staging environment before authorizing the
+Compose profile or any public rollout.
 
 Because the profile defaults to `FLOWOPS_ENVIRONMENT=production`, it fails
 fast at startup until an Entra configuration exists (same gate as above).

@@ -7,11 +7,12 @@ the wall-clock window measured, not guessed.
 
 The rehearsal runs automatically in CI (the `docker-postgres` job step
 "Backup-restore rehearsal") and uploads its timings as the dated evidence
-artifact `backup-restore-timings`. Run it locally against any running
-compose stack with:
+artifact `backup-restore-timings`. Run only against an isolated, explicitly
+disposable synthetic compose stack with no concurrent API traffic. The script
+seeds fixtures and must never be pointed at a real tenant database:
 
 ```bash
-./scripts/backup_restore_rehearsal.sh
+FLOWOPS_DISPOSABLE_REHEARSAL=1 ./scripts/backup_restore_rehearsal.sh
 ```
 
 **What the script does, in order** (all against a running compose stack):
@@ -99,10 +100,11 @@ docker rm -f flowops-rehearsal-pg
 
 The compose network name is the project's default network
 (`<project>_default`); the script resolves it from the running postgres
-container. To restore into a *production* PostgreSQL instead of a
-throwaway container, point step 3 at the target server with `psql` and run
-step 4 from any environment that has the app code and
-`FLOWOPS_DATABASE_URL` pointed at the restored copy.
+container. Never run the disposable seed or migration downgrade checker on production.
+For an actual incident, use a separately authorized restore into a fresh
+isolated target, verify the backup checksum, schema and application checks,
+then switch traffic only after approval. Keep the old database isolated for
+forensic and rollback review.
 
 ## Recovery philosophy
 
@@ -116,3 +118,16 @@ step 4 from any environment that has the app code and
 - **What is NOT covered**: volumes outside PostgreSQL (Grafana dashboards,
   Prometheus TSDB) and anything in external systems. Those are re-provisionable;
   the FlowOps database is the state that matters.
+
+## Additional CI integrity checks
+
+Before the optional-column migration roundtrip, the rehearsal compares
+content digests of all nine selected tables, not only counts. A deliberately
+failing SQL transaction on the disposable restored server must exit nonzero
+and leave no probe table. The recovery artifact records both assertions and
+elapsed time separately. This is synthetic transaction and restoration
+integrity evidence, not a production disaster recovery exercise.
+
+If a release or migration fails, stop writes, retain the original backup and
+image identifiers, review the migration state, and validate a separate
+restored copy. Never attempt a destructive downgrade on the live database.

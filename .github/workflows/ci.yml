@@ -126,6 +126,8 @@ jobs:
           path: docs/assets/*.png
           if-no-files-found: error
       - name: Backup-restore rehearsal
+        env:
+          FLOWOPS_DISPOSABLE_REHEARSAL: '1'
         run: ./scripts/backup_restore_rehearsal.sh
       - name: Upload backup-restore rehearsal evidence
         uses: actions/upload-artifact@v4
