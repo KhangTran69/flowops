@@ -1,6 +1,6 @@
 # FlowOps — Autonomous Large-Task Orchestrator Prompt Framework
 
-> **How to use this file**: 
+> **How to use this file**:
 > When directing an AI coding assistant (Antigravity, Cursor, Claude Code, etc.) to perform complex, multi-file, or long-running tasks, copy the **Master Prompt** below into your prompt window or agent configuration.
 
 ---
