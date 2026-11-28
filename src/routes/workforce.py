@@ -31,6 +31,7 @@ TASKS = (
 STATUSES = {"DRAFT", "PENDING_APPROVAL", "APPROVED", "IN_PROGRESS", "COMPLETED", "REJECTED", "CANCELLED"}
 TASK_STATUSES = {"TODO", "IN_PROGRESS", "BLOCKED", "DONE"}
 CALLBACK_TIMEOUT = timedelta(minutes=10)
+_UNSET_TENANT = object()
 
 
 def role_actor(*required: str):
@@ -63,15 +64,24 @@ def role_actor(*required: str):
     return dependency
 
 
-def _audit(session: Session, actor: Actor, action: str, entity: str, entity_id: int, detail: str = "") -> None:
+def _audit(session: Session, actor: Actor, action: str, entity: str, entity_id: int,
+           detail: str = "", *, tenant_key=_UNSET_TENANT) -> None:
+    if tenant_key is _UNSET_TENANT:
+        tenant_key = actor.tenant_key
     session.add(db.WorkforceAuditRecord(actor_subject=actor.subject, action=action,
-        tenant_key=actor.tenant_key, entity_type=entity, entity_id=str(entity_id), detail=detail[:1000] or None))
+        tenant_key=tenant_key,
+        entity_type=entity, entity_id=str(entity_id), detail=detail[:1000] or None))
+
+
+def _same_tenant(left, right):
+    """Compare tenant ownership while treating two legacy NULL keys as equal."""
+    return left.is_not_distinct_from(right)
 
 
 def _stop_request_events(session: Session, request: db.StaffOnboardingRecord) -> None:
     events = session.execute(select(db.WorkforceAutomationEventRecord).where(
         db.WorkforceAutomationEventRecord.request_id == request.id,
-        db.WorkforceAutomationEventRecord.tenant_key == request.tenant_key)).scalars()
+        _same_tenant(db.WorkforceAutomationEventRecord.tenant_key, request.tenant_key))).scalars()
     for event in events:
         if event.delivery_status == "PENDING":
             event.delivery_status = "CANCELLED"
@@ -279,7 +289,7 @@ def create_employee(payload: EmployeeIn, actor: Actor = Depends(role_actor("HR")
     except IntegrityError as exc:
         session.rollback()
         raise HTTPException(409, "Employee number or work email already exists.") from exc
-    _audit(session, actor, "employee.created", "employee", row.id)
+    _audit(session, actor, "employee.created", "employee", row.id, tenant_key=row.tenant_key)
     session.flush()
     return {"id": row.id, "employee_number": row.employee_number, "full_name": row.full_name,
             "work_email": row.work_email, "department": row.department, "job_title": row.job_title,
@@ -299,7 +309,7 @@ def update_employee(employee_id: int, payload: EmployeeIn,
     except IntegrityError as exc:
         session.rollback()
         raise HTTPException(409, "Employee number or work email already exists.") from exc
-    _audit(session, actor, "employee.updated", "employee", employee.id)
+    _audit(session, actor, "employee.updated", "employee", employee.id, tenant_key=employee.tenant_key)
     return {"id": employee.id, "employee_number": employee.employee_number, "full_name": employee.full_name,
             "work_email": employee.work_email, "department": employee.department, "job_title": employee.job_title,
             "start_date": employee.start_date, "manager_subject": employee.manager_subject, "status": employee.status}
@@ -321,9 +331,11 @@ def update_employee_status(employee_id: int, payload: EmployeeStatusIn,
             request.status = "CANCELLED"
             request.updated_at = db.utcnow()
             _stop_request_events(session, request)
-            _audit(session, actor, "onboarding.cancelled_on_termination", "onboarding_request", request.id)
+            _audit(session, actor, "onboarding.cancelled_on_termination", "onboarding_request", request.id,
+                   tenant_key=request.tenant_key)
     employee.status = payload.status
-    _audit(session, actor, "employee.status_changed", "employee", employee.id, payload.status)
+    _audit(session, actor, "employee.status_changed", "employee", employee.id, payload.status,
+           tenant_key=employee.tenant_key)
     return {"id": employee.id, "status": employee.status}
 
 
@@ -347,7 +359,7 @@ def create_request(payload: RequestIn, actor: Actor = Depends(role_actor("HR")),
     except IntegrityError as exc:
         session.rollback()
         raise HTTPException(409, "Employee already has an active onboarding request.") from exc
-    _audit(session, actor, "onboarding.draft_created", "onboarding_request", row.id)
+    _audit(session, actor, "onboarding.draft_created", "onboarding_request", row.id, tenant_key=row.tenant_key)
     session.flush()
     return _request_view(row, employee)
 
@@ -367,7 +379,7 @@ def requests(offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=100),
              actor: Actor = Depends(role_actor("HR", "MANAGER", "IT_ADMIN")), session: Session = Depends(db.get_session)):
     query = _scope(select(db.StaffOnboardingRecord, db.EmployeeRecord).join(
         db.EmployeeRecord, (db.EmployeeRecord.id == db.StaffOnboardingRecord.employee_id) &
-        (db.EmployeeRecord.tenant_key == db.StaffOnboardingRecord.tenant_key)),
+        _same_tenant(db.EmployeeRecord.tenant_key, db.StaffOnboardingRecord.tenant_key)),
         db.StaffOnboardingRecord, actor)
     roles = {x.upper() for x in actor.roles}
     if "MANAGER" in roles and not ("HR" in roles or "IT_ADMIN" in roles or "AUTOMATION.ADMIN" in roles):
@@ -386,11 +398,11 @@ def request_detail(request_id: int, actor: Actor = Depends(role_actor("HR", "MAN
                    session: Session = Depends(db.get_session)):
     row, employee = _request(session, request_id, actor)
     task_rows = session.execute(select(db.ITTaskRecord).where(db.ITTaskRecord.request_id == row.id,
-        db.ITTaskRecord.tenant_key == row.tenant_key)
+        _same_tenant(db.ITTaskRecord.tenant_key, row.tenant_key))
                                 .order_by(db.ITTaskRecord.id)).scalars()
     decision = session.execute(select(db.WorkforceApprovalRecord).where(
         db.WorkforceApprovalRecord.request_id == row.id,
-        db.WorkforceApprovalRecord.tenant_key == row.tenant_key)).scalar_one_or_none()
+        _same_tenant(db.WorkforceApprovalRecord.tenant_key, row.tenant_key))).scalar_one_or_none()
     return {**_request_view(row, employee), "tasks": [_task_view(t) for t in task_rows],
             "approval": None if decision is None else {"decision": decision.decision,
                 "actor_subject": decision.actor_subject, "comment": decision.comment, "decided_at": decision.decided_at}}
@@ -418,7 +430,7 @@ def update_draft(request_id: int, payload: DraftUpdateIn,
     except IntegrityError as exc:
         session.rollback()
         raise HTTPException(409, "Employee already has another active onboarding request.") from exc
-    _audit(session, actor, "onboarding.draft_updated", "onboarding_request", row.id)
+    _audit(session, actor, "onboarding.draft_updated", "onboarding_request", row.id, tenant_key=row.tenant_key)
     return _request_view(row, employee)
 
 
@@ -432,13 +444,13 @@ def submit_request(request_id: int, actor: Actor = Depends(role_actor("HR")), se
     submitted_at = db.utcnow()
     changed = session.execute(update(db.StaffOnboardingRecord).where(
         db.StaffOnboardingRecord.id == row.id,
-        db.StaffOnboardingRecord.tenant_key == row.tenant_key,
+        _same_tenant(db.StaffOnboardingRecord.tenant_key, row.tenant_key),
         db.StaffOnboardingRecord.status == "DRAFT").values(
             status="PENDING_APPROVAL", submitted_at=submitted_at, updated_at=submitted_at))
     if changed.rowcount != 1:
         raise HTTPException(409, "This draft was already submitted or changed.")
     session.refresh(row)
-    _audit(session, actor, "onboarding.submitted", "onboarding_request", row.id)
+    _audit(session, actor, "onboarding.submitted", "onboarding_request", row.id, tenant_key=row.tenant_key)
     return _request_view(row, employee)
 
 
@@ -463,7 +475,8 @@ def _decide(request_id: int, actor: Actor, session: Session, decision: str, comm
     session.add(db.WorkforceApprovalRecord(request_id=row.id, tenant_key=row.tenant_key,
                                            actor_subject=actor.subject, decision=decision,
                                            comment=reason or comment))
-    _audit(session, actor, "onboarding." + decision.lower(), "onboarding_request", row.id, reason or comment or "")
+    _audit(session, actor, "onboarding." + decision.lower(), "onboarding_request", row.id,
+           reason or comment or "", tenant_key=row.tenant_key)
     if decision == "APPROVED":
         row.status = "IN_PROGRESS"
         due = datetime.combine(date.fromisoformat(employee.start_date), datetime.min.time(), tzinfo=timezone.utc)
@@ -513,7 +526,7 @@ def cancel_request(request_id: int, actor: Actor = Depends(role_actor("HR")), se
         raise HTTPException(409, "This request cannot be cancelled from its current state.")
     row.status = "CANCELLED"
     _stop_request_events(session, row)
-    _audit(session, actor, "onboarding.cancelled", "onboarding_request", row.id)
+    _audit(session, actor, "onboarding.cancelled", "onboarding_request", row.id, tenant_key=row.tenant_key)
     return {"id": row.id, "status": row.status}
 
 
@@ -536,7 +549,8 @@ def copy_rejected(request_id: int, actor: Actor = Depends(role_actor("HR")), ses
     except IntegrityError as exc:
         session.rollback()
         raise HTTPException(409, "Employee already has an active onboarding request.") from exc
-    _audit(session, actor, "onboarding.draft_copied", "onboarding_request", row.id, f"source={source.id}")
+    _audit(session, actor, "onboarding.draft_copied", "onboarding_request", row.id,
+           f"source={source.id}", tenant_key=row.tenant_key)
     return _request_view(row, employee)
 
 
@@ -547,7 +561,7 @@ def tasks(status: str | None = Query(None, max_length=24), assignee: str | None 
     query = _scope(select(db.ITTaskRecord).join(
         db.StaffOnboardingRecord,
         (db.StaffOnboardingRecord.id == db.ITTaskRecord.request_id) &
-        (db.StaffOnboardingRecord.tenant_key == db.ITTaskRecord.tenant_key)
+        _same_tenant(db.StaffOnboardingRecord.tenant_key, db.ITTaskRecord.tenant_key)
     ).where(db.StaffOnboardingRecord.status.not_in(("CANCELLED", "REJECTED", "COMPLETED"))),
         db.ITTaskRecord, actor)
     if status:
@@ -591,7 +605,8 @@ def update_task(task_id: int, payload: TaskUpdateIn,
     if "completion_notes" in payload.model_fields_set:
         task.completion_notes = payload.completion_notes
     task.completed_at = db.utcnow() if payload.status == "DONE" else None
-    _audit(session, actor, "it_task." + payload.status.lower(), "it_task", task.id)
+    _audit(session, actor, "it_task." + payload.status.lower(), "it_task", task.id,
+           tenant_key=task.tenant_key)
     _update_completion(session, request, actor)
     return _task_view(task)
 
@@ -599,13 +614,15 @@ def update_task(task_id: int, payload: TaskUpdateIn,
 def _update_completion(session: Session, request: db.StaffOnboardingRecord, actor: Actor):
     if request.status not in {"CANCELLED", "REJECTED"}:
         remaining = session.execute(select(db.ITTaskRecord.id).where(
-            db.ITTaskRecord.request_id == request.id, db.ITTaskRecord.tenant_key == request.tenant_key,
+            db.ITTaskRecord.request_id == request.id,
+            _same_tenant(db.ITTaskRecord.tenant_key, request.tenant_key),
             db.ITTaskRecord.required.is_(True),
             db.ITTaskRecord.status != "DONE").limit(1)).first()
         if remaining is None:
             request.status = "COMPLETED"
             request.completed_at = db.utcnow()
-            _audit(session, actor, "onboarding.completed", "onboarding_request", request.id)
+            _audit(session, actor, "onboarding.completed", "onboarding_request", request.id,
+                   tenant_key=request.tenant_key)
 
 
 @router.get("/assets")
@@ -634,7 +651,7 @@ def create_asset(payload: AssetIn, actor: Actor = Depends(role_actor("IT_ADMIN")
     except IntegrityError as exc:
         session.rollback()
         raise HTTPException(409, "Asset tag or serial number already exists.") from exc
-    _audit(session, actor, "asset.created", "asset", asset.id)
+    _audit(session, actor, "asset.created", "asset", asset.id, tenant_key=asset.tenant_key)
     return _asset_view(asset)
 
 
@@ -650,7 +667,8 @@ def update_asset_status(asset_id: int, payload: AssetStatusIn,
     asset.status = payload.status
     if payload.condition:
         asset.condition = payload.condition.upper()
-    _audit(session, actor, "asset.status_changed", "asset", asset.id, payload.status)
+    _audit(session, actor, "asset.status_changed", "asset", asset.id, payload.status,
+           tenant_key=asset.tenant_key)
     return _asset_view(asset)
 
 
@@ -663,7 +681,7 @@ def assign_asset(asset_id: int, payload: AssignIn,
     asset_update = update(db.ITAssetRecord).where(
         db.ITAssetRecord.id == asset_id, db.ITAssetRecord.status == "AVAILABLE",
         db.ITAssetRecord.employee_id.is_(None),
-        db.ITAssetRecord.tenant_key == employee.tenant_key)
+        _same_tenant(db.ITAssetRecord.tenant_key, employee.tenant_key))
     asset_update = _scope(asset_update, db.ITAssetRecord, actor)
     result = session.execute(asset_update.values(status="ASSIGNED", employee_id=employee.id))
     if result.rowcount != 1:
@@ -672,7 +690,8 @@ def assign_asset(asset_id: int, payload: AssignIn,
         tenant_key=employee.tenant_key, assigned_by=actor.subject)
     session.add(assignment)
     session.flush()
-    _audit(session, actor, "asset.assigned", "asset", asset_id, f"employee_id={employee.id}")
+    _audit(session, actor, "asset.assigned", "asset", asset_id, f"employee_id={employee.id}",
+           tenant_key=employee.tenant_key)
     session.flush()
     return {"assignment_id": assignment.id, "asset_id": asset_id, "employee_id": employee.id,
             "assigned_at": assignment.assigned_at}
@@ -689,14 +708,14 @@ def return_asset(asset_id: int, payload: ReturnIn,
         raise HTTPException(409, "Asset is not currently assigned.")
     assignment = session.execute(select(db.AssetAssignmentRecord).where(
         db.AssetAssignmentRecord.asset_id == asset.id,
-        db.AssetAssignmentRecord.tenant_key == asset.tenant_key,
+        _same_tenant(db.AssetAssignmentRecord.tenant_key, asset.tenant_key),
         db.AssetAssignmentRecord.returned_at.is_(None)).with_for_update()).scalar_one_or_none()
     if assignment is None:
         raise HTTPException(409, "Current assignment record is missing.")
     assignment.returned_at = db.utcnow()
     assignment.return_notes = payload.notes
     asset.status, asset.employee_id = "AVAILABLE", None
-    _audit(session, actor, "asset.returned", "asset", asset_id)
+    _audit(session, actor, "asset.returned", "asset", asset_id, tenant_key=asset.tenant_key)
     return _asset_view(asset)
 
 
@@ -715,13 +734,14 @@ def asset_history(asset_id: int, actor: Actor = Depends(role_actor("IT_ADMIN")),
 def _complete_provisioning(session: Session, event: db.WorkforceAutomationEventRecord, actor_subject: str, outcome: str, detail: str = ""):
     request = session.execute(select(db.StaffOnboardingRecord).where(
         db.StaffOnboardingRecord.id == event.request_id,
-        db.StaffOnboardingRecord.tenant_key == event.tenant_key).with_for_update()).scalar_one()
+        _same_tenant(db.StaffOnboardingRecord.tenant_key, event.tenant_key)).with_for_update()).scalar_one()
     if request.tenant_key != event.tenant_key:
         raise HTTPException(409, "Automation event tenant does not match its onboarding request.")
     if request.status in {"CANCELLED", "REJECTED"}:
         raise HTTPException(409, "Terminal onboarding cannot accept automation callbacks.")
     task = session.execute(select(db.ITTaskRecord).where(
-        db.ITTaskRecord.request_id == request.id, db.ITTaskRecord.tenant_key == event.tenant_key,
+        db.ITTaskRecord.request_id == request.id,
+        _same_tenant(db.ITTaskRecord.tenant_key, event.tenant_key),
         db.ITTaskRecord.task_key == "provision_account")).scalar_one_or_none()
     if task is None:
         raise HTTPException(409, "Provisioning task does not exist.")
@@ -731,12 +751,14 @@ def _complete_provisioning(session: Session, event: db.WorkforceAutomationEventR
             task.status, task.completed_at = "DONE", db.utcnow()
             task.completion_notes = "Simulated account provisioning confirmed by automation callback."
             automation_actor = Actor(actor_subject, (), tenant_key=event.tenant_key)
-            _audit(session, automation_actor, "automation.provisioning_succeeded", "it_task", task.id)
+            _audit(session, automation_actor, "automation.provisioning_succeeded", "it_task", task.id,
+                   tenant_key=task.tenant_key)
         _update_completion(session, request, Actor(actor_subject, (), tenant_key=event.tenant_key))
     else:
         event.last_error = _redact_detail(detail) or "Provisioning workflow reported failure."
         _audit(session, Actor(actor_subject, (), tenant_key=event.tenant_key),
-               "automation.provisioning_failed", "onboarding_request", request.id)
+               "automation.provisioning_failed", "onboarding_request", request.id,
+               tenant_key=request.tenant_key)
 
 
 class CallbackIn(BaseModel):
@@ -824,7 +846,7 @@ def retry_event(event_id: str, actor: Actor = Depends(role_actor("IT_ADMIN")), s
         raise HTTPException(404, "Automation event not found.")
     request = session.execute(select(db.StaffOnboardingRecord).where(
         db.StaffOnboardingRecord.id == event.request_id,
-        db.StaffOnboardingRecord.tenant_key == event.tenant_key)).scalar_one_or_none()
+        _same_tenant(db.StaffOnboardingRecord.tenant_key, event.tenant_key))).scalar_one_or_none()
     if request is None or request.status in {"CANCELLED", "REJECTED", "COMPLETED"}:
         raise HTTPException(409, "Terminal or missing onboarding automation cannot be retried.")
     if event.tenant_key:
@@ -839,7 +861,8 @@ def retry_event(event_id: str, actor: Actor = Depends(role_actor("IT_ADMIN")), s
     event.last_error = None
     event.lease_until = None
     event.lease_token = None
-    _audit(session, actor, "automation.delivery_retried", "automation_event", event.id)
+    _audit(session, actor, "automation.delivery_retried", "automation_event", event.id,
+           tenant_key=event.tenant_key)
     return {"event_id": event.event_id, "delivery_status": event.delivery_status}
 
 
@@ -875,7 +898,7 @@ def workforce_dashboard(actor: Actor = Depends(role_actor("HR", "MANAGER", "IT_A
     tasks = session.execute(_scope(select(db.ITTaskRecord).join(
         db.StaffOnboardingRecord,
         (db.StaffOnboardingRecord.id == db.ITTaskRecord.request_id) &
-        (db.StaffOnboardingRecord.tenant_key == db.ITTaskRecord.tenant_key)
+        _same_tenant(db.StaffOnboardingRecord.tenant_key, db.ITTaskRecord.tenant_key)
     ).where(db.ITTaskRecord.request_id.in_(request_ids or [-1]),
             db.StaffOnboardingRecord.status.not_in(("CANCELLED", "REJECTED", "COMPLETED"))),
         db.ITTaskRecord, actor)).scalars().all()
@@ -984,7 +1007,8 @@ def record_reminder(payload: ReminderCallbackIn,
             return {"eventId": existing.event_id, "outcome": existing.outcome, "duplicate": True}
         raise HTTPException(409, "Event ID has already been recorded.") from exc
     _audit(session, Actor("n8n", (), tenant_key=payload.tenantKey),
-           "task.reminder." + payload.outcome.lower(), "it_task", task.id)
+           "task.reminder." + payload.outcome.lower(), "it_task", task.id,
+           tenant_key=task.tenant_key)
     return {"eventId": payload.eventId, "outcome": payload.outcome, "duplicate": False}
 
 
