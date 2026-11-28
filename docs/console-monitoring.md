@@ -116,3 +116,27 @@ response bodies or tenant data. The run is closed-loop: it does not model
 real arrival rates, backlog drainage, external providers, HTTPS, or WAN
 latency. A protected representative staging rehearsal and production alert
 calibration remain open; do not close roadmap 2d from this artifact alone.
+
+
+### Queue contention and recovery evidence
+
+The same disposable PostgreSQL job now runs `python -m scripts.benchmark_queue`
+before the API read benchmark. It uses 84 synthetic queue rows over four logical
+arrival phases (12/48/24/0), with 4 or 8 concurrent claimers and bounded claim
+budgets. Retryable and terminal failures and abandoned leases are injected
+deterministically. Later phases advance logical time without sleeps; stale
+owners are explicitly tested against the terminal completion fence.
+
+The JSON artifact `benchmark-queue.json` records phase arrivals, backlog,
+claim outcomes, successful/failed finalizations, observed p50/p95/p99
+claim-and-finalize operation latency, throughput and invariant failures. The
+hard gates are zero missing or unfinished jobs, zero duplicate finalizations,
+zero unexpected errors, no attempt count over the configured budget and
+backlog growth during overload followed by complete drainage. Terminal
+injected failures are expected and counted, not hidden.
+
+This measures PostgreSQL queue mechanics, not real worker execution, actual
+scheduled arrival rates, wall-clock lease expiration, provider effects or
+end-to-end staging latency. The logical phase clock intentionally avoids
+network calls and timing-dependent sleeps. Representative staging and
+credentialed integration evidence remain open.

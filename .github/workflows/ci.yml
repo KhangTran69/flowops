@@ -194,13 +194,16 @@ jobs:
           FLOWOPS_AUTOMATION_ADAPTER: simulated
         run: |
           alembic upgrade head
+          python -m scripts.benchmark_queue
           python -m scripts.benchmark_console
       - name: Upload PostgreSQL benchmark evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: postgres-console-benchmark
-          path: benchmark-console.json
+          path: |
+            benchmark-console.json
+            benchmark-queue.json
           if-no-files-found: warn
 
   command-center:
