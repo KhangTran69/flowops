@@ -244,11 +244,12 @@ class GraphClient:
                         return None
                 body = _json_or_empty(response)
                 if not response.is_success:
-                    error = body.get("error") if isinstance(body.get("error"), dict) else {}
+                    raw_error = body.get("error")
+                    error_payload = raw_error if isinstance(raw_error, dict) else {}
                     raise GraphError(
-                        str(error.get("message") or response.reason_phrase or "request failed"),
+                        str(error_payload.get("message") or response.reason_phrase or "request failed"),
                         status_code=response.status_code,
-                        code=error.get("code"),
+                        code=error_payload.get("code"),
                         request_id=response.headers.get("request-id"),
                     )
                 return body

@@ -58,7 +58,7 @@ def claim_delivery(
                 updated_at=now,
             )
         )
-        if result.rowcount == 1:
+        if result.rowcount == 1:  # type: ignore[attr-defined]  # rowcount is CursorResult-only at runtime
             session.commit()
             session.expire_all()
             return session.get(table, notification_id)
@@ -121,7 +121,7 @@ def finalize_delivery(
         )
         .values(**values)
     )
-    return resulting if outcome.rowcount == 1 else None
+    return resulting if outcome.rowcount == 1 else None  # type: ignore[attr-defined]  # rowcount is CursorResult-only at runtime
 
 
 def max_attempts_from_environment() -> int:

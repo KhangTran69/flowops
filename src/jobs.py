@@ -123,7 +123,7 @@ def claim_job(
                 updated_at=now,
             )
         )
-        if result.rowcount == 1:
+        if result.rowcount == 1:  # type: ignore[attr-defined]  # rowcount is CursorResult-only at runtime
             session.commit()
             session.expire_all()
             return session.get(table, job_id)
@@ -156,7 +156,7 @@ def heartbeat_job(
             updated_at=now,
         )
     )
-    return result.rowcount == 1
+    return result.rowcount == 1  # type: ignore[attr-defined]  # rowcount is CursorResult-only at runtime
 
 
 def complete_job(
@@ -189,7 +189,7 @@ def complete_job(
             updated_at=now,
         )
     )
-    return outcome.rowcount == 1
+    return outcome.rowcount == 1  # type: ignore[attr-defined]  # rowcount is CursorResult-only at runtime
 
 
 def fail_job(
@@ -245,7 +245,7 @@ def fail_job(
         )
         .values(**values)
     )
-    return resulting_status if outcome.rowcount == 1 else None
+    return resulting_status if outcome.rowcount == 1 else None  # type: ignore[attr-defined]  # rowcount is CursorResult-only at runtime
 
 
 def retry_failed_job(
@@ -269,7 +269,7 @@ def retry_failed_job(
             updated_at=now,
         )
     )
-    return result.rowcount == 1
+    return result.rowcount == 1  # type: ignore[attr-defined]  # rowcount is CursorResult-only at runtime
 
 
 def cancel_job(
@@ -294,7 +294,7 @@ def cancel_job(
             updated_at=now,
         )
     )
-    return result.rowcount == 1
+    return result.rowcount == 1  # type: ignore[attr-defined]  # rowcount is CursorResult-only at runtime
 
 
 def list_jobs(

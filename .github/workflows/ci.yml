@@ -63,6 +63,18 @@ jobs:
       - name: Ruff (E,F,I,B,UP @140, py310 target)
         run: ruff check src tests scripts
 
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Mypy (allowlist ratchet)
+        run: mypy src/definitions.py src/expressions.py src/graph.py src/jobs.py src/outbox.py src/ticket_processor.py
+
   docker-postgres:
 
     runs-on: ubuntu-latest
