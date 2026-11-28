@@ -38,3 +38,11 @@ send is observed; no exactly-once external effect is inferred.
 Follow-up: protected operator workforce denial, focus navigation and active
 retry lease guard, plus opt-in connector observed revision identities. Full
 provider CDC and live workforce identity remain gated.
+
+## Shared admission follow-up (#92)
+Pinned head: c2cbefb4ed9fbbe209a9e7d4cad960bcf05f0369. Migration 0018 adds the PostgreSQL quota table.
+The combined candidate preserves notification lease alerts alongside the
+new admission alert and includes both PostgreSQL test modules. Review #92
+before final release; old workers must be drained before any migration
+rollback. Production browser identity remains disabled. The previously
+validated combined head 70f28c7 passed 12/12 with 37 PostgreSQL tests.

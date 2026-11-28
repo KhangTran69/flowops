@@ -52,3 +52,18 @@ tests:
       - eval_time: 9m
         alertname: FlowOpsExpiredNotificationLease
         exp_alerts: []
+  - interval: 1m
+    input_series:
+      - series: 'flowops_rate_limit_decisions_total{outcome="unavailable"}'
+        values: '0 1+1x10'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: FlowOpsSharedAdmissionUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: FlowOpsSharedAdmissionUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Shared request admission is failing closed"
