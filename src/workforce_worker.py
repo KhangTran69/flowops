@@ -41,10 +41,14 @@ def _claim(session):
     if candidate is None:
         return None
     if candidate.attempts >= MAX_ATTEMPTS:
-        candidate.delivery_status = "FAILED"
-        candidate.last_error = "Attempt budget exhausted after abandoned ownership; reconcile before retry."
-        candidate.lease_token = None
-        candidate.lease_until = None
+        session.execute(update(db.WorkforceAutomationEventRecord).where(
+            db.WorkforceAutomationEventRecord.id == candidate.id,
+            db.WorkforceAutomationEventRecord.delivery_status == "PENDING",
+            db.WorkforceAutomationEventRecord.attempts >= MAX_ATTEMPTS,
+            or_(db.WorkforceAutomationEventRecord.lease_until.is_(None),
+                db.WorkforceAutomationEventRecord.lease_until < now),
+        ).values(delivery_status="FAILED", lease_token=None, lease_until=None,
+                 last_error="Attempt budget exhausted after abandoned ownership; reconcile before retry."))
         session.commit()
         return None
     lease_token = uuid.uuid4().hex
@@ -154,6 +158,8 @@ def run_once(*, timeout: float = 10.0) -> dict | None:
         event = _locked_automation_event(session, event_id)
         if event is None or event.id != event_row_id or event.lease_token != lease_token:
             return {"event_id": event_id, "status": "lease_lost"}
+        if event.workflow_status in {"SUCCEEDED", "FAILED"} and mode == "simulated":
+            success = True
         now = db.utcnow()
         next_status = "DELIVERED" if success else ("FAILED" if attempt_number >= MAX_ATTEMPTS else "PENDING")
         values = {
@@ -180,7 +186,8 @@ def run_once(*, timeout: float = 10.0) -> dict | None:
         if success and mode == "simulated":
             from src.routes.workforce import _complete_provisioning
             event = session.get(db.WorkforceAutomationEventRecord, event_row_id)
-            _complete_provisioning(session, event, "mock-automation", "success")
+            if event.workflow_status not in {"SUCCEEDED", "FAILED"}:
+                _complete_provisioning(session, event, "mock-automation", "success")
         session.commit()
         event = session.get(db.WorkforceAutomationEventRecord, event_row_id)
         return {"event_id": event_id, "status": event.delivery_status, "workflow_status": event.workflow_status,
