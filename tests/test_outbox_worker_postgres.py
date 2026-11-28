@@ -79,3 +79,19 @@ def test_postgres_outbox_takeover_and_dispatcher(database, monkeypatch):
     processed = outbox_worker.run_once(worker_id="pg-outbox")
     assert processed is not None
     assert processed.status == "delivered"
+
+
+def test_postgres_abandoned_notification_attempts_are_bounded(database, monkeypatch):
+    monkeypatch.setenv("FLOWOPS_NOTIFICATION_MAX_ATTEMPTS", "2")
+    notification_id = _insert()
+    with db.SessionLocal() as session:
+        at = db.utcnow()
+        first = outbox.claim_delivery(session, now=at, lease_seconds=1)
+        assert first is not None and first.attempts == 1
+        second = outbox.claim_delivery(session, now=at + timedelta(seconds=1), lease_seconds=1)
+        assert second is not None and second.attempts == 2
+        assert outbox.claim_delivery(session, now=at + timedelta(seconds=2)) is None
+        row = session.get(db.NotificationOutboxRecord, notification_id, populate_existing=True)
+        assert row.status == "failed" and row.attempts == 2
+        assert row.lease_owner_token is None
+        assert "reconcile external effects" in row.last_error

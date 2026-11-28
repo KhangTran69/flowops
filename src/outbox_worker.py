@@ -10,13 +10,15 @@ Or as a polling daemon:
 """
 
 import argparse
-import json
+import logging
 import signal
 import time
 import uuid
 
+from sqlalchemy.exc import OperationalError
+
 from src import db, idempotency, outbox
-from src.notify import deliver_webhook
+from src.notify import DeliveryResult, deliver_webhook
 from src.services.connectors import deliver_outbox_notification
 
 
@@ -58,9 +60,12 @@ def run_once(
         )
         if record is None:
             return None
-        payload = json.loads(record.payload_json)
+        owner_token = record.lease_owner_token or ""
         started = time.perf_counter()
-        if payload.get("event") == "trigger.fired" and payload.get("tenant"):
+        payload = outbox.decode_payload(record.payload_json)
+        if payload is None:
+            delivery = DeliveryResult(success=False, attempts=1, last_error="Invalid persisted notification payload.")
+        elif payload.get("event") == "trigger.fired" and payload.get("tenant"):
             delivery = deliver_outbox_notification(
                 record.url, payload, session, max_attempts=1
             )
@@ -70,11 +75,11 @@ def run_once(
         resulting = outbox.finalize_delivery(
             session,
             record.id,
-            record.lease_owner_token or "",
+            owner_token,
             success=delivery.success,
             attempt_delta=delivery.attempts or 1,
             error=delivery.last_error,
-            max_attempts=outbox.max_attempts_from_environment(),
+            max_attempts=1 if payload is None else outbox.max_attempts_from_environment(),
         )
         if resulting is None:
             session.rollback()
@@ -132,8 +137,18 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
+    failures = 0
     while not stopping:
-        record = run_once(worker_id=worker_id, lease_seconds=args.lease_seconds)
+        try:
+            record = run_once(worker_id=worker_id, lease_seconds=args.lease_seconds)
+            failures = 0
+        except OperationalError as error:
+            if args.once:
+                raise
+            failures = min(6, failures + 1)
+            logging.getLogger(__name__).warning("Outbox database unavailable: %s", type(error).__name__)
+            time.sleep(min(30.0, max(0.1, args.poll_interval) * 2 ** failures))
+            continue
         if record is not None:
             print(f"{record.id} {record.status}", flush=True)
             if args.once:

@@ -308,6 +308,16 @@ def metrics_endpoint(
         lines.append(
             f'flowops_notification_outbox{{status="{state}"}} {outbox_counts.get(state, 0)}'
         )
+    expired_deliveries = session.scalar(select(func.count()).select_from(db.NotificationOutboxRecord).where(
+        db.NotificationOutboxRecord.status == "pending",
+        db.NotificationOutboxRecord.lease_owner_token.is_not(None),
+        db.NotificationOutboxRecord.lease_expires_at <= db.utcnow(),
+    )) or 0
+    lines.extend([
+        "# HELP flowops_notification_expired_leases Pending deliveries with expired ownership",
+        "# TYPE flowops_notification_expired_leases gauge",
+        f"flowops_notification_expired_leases {expired_deliveries}",
+    ])
     triage_counts, apply_counts, provider_errors = metrics.snapshot_ai()
     lines.extend(
         [

@@ -29,3 +29,10 @@ groups:
           severity: warning
         annotations:
           summary: "Failed notification deliveries require reconciliation"
+      - alert: FlowOpsExpiredNotificationLease
+        expr: max(flowops_notification_expired_leases) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Expired notification delivery ownership requires reconciliation"
