@@ -56,6 +56,7 @@ from urllib.parse import urlsplit
 import requests
 from fastapi import HTTPException
 from sqlalchemy import or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src import db, expressions, scheduler
@@ -67,6 +68,32 @@ from src.schemas import OnboardingRequestIn
 # ---------------------------------------------------------------------------
 
 MAX_EVENT_PAYLOAD_BYTES = 64 * 1024
+MAX_POLL_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_POLL_RECORDS = 50
+
+
+def _read_poll_page(response: requests.Response, field: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Accept only bounded successful JSON provider pages, not redirects."""
+    with response:
+        response.raise_for_status()
+        if not 200 <= response.status_code < 300:
+            raise ValueError("Connector response was not successful.")
+        data = bytearray()
+        for chunk in response.iter_content(chunk_size=65536):
+            if len(data) + len(chunk) > MAX_POLL_RESPONSE_BYTES:
+                raise ValueError("Connector response exceeds the configured size limit.")
+            data.extend(chunk)
+        page = json.loads(data)
+        if not isinstance(page, dict) or not isinstance(page.get(field), list):
+            raise ValueError("Connector response has an invalid page shape.")
+        records = page[field]
+        if len(records) > MAX_POLL_RECORDS or not all(isinstance(row, dict) for row in records):
+            raise ValueError("Connector response has invalid or excessive records.")
+        return records, page
+
+
+def _read_poll_records(response: requests.Response, field: str) -> list[dict[str, Any]]:
+    return _read_poll_page(response, field)[0]
 
 
 @dataclass(frozen=True)
@@ -134,6 +161,10 @@ class SourceConnector:
         """Return new events since the last poll. Webhook sources: []."""
         raise NotImplementedError
 
+    def fetch_page(self, session: Session, cursor: str | None) -> tuple[list[NormalizedEvent], str | None]:
+        """One resumable page; older adapters retain their single-page contract."""
+        return self.fetch_events(session), None
+
     def verify_webhook(self, request, body: bytes) -> bool:
         """Authenticate a webhook delivery at the transport level."""
         return True  # route-level API-key auth is the baseline guarantee
@@ -155,16 +186,33 @@ class JiraConnector(SourceConnector):
         self.jql = jql
 
     def fetch_events(self, session: Session) -> list[NormalizedEvent]:
+        return self.fetch_page(session, None)[0]
+
+    def fetch_page(self, session: Session, cursor: str | None) -> tuple[list[NormalizedEvent], str | None]:
+        params: dict[str, str | int] = {
+            "jql": self.jql, "maxResults": MAX_POLL_RECORDS,
+            "fields": "summary,status,priority,assignee,description",
+        }
+        if cursor:
+            params["nextPageToken"] = cursor
         response = requests.get(
-            f"{self.base_url}/rest/api/3/search",
+            f"{self.base_url}/rest/api/3/search/jql",
             auth=(self.email, self.api_token),
-            params={"jql": self.jql, "maxResults": 50},
+            params=params,
             timeout=15,
+            stream=True,
             allow_redirects=False,
         )
-        response.raise_for_status()
         events = []
-        for issue in response.json().get("issues", []):
+        records, page = _read_poll_page(response, "issues")
+        next_cursor = page.get("nextPageToken")
+        if page.get("isLast") is True:
+            next_cursor = None
+        elif not isinstance(next_cursor, str) or not next_cursor or len(next_cursor) > 8192 or next_cursor == cursor:
+            raise ValueError("Jira returned an invalid continuation token.")
+        for issue in records:
+            if not issue.get("id"):
+                raise ValueError("Jira record has no stable identity.")
             fields = issue.get("fields", {})
             events.append(
                 NormalizedEvent(
@@ -178,10 +226,10 @@ class JiraConnector(SourceConnector):
                         "assignee": (fields.get("assignee") or {}).get("emailAddress"),
                     },
                     title=f"Jira {issue.get('key')}: {fields.get('summary', '')}".strip(),
-                    description=fields.get("description") or "",
+                    description=(fields.get("description") if isinstance(fields.get("description"), str) else "") or "",
                 )
             )
-        return events
+        return events, next_cursor
 
 
 class ServiceNowConnector(SourceConnector):
@@ -195,17 +243,34 @@ class ServiceNowConnector(SourceConnector):
         self.password = password
 
     def fetch_events(self, session: Session) -> list[NormalizedEvent]:
+        return self.fetch_page(session, None)[0]
+
+    def fetch_page(self, session: Session, cursor: str | None) -> tuple[list[NormalizedEvent], str | None]:
+        # Keyset scan, not offset pagination: inserts/deletions cannot shift
+        # the next page. Existing event identity remains the incident number.
+        if cursor is not None and not re.fullmatch(r"[0-9a-f]{32}", cursor):
+            raise ValueError("Invalid ServiceNow continuation key.")
+        query = "ORDERBYsys_id" if cursor is None else f"sys_id>{cursor}^ORDERBYsys_id"
         response = requests.get(
             f"{self.instance_url}/api/now/table/incident",
             auth=(self.username, self.password),
             headers={"Accept": "application/json"},
-            params={"sysparm_limit": 50, "sysparm_orderby": "sys_updated_on:DESC"},
+            params={"sysparm_limit": MAX_POLL_RECORDS, "sysparm_query": query,
+                    "sysparm_fields": "sys_id,number,state,severity,assigned_to,short_description,description"},
             timeout=15,
+            stream=True,
             allow_redirects=False,
         )
-        response.raise_for_status()
         events = []
-        for rec in response.json().get("result", []):
+        records = _read_poll_records(response, "result")
+        previous = cursor or ""
+        for rec in records:
+            key = rec.get("sys_id")
+            if not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{32}", key) or key <= previous:
+                raise ValueError("ServiceNow returned an invalid or unordered continuation key.")
+            previous = key
+            if not (rec.get("number") or rec.get("sys_id")):
+                raise ValueError("ServiceNow record has no stable identity.")
             events.append(
                 NormalizedEvent(
                     source=self.name,
@@ -221,7 +286,7 @@ class ServiceNowConnector(SourceConnector):
                     description=rec.get("description") or "",
                 )
             )
-        return events
+        return events, previous if len(records) == MAX_POLL_RECORDS else None
 
 
 class SlackConnector(SourceConnector):
@@ -235,7 +300,7 @@ class SlackConnector(SourceConnector):
 
     def verify_webhook(self, request, body: bytes) -> bool:
         if not self.signing_secret:
-            return True
+            return False
         signature = request.headers.get("x-slack-signature", "")
         timestamp = request.headers.get("x-slack-request-timestamp", "")
         if not signature or not timestamp:
@@ -249,11 +314,11 @@ class SlackConnector(SourceConnector):
         import hmac
         import secrets
 
-        base = f"v0:{timestamp}:{body.decode('utf-8', 'replace')}"
+        base = b"v0:" + timestamp.encode() + b":" + body
         expected = "v0=" + hmac.new(
-            self.signing_secret.encode(), base.encode(), hashlib.sha256
+            self.signing_secret.encode(), base, hashlib.sha256
         ).hexdigest()
-        return secrets.compare_digest(signature, expected)
+        return secrets.compare_digest(signature.encode(), expected.encode())
 
     def parse_webhook(self, payload: Any) -> list[NormalizedEvent]:
         if not isinstance(payload, dict):
@@ -261,13 +326,18 @@ class SlackConnector(SourceConnector):
         body = payload.get("event") if payload.get("type") == "event_callback" else payload
         if not isinstance(body, dict):
             return []
-        if body.get("type") == "url_verification" or body.get("subtype") == "bot_message":
+        if payload.get("type") == "url_verification" or body.get("type") == "url_verification" or body.get("subtype") == "bot_message":
             return []
+        identity = body.get("ts") or body.get("event_ts") or payload.get("event_id")
+        if not isinstance(identity, str) or not identity.strip() or len(identity) > 255:
+            raise ValueError("Slack delivery requires a stable event identity.")
+        if not isinstance(body.get("text") or "", str):
+            raise ValueError("Slack message text must be a string.")
         return [
             NormalizedEvent(
                 source=self.name,
                 event_type="message_posted",
-                external_id=str(body.get("ts") or body.get("event_ts") or uuid.uuid4()),
+                external_id=identity,
                 payload={
                     "channel": body.get("channel"),
                     "user": body.get("user"),
@@ -289,11 +359,14 @@ class MSTeamsConnector(SourceConnector):
         if not isinstance(payload, dict):
             return []
         text = payload.get("text") or payload.get("message") or ""
+        identity = payload.get("id")
+        if not isinstance(identity, str) or not identity.strip() or len(identity) > 255 or not isinstance(text, str):
+            raise ValueError("Teams delivery requires a stable ID and text message.")
         return [
             NormalizedEvent(
                 source=self.name,
                 event_type="message_posted",
-                external_id=str(payload.get("id") or uuid.uuid4()),
+                external_id=identity,
                 payload={
                     "summary": payload.get("summary"),
                     "themeColor": payload.get("themeColor"),
@@ -323,15 +396,22 @@ class GenericJsonConnector(SourceConnector):
             items = [payload]
         else:
             return []
+        if not isinstance(items, list):
+            raise ValueError("Connector events must be a list.")
         events = []
         for item in items:
             if not isinstance(item, dict):
-                continue
+                raise ValueError("Each connector event must be an object.")
+            identity = item.get("id")
+            if not isinstance(identity, str) or not identity.strip() or len(identity) > 255:
+                raise ValueError("Connector event requires a stable ID.")
+            if not isinstance(item.get("payload", {}), dict):
+                raise ValueError("Connector event payload must be an object.")
             events.append(
                 NormalizedEvent(
                     source=str(item.get("source") or self.name)[:40],
                     event_type=str(item.get("type") or "event")[:80],
-                    external_id=str(item.get("id") or uuid.uuid4())[:255],
+                    external_id=identity,
                     payload=item.get("payload") or {},
                     tenant_key=item.get("tenant"),
                     title=str(item.get("title") or "")[:200],
@@ -928,8 +1008,21 @@ def ingest_event(session: Session, event: NormalizedEvent) -> dict[str, Any]:
         tenant_key=event.tenant_key,
         connector_id=event.connector_id,
     )
-    session.add(row)
-    session.flush()
+    # A simultaneous poll/webhook may insert the same fingerprint between
+    # our initial read and flush. Resolve that conflict in a savepoint, not
+    # by rolling back unrelated work in the caller's transaction.
+    try:
+        with session.begin_nested():
+            session.add(row)
+            session.flush()
+    except IntegrityError:
+        existing = session.execute(
+            select(db.EventRecord).where(db.EventRecord.fingerprint == fingerprint)
+        ).scalar_one_or_none()
+        if existing is None:
+            raise
+        return {"fingerprint": fingerprint, "event_id": existing.id,
+                "duplicate": True, "triggers_fired": []}
 
     fired = evaluate_triggers(session, event, row)
 
@@ -965,14 +1058,14 @@ def ingest_events(session: Session, events: list[NormalizedEvent]) -> list[dict[
                 run_id=_new_run_id(),
                 action="connector.event_failed",
                 status="failure",
-                detail=f"{event.fingerprint()}: {type(error).__name__}: {error}",
+                detail=f"{event.fingerprint()}: {type(error).__name__}",
             )
             results.append(
                 {
                     "fingerprint": event.fingerprint(),
                     "event_id": None,
                     "duplicate": False,
-                    "error": f"{type(error).__name__}: {error}",
+                    "error": f"{type(error).__name__}: event processing failed.",
                     "triggers_fired": [],
                 }
             )
@@ -1006,7 +1099,7 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def _poll_state(record: "db.ConnectorRecord") -> dict[str, int]:
+def _poll_state(record: "db.ConnectorRecord") -> dict[str, Any]:
     try:
         state = json.loads(record.cursor_json or "{}")
     except (TypeError, ValueError):
@@ -1016,6 +1109,8 @@ def _poll_state(record: "db.ConnectorRecord") -> dict[str, int]:
     return {
         "failures": max(0, _safe_int(state.get("failures"))),
         "last_batch": max(0, _safe_int(state.get("last_batch"))),
+        "cursor": state.get("cursor") if isinstance(state.get("cursor"), str) else None,
+        "config_digest": state.get("config_digest"),
     }
 
 
@@ -1083,59 +1178,77 @@ def poll_all_connectors(
     finally:
         session.close()
 
-    for record in records:
+    for candidate in records:
         session = db.SessionLocal()
         try:
-            # Re-attach inside this connector's own session: `records` came
-            # from a session that is already closed, and mutating a detached
-            # instance would silently never reach the database.
-            record = session.get(db.ConnectorRecord, record.id)
-            if record is None or not record.enabled:
+            # PostgreSQL locks one connector at a time; recheck due state
+            # after claiming it so competing pollers do not fetch twice.
+            query = select(db.ConnectorRecord).where(
+                db.ConnectorRecord.id == candidate.id,
+                db.ConnectorRecord.enabled.is_(True),
+                db.ConnectorRecord.kind == "polling",
+            )
+            if tenant_key is not None:
+                query = query.where(db.ConnectorRecord.tenant_key == tenant_key)
+            if session.get_bind().dialect.name == "postgresql":
+                query = query.with_for_update(skip_locked=True)
+            record = session.execute(query).scalar_one_or_none()
+            if record is None or (only_due and not connector_due(record, at)):
                 continue
-            connector = build_connector(
-                record.connector_type,
-                json.loads(record.config_json or "{}"),
-                tenant_key=record.tenant_key,
-            )
-            events = connector.fetch_events(session)
-            events = [
-                NormalizedEvent(
-                    source=event.source,
-                    event_type=event.event_type,
-                    external_id=event.external_id,
-                    payload=event.payload,
-                    tenant_key=record.tenant_key or event.tenant_key,
-                    connector_id=record.id,
-                    title=event.title,
-                    description=event.description,
+            try:
+                with session.begin_nested():
+                    if record.tenant_key:
+                        tenant = session.get(db.TenantRecord, record.tenant_key)
+                        if tenant is None or not tenant.active:
+                            raise ValueError("Connector tenant is missing or inactive.")
+                    connector = build_connector(
+                        record.connector_type,
+                        json.loads(record.config_json or "{}"),
+                        tenant_key=record.tenant_key,
+                    )
+                    state = _poll_state(record)
+                    config_digest = hashlib.sha256((record.config_json or "{}").encode()).hexdigest()
+                    cursor = state["cursor"] if state["config_digest"] == config_digest else None
+                    fetch_page = getattr(connector, "fetch_page", None)
+                    if fetch_page is None:
+                        events, next_cursor = connector.fetch_events(session), None
+                    else:
+                        events, next_cursor = fetch_page(session, cursor)
+                    events = [
+                        NormalizedEvent(
+                            source=event.source, event_type=event.event_type,
+                            external_id=event.external_id, payload=event.payload,
+                            tenant_key=record.tenant_key, connector_id=record.id,
+                            title=event.title, description=event.description,
+                        )
+                        for event in events
+                    ]
+                    summaries = ingest_events(session, events)
+                    ingested = sum(1 for s in summaries if not s["duplicate"] and "error" not in s)
+                    failed = sum(1 for s in summaries if "error" in s)
+                    # Successful rows commit even if a peer fails. In that case
+                    # replay the same page and let event fingerprints dedupe.
+                    state["cursor"] = cursor if failed else next_cursor
+                    state["config_digest"] = config_digest
+                    state["failures"] = min(32, state["failures"] + 1) if failed else 0
+                    state["last_batch"] = len(events)
+                    record.cursor_json = json.dumps(state)
+                    record.last_polled_at = at
+                session.commit()
+                count += ingested
+            except Exception as error:
+                # Roll back only the savepoint; keep the claim until the
+                # failure/backoff state has been persisted.
+                state = _poll_state(record)
+                state["failures"] = min(32, state["failures"] + 1)
+                record.last_polled_at = at
+                record.cursor_json = json.dumps(state)
+                db.log_execution(
+                    session, run_id=_new_run_id(), action="connector.poll_failed",
+                    status="failure",
+                    detail=f"connector={record.id} ({record.connector_type}): {type(error).__name__}",
                 )
-                for event in events
-            ]
-            summaries = ingest_events(session, events)
-            ingested = sum(
-                1 for s in summaries if not s["duplicate"] and "error" not in s
-            )
-            record.last_polled_at = at
-            record.cursor_json = json.dumps(
-                {"failures": 0, "last_batch": len(events)}
-            )
-            session.commit()
-            count += ingested
-        except Exception as error:
-            session.rollback()
-            state = _poll_state(record)
-            state["failures"] += 1
-            record.last_polled_at = at
-            record.cursor_json = json.dumps(state)
-            db.log_execution(
-                session,
-                run_id=_new_run_id(),
-                action="connector.poll_failed",
-                status="failure",
-                detail=f"connector={record.id} ({record.connector_type}): "
-                f"{type(error).__name__}: {error}",
-            )
-            session.commit()
+                session.commit()
         finally:
             session.close()
     return count

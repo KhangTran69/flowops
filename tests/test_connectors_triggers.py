@@ -429,3 +429,18 @@ def test_sweep_expired_removes_stale_completed_records(client):
         assert deleted == 2  # stale completed + stale abandoned reservation
         keys = {r.key for r in session.query(db.IdempotencyRecord).all()}
         assert keys == {"fresh-completed", "recent-processing"}
+
+
+@pytest.mark.parametrize("payload", [
+    {"events": {}},
+    {"events": [None]},
+    {"events": [{"type": "alert"}]},
+    {"events": [{"id": "abc", "payload": ["invalid"]}]},
+])
+def test_connector_webhook_rejects_missing_stable_id_and_bad_shapes(client, payload):
+    connector = client.post("/connectors", headers=ADMIN,
+        json={"name": "Strict generic", "connector_type": "generic", "config": {}}).json()
+    response = client.post(f"/connectors/{connector['id']}/webhook", json=payload)
+    assert response.status_code == 422
+    with db.SessionLocal() as session:
+        assert session.query(db.EventRecord).count() == 0

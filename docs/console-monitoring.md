@@ -94,3 +94,66 @@ uploaded as the `backup-restore-timings` artifact (first dated run
 2026-11-28; measured window in `docs/runbooks/backup-restore.md`). A
 rehearsal at production data volume remains part of the eventual production
 deployment.
+
+
+## Synthetic benchmark evidence format (roadmap 2d)
+
+The disposable PostgreSQL CI benchmark retains the existing single-endpoint
+40-request runs at concurrency 1 and 4, and adds 120 balanced mixed reads at
+concurrency 8. Each record reports successful-request p50, p95, p99 and maximum
+latency, status counts (including exception classes), total and successful
+throughput, and whether the provisional 500 ms p95 target was observed. The
+aggregate mixed throughput uses the complete mixed interval; per-endpoint
+throughput uses the same interval to remain additive. Any non-200 response
+fails the benchmark after evidence is written. The latency target is
+observational in shared CI, not a hard production SLA or an alert threshold.
+
+Set `FLOWOPS_BENCHMARK_REPORT` to a local output path to retain the JSON report.
+CI uploads it as `postgres-console-benchmark` even if measured requests fail.
+The report identifies its synthetic TestClient environment, database dialect,
+fixture sizes and CI commit. It contains no connection strings, credentials,
+response bodies or tenant data. The run is closed-loop: it does not model
+real arrival rates, backlog drainage, external providers, HTTPS, or WAN
+latency. A protected representative staging rehearsal and production alert
+calibration remain open; do not close roadmap 2d from this artifact alone.
+
+
+### Queue contention and recovery evidence
+
+The same disposable PostgreSQL job now runs `python -m scripts.benchmark_queue`
+before the API read benchmark. It uses 84 synthetic queue rows over four logical
+arrival phases (12/48/24/0), with 4 or 8 concurrent claimers and bounded claim
+budgets. Retryable and terminal failures and abandoned leases are injected
+deterministically. Later phases advance logical time without sleeps; stale
+owners are explicitly tested against the terminal completion fence.
+
+The JSON artifact `benchmark-queue.json` records phase arrivals, backlog,
+claim outcomes, successful/failed finalizations, observed p50/p95/p99
+claim-and-finalize operation latency, throughput and invariant failures. The
+hard gates are zero missing or unfinished jobs, zero duplicate finalizations,
+zero unexpected errors, no attempt count over the configured budget and
+backlog growth during overload followed by complete drainage. Terminal
+injected failures are expected and counted, not hidden.
+
+This measures PostgreSQL queue mechanics, not real worker execution, actual
+scheduled arrival rates, wall-clock lease expiration, provider effects or
+end-to-end staging latency. The logical phase clock intentionally avoids
+network calls and timing-dependent sleeps. Representative staging and
+credentialed integration evidence remain open.
+
+
+### Paced wall-clock queue workload
+
+`python -m scripts.benchmark_queue_arrivals` extends the existing logical-time
+queue benchmark without replacing its evidence. Four concurrent claimers
+process synthetic work with a fixed 150 ms service delay while a producer
+targets 4/s for two seconds, 48/s for two seconds, and 12/s for four seconds.
+Actual arrival rates, backlog, expected retries and terminal failures,
+abandoned leases, end-to-end and claim/finalize latency percentiles, throughput
+and drain time are written to `benchmark-queue-arrivals.json`. CI gates
+missing/duplicate results, unexpected errors, over-budget attempts, nonzero
+final backlog, failure injection, stale owner finalization, and backlog growth;
+the synthetic p95 ceiling is 25 s and drain deadline 40 s. These intentionally
+loose ceilings are regression safeguards, not customer-facing SLOs. No provider
+or real workflow adapter is executed. Representative production staging,
+real provider latency, distributed hosts and larger sustained tests remain open.
