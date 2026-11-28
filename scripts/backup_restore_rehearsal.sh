@@ -10,15 +10,20 @@
 # evidence artifact.
 #
 # Usage: from the repo root of a RUNNING compose stack:
-#   ./scripts/backup_restore_rehearsal.sh
+#   FLOWOPS_DISPOSABLE_REHEARSAL=1 ./scripts/backup_restore_rehearsal.sh
 #
-# The rehearsal never writes to the source stack: writer services (worker,
-# scheduler, timers, outbox, workforce-outbox) are paused for the dump so the
-# reconciliation is deterministic, and resumed in the EXIT trap. The app
-# service stays up.
+# This rehearsal seeds synthetic source data. Run only on an explicitly
+# disposable stack with no concurrent API traffic. Writer services are
+# paused for the dump and resumed in the EXIT trap; the app stays up.
 set -euo pipefail
 
-REHEARSAL_CONTAINER="flowops-rehearsal-pg"
+if [[ "${FLOWOPS_DISPOSABLE_REHEARSAL:-}" != "1" ]]; then
+  echo "Refusing rehearsal: an explicitly disposable synthetic compose stack is required." >&2
+  exit 1
+fi
+REHEARSAL_CONTAINER="flowops-rehearsal-pg-$$"
+RESTORE_ID=""
+PAUSE_ATTEMPTED=0
 REHEARSAL_HOST_PORT="${FLOWOPS_REHEARSAL_PG_PORT:-}"
 WORK_DIR="$(mktemp -d)"
 TIMINGS_FILE="${FLOWOPS_REHEARSAL_TIMINGS_FILE:-backup-restore-timings.txt}"
@@ -47,8 +52,13 @@ PY
 
 cleanup() {
   local code=$?
-  docker rm -f "$REHEARSAL_CONTAINER" >/dev/null 2>&1 || true
-  docker compose unpause "${WRITER_SERVICES[@]}" >/dev/null 2>&1 || true
+  if [[ $code -ne 0 && -n "$RESTORE_ID" ]]; then
+    docker inspect --format 'Rehearsal container state: {{.State.Status}} (exit {{.State.ExitCode}})' "$REHEARSAL_CONTAINER" >&2 || true
+    # Do not emit database logs: failed restore statements may contain data.
+    # Inspect the disposable container locally before cleanup if needed.
+  fi
+  if [[ -n "$RESTORE_ID" ]]; then docker rm -f "$RESTORE_ID" >/dev/null 2>&1 || true; fi
+  if [[ "$PAUSE_ATTEMPTED" == "1" ]]; then docker compose unpause "${WRITER_SERVICES[@]}" >/dev/null 2>&1 || true; fi
   rm -rf -- "$WORK_DIR"
   if [[ $code -ne 0 ]]; then
     echo "Rehearsal FAILED (exit ${code}); writer services resumed and rehearsal container removed." >&2
@@ -69,6 +79,8 @@ STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "FlowOps backup/restore rehearsal — ${STAMP} — commit ${GIT_SHA}"
 
 # ---------------------------------------------------------------------------
+# A mistaken opt-in must not seed a protected application.
+docker compose exec -T app python -c 'import os, sys; sys.exit(0 if os.environ.get("FLOWOPS_ENVIRONMENT", "development") == "development" else 1)' || { echo "Refusing to seed a protected or unavailable application." >&2; exit 1; }
 echo "Preparing non-trivial data on the source stack"
 # The demo seed (when present in the image) fills every dashboard; the
 # rehearsal fixtures add rows this script can spot-check verbatim afterwards.
@@ -110,6 +122,7 @@ finally:
 PY
 
 echo "Pausing writer services so the dump is deterministic"
+PAUSE_ATTEMPTED=1
 docker compose pause "${WRITER_SERVICES[@]}"
 
 # ---------------------------------------------------------------------------
@@ -123,20 +136,52 @@ echo "Stage 2/4: restore into a clean postgres:16-alpine container"
 COMPOSE_NETWORK="$(docker inspect "$(docker compose ps -q postgres)" \
   --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}')"
 START="$(now)"
-docker run -d --name "$REHEARSAL_CONTAINER" --network "$COMPOSE_NETWORK" \
+RESTORE_ID="$(docker run -d --name "$REHEARSAL_CONTAINER" --network "$COMPOSE_NETWORK" \
   -e POSTGRES_DB=flowops -e POSTGRES_USER=flowops -e POSTGRES_PASSWORD=flowops \
   ${REHEARSAL_HOST_PORT:+-p "127.0.0.1:${REHEARSAL_HOST_PORT}:5432"} \
-  postgres:16-alpine >/dev/null
-for _ in $(seq 1 60); do
-  if docker exec "$REHEARSAL_CONTAINER" pg_isready -U flowops -d flowops >/dev/null 2>&1; then
+  postgres:16-alpine)"
+# Probe the final TCP listener with an authenticated query. The official
+# PostgreSQL image uses a socket-only temporary init server, which may answer
+# both pg_isready and local-socket queries before shutting down.
+server_ready() {
+  docker exec -e PGPASSWORD=flowops "$REHEARSAL_CONTAINER" \
+    psql -h 127.0.0.1 -U flowops -d flowops -v ON_ERROR_STOP=1 -tAc "SELECT 1" >/dev/null 2>&1
+}
+for _ in $(seq 1 120); do
+  if server_ready; then
     break
   fi
   sleep 1
 done
-docker exec "$REHEARSAL_CONTAINER" pg_isready -U flowops -d flowops >/dev/null
-docker exec -i "$REHEARSAL_CONTAINER" psql -U flowops -d flowops \
+server_ready || { echo "Rehearsal postgres never became ready." >&2; exit 1; }
+docker exec -i -e PGPASSWORD=flowops "$REHEARSAL_CONTAINER" psql -h 127.0.0.1 -U flowops -d flowops \
   -v ON_ERROR_STOP=1 -q < "${WORK_DIR}/dump.sql" > /dev/null
 stage "restore" "$START"
+
+# Verify full row contents before the intentionally lossy optional-column
+# migration roundtrip. Only digests are compared; no fixture or secret values
+# are written to logs or artifacts.
+START="$(now)"
+digest_sql() {
+  printf "SELECT md5(COALESCE(string_agg(row_hash, ',' ORDER BY row_hash), '')) FROM (SELECT md5(to_jsonb(t)::text) AS row_hash FROM %s t) hashes" "$1"
+}
+for table in "${TABLES[@]}"; do
+  sql="$(digest_sql "$table")"
+  source_digest="$(docker compose exec -T postgres psql -U flowops -d flowops -v ON_ERROR_STOP=1 -tAc "$sql")"
+  target_digest="$(docker exec "$REHEARSAL_CONTAINER" psql -U flowops -d flowops -v ON_ERROR_STOP=1 -tAc "$sql")"
+  [[ "$source_digest" == "$target_digest" ]] || { echo "Content digest mismatch: $table" >&2; exit 1; }
+done
+echo "  CONTENT_INTEGRITY: PASS"
+# A failed SQL restore transaction must return nonzero and roll back. The
+# injected row exists only inside the disposable target transaction.
+if printf "%s\n" "BEGIN; CREATE TABLE flowops_rehearsal_failure_probe(id integer); SELECT 1/0; COMMIT;" | \
+    docker exec -i "$REHEARSAL_CONTAINER" psql -U flowops -d flowops -v ON_ERROR_STOP=1 -q >/dev/null 2>&1; then
+  echo "Injected restore transaction unexpectedly succeeded." >&2; exit 1
+fi
+probe="$(docker exec "$REHEARSAL_CONTAINER" psql -U flowops -d flowops -tAc "SELECT to_regclass('flowops_rehearsal_failure_probe') IS NULL")"
+[[ "$probe" == "t" ]] || { echo "Injected failure left database state behind." >&2; exit 1; }
+echo "  RESTORE_FAILURE_ROLLBACK: PASS"
+stage "content_integrity_and_failure_injection" "$START"
 
 echo "Stage 3/4: replay the migration chain on the restored copy"
 echo "  (scripts/check_manual_ticket_migration.py: 0016 down/up roundtrip on restored data)"
@@ -191,6 +236,8 @@ PY
   echo "timestamp_utc: ${STAMP}"
   echo "commit: ${GIT_SHA}"
   echo "result: PASS"
+  echo "pre_migration_content_integrity: PASS"
+  echo "injected_restore_transaction_rollback: PASS"
   echo "tables_reconciled: ${TABLES[*]}"
   echo "alembic_version_after_replay: ${restored_version}"
   for index in "${!STAGE_NAMES[@]}"; do

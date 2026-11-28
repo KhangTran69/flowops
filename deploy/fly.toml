@@ -1,4 +1,4 @@
-# FlowOps public demo on Fly.io.
+# FlowOps protected, simulated-adapter deployment candidate on Fly.io.
 #
 # One Fly app runs the whole topology as process groups; every group is
 # scaled to exactly one machine (see deploy/README.md). Secrets are set with
@@ -8,9 +8,8 @@
 #
 # Migrations are a release step, not a container-start side effect: with
 # several process groups booting concurrently, FLOWOPS_RUN_MIGRATIONS=true
-# would race alembic against itself. Run `alembic upgrade head` once per
-# release (deploy/README.md); a recorded follow-up moves this into the
-# release pipeline properly (ROADMAP Phase 4).
+# would race alembic against itself. The release command validates the
+# deployment configuration and upgrades the schema before rollout.
 
 app = "flowops-demo"
 primary_region = "ams"
@@ -19,7 +18,7 @@ primary_region = "ams"
   dockerfile = "../Dockerfile"
 
 [env]
-  FLOWOPS_ENVIRONMENT = "development"
+  FLOWOPS_ENVIRONMENT = "production"
   FLOWOPS_AUTH_REQUIRED = "true"
   FLOWOPS_UI_AUTH_REQUIRED = "true"
   FLOWOPS_SESSION_COOKIE_SECURE = "true"
@@ -28,6 +27,9 @@ primary_region = "ams"
   FLOWOPS_AUTOMATION_ADAPTER = "simulated"
   FLOWOPS_AI_ADAPTER = "simulated"
   FLOWOPS_RUN_MIGRATIONS = "false"
+
+[deploy]
+  release_command = "python -m scripts.release_preflight"
 
 [processes]
   app = "uvicorn src.api:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=*"
