@@ -1,6 +1,8 @@
 """PostgreSQL coverage for the offboarding completion ledger."""
 
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi.testclient import TestClient
@@ -186,3 +188,70 @@ def test_postgres_ledger_replays_after_definition_migration(client, monkeypatch)
     assert _ledger_states(checklist_id) == {"recover_laptop": "completed"}
     assert client.post(f"{prefix}/archive_mailbox/complete").status_code == 201
     assert calls == ["recover_laptop", "archive_mailbox"]
+
+
+def test_postgres_definition_migration_cannot_race_offboarding_claim(client, monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def fake(key, email):
+        calls.append(key)
+        entered.set()
+        assert release.wait(timeout=10), "test never released the executor"
+        return {"action": key}
+
+    monkeypatch.setattr(onboarding_routes, "offboarding_executor", fake)
+    key = "pg-offboarding-migration-race"
+    steps = [
+        {"key": "recover_laptop", "step": "Recover laptop", "queue": "it-hardware"},
+        {"key": "archive_mailbox", "step": "Archive mailbox", "queue": "it-messaging"},
+    ]
+    created = client.post(
+        "/workflow-definitions",
+        json={"key": key, "name": "Migration race", "request_type": "offboarding", "steps": steps},
+    )
+    assert created.status_code == 200, created.text
+    assert client.post(f"/workflow-definitions/{key}/publish", json={"version": 1}).status_code == 200
+    request = client.post("/onboarding-requests", json={**OFFBOARDING, "definition_key": key})
+    assert request.status_code == 201, request.text
+    request_id = request.json()["id"]
+    completion_path = f"/offboarding-requests/{request_id}/steps/recover_laptop/complete"
+    migration_path = f"/onboarding-requests/{request_id}/definition"
+    changed = [dict(step) for step in steps]
+    changed[0]["step"] = "Recover assigned laptop"
+    assert client.put(f"/workflow-definitions/{key}", json={"steps": changed}).status_code == 200
+    rejected = client.post(migration_path, json={"version": 2, "dry_run": False})
+    assert rejected.status_code == 409
+    assert "unpublished" in rejected.json()["detail"]
+    assert client.post(f"/workflow-definitions/{key}/publish", json={"version": 2}).status_code == 200
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(client.post, completion_path)
+        try:
+            assert entered.wait(timeout=5), "executor was not reached"
+            rejected = client.post(migration_path, json={"version": 2, "dry_run": False})
+            assert rejected.status_code == 409
+            assert "active ledger claim" in rejected.json()["detail"]
+            assert _ledger_states(request_id) == {"recover_laptop": "running"}
+            duplicate = client.post(completion_path)
+            assert duplicate.status_code == 409
+        finally:
+            release.set()
+        completed = pending.result(timeout=5)
+    assert completed.status_code == 201, completed.text
+    assert calls == ["recover_laptop"]
+    applied = client.post(migration_path, json={"version": 2, "dry_run": False})
+    assert applied.status_code == 200, applied.text
+    replay = client.post(completion_path)
+    assert replay.status_code == 200
+    assert replay.json() == completed.json()
+    assert calls == ["recover_laptop"]
+
+    changed[0]["depends_on"] = ["archive_mailbox"]
+    assert client.put(f"/workflow-definitions/{key}", json={"steps": changed}).status_code == 200
+    assert client.post(f"/workflow-definitions/{key}/publish", json={"version": 3}).status_code == 200
+    rejected = client.post(migration_path, json={"version": 3, "dry_run": False})
+    assert rejected.status_code == 409
+    assert "execution rules" in rejected.json()["detail"]
+    assert client.get(f"/onboarding-requests/{request_id}").json()["definition_version"] == 2

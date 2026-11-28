@@ -151,6 +151,27 @@ def create_onboarding_request(
         raise
 
 
+def _lock_request_for_definition_or_completion(
+    session: Session, request_id: int, actor: Actor,
+) -> db.OnboardingRequestRecord | None:
+    """Serialize definition changes and ledger claims on the same request.
+
+    PostgreSQL takes a row lock; SQLite acquires its writer reservation before
+    reading the checklist. The lock is released when the claim is committed,
+    so no database lock is held across an external executor call.
+    """
+    table = db.OnboardingRequestRecord
+    conditions = [table.id == request_id]
+    tenant_key = _actor_tenant(actor)
+    if tenant_key is not None:
+        conditions.append(table.tenant_key == tenant_key)
+    if session.get_bind().dialect.name == "sqlite":
+        session.execute(update(table).where(*conditions).values(id=table.id))
+    return session.execute(
+        select(table).where(*conditions).with_for_update()
+    ).scalar_one_or_none()
+
+
 @router.post("/onboarding-requests/{request_id}/definition")
 def migrate_definition(
     request_id: int,
@@ -159,6 +180,10 @@ def migrate_definition(
     session: Session = Depends(db.get_session),
 ) -> dict[str, Any]:
     """Preview or apply a safe move to another definition version."""
+    if not payload.dry_run:
+        locked = _lock_request_for_definition_or_completion(session, request_id, actor)
+        if locked is None:
+            raise HTTPException(404, "Onboarding request not found.")
     record, items = _load_request(session, request_id)
     _require_request_access(actor, record)
     if not record.definition_key:
@@ -191,6 +216,24 @@ def migrate_definition(
     }
     if payload.dry_run:
         return diff
+    if target.published_at is None:
+        raise HTTPException(409, "Cannot migrate to an unpublished definition version.")
+    if record.request_type == "offboarding":
+        ledger = db.OffboardingCompletionRecord
+        running = session.execute(
+            select(ledger.id).where(ledger.checklist_id == record.id, ledger.status == "running").limit(1)
+        ).scalar_one_or_none()
+        if running is not None:
+            raise HTTPException(409, "Cannot migrate while an offboarding step has an active ledger claim.")
+        for key in sorted(set(existing) & set(target_steps)):
+            item, step = existing[key], target_steps[key]
+            if item.status not in ("approved", "completed"):
+                continue
+            before = (item.action or "none", item.requires_approval, json.loads(item.depends_on_json or "[]"),
+                      item.join_mode or "all", json.loads(item.when_json or "[]"))
+            after = (step["action"], step["requires_approval"], step["depends_on"], step["join"], step["when"])
+            if before != after:
+                raise HTTPException(409, f"Cannot change execution rules for {item.status} step {key!r} during migration.")
     for key in removed:
         if existing[key].status == "completed":
             raise HTTPException(
@@ -629,7 +672,7 @@ def complete_offboarding_step(
     authenticated actor.
     """
     started = time.perf_counter()
-    record = session.get(db.OnboardingRequestRecord, checklist_id)
+    record = _lock_request_for_definition_or_completion(session, checklist_id, actor)
     if record is None:
         raise HTTPException(status_code=404, detail="Offboarding checklist not found.")
     _require_request_access(actor, record)
