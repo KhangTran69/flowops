@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from typing import Any
 
@@ -120,6 +121,42 @@ class FlowOpsTools:
         self._require_writes("retry_job")
         return self._call("POST", f"/workflow-jobs/{job_id}/retry")
 
+    @staticmethod
+    def _resource_key(key: str) -> str:
+        """Keep MCP identifiers inside a single API path segment."""
+        if key in (".", "..") or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", key):
+            raise FlowOpsToolError("Invalid resource key: use letters, digits, dots, underscores or hyphens.")
+        return key
+
+    def list_workflow_definitions(self) -> list[dict]:
+        """List workflow definitions; requires a global administrator API credential."""
+        return self._call("GET", "/workflow-definitions")
+
+    def get_workflow_definition(self, key: str) -> dict:
+        """Inspect one workflow definition and its immutable versions."""
+        return self._call("GET", f"/workflow-definitions/{self._resource_key(key)}")
+
+    def list_workflow_runs(
+        self, status: str | None = None, tenant: str | None = None,
+        definition: str | None = None, limit: int = 20, offset: int = 0,
+    ) -> list[dict]:
+        """List authorized workflow runs with optional filters and pagination."""
+        params = {"status": status, "tenant": tenant, "definition": definition,
+                  "limit": max(1, min(limit, 200)), "offset": max(0, offset)}
+        return self._call("GET", "/workflow-runs", params={k: v for k, v in params.items() if v is not None})
+
+    def get_workflow_run(self, run_id: int) -> dict:
+        """Inspect one authorized workflow run, including checklist and attempts."""
+        return self._call("GET", f"/workflow-runs/{run_id}")
+
+    def list_triggers(self) -> list[dict]:
+        """List trigger configuration; requires a global administrator API credential."""
+        return self._call("GET", "/triggers")
+
+    def get_trigger(self, key: str) -> dict:
+        """Inspect a trigger configuration without firing it."""
+        return self._call("GET", f"/triggers/{self._resource_key(key)}")
+
     def automation_kpis(self, days: int = 30) -> dict:
         return self._call("GET", "/reports/summary", params={"days": days})
 
@@ -130,6 +167,8 @@ class FlowOpsTools:
 TOOL_NAMES = (
     "list_tickets", "get_ticket", "triage_ticket", "list_pending_approvals", "request_onboarding",
     "list_failed_jobs", "retry_job", "automation_kpis", "tenant_drift_report",
+    "list_workflow_definitions", "get_workflow_definition", "list_workflow_runs", "get_workflow_run",
+    "list_triggers", "get_trigger",
 )
 
 
@@ -138,7 +177,8 @@ def build_server(tools: FlowOpsTools) -> MCPServer:
         "flowops",
         instructions=(
             "FlowOps is an MSP service-desk automation platform. Use read tools to inspect "
-            "tickets, failed jobs, KPIs and tenant drift. Triage suggestions are advisory; "
+            "tickets, workflow definitions and runs, triggers, failed jobs, KPIs and tenant drift. "
+            "Triage suggestions are advisory; "
             "never claim a step was approved, approvals are done by a human operator."
         ),
     )
