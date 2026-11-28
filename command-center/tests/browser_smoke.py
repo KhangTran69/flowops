@@ -7,6 +7,46 @@ from urllib.request import urlopen
 from playwright.sync_api import expect, sync_playwright
 
 
+def _seed_notification_rows():
+    """Insert one pending and one dead-letter delivery for the console actions.
+
+    The smoke environment has no FLOWOPS_NOTIFICATION_WEBHOOK_URL (intake never
+    queues deliveries there), so the requeue/retry journey needs fixtures.
+    Written through the same SQLite file the API uses.
+    """
+    import sqlite3
+    from datetime import datetime, timezone
+
+    url = os.environ.get("FLOWOPS_DATABASE_URL", "sqlite:///data/flowops.db")
+    path = url.removeprefix("sqlite:///")
+    now = datetime.now(timezone.utc).isoformat()
+    rows = [
+        ("http://127.0.0.1:9/unreachable",
+         '{"event":"ticket.created","ticket":{"ticket_id":"SMOKE-NTF-PENDING"}}',
+         "SMOKE-NTF-PENDING", "pending", 0, None),
+        ("http://127.0.0.1:9/unreachable",
+         '{"event":"ticket.created","ticket":{"ticket_id":"SMOKE-NTF-DEAD"}}',
+         "SMOKE-NTF-DEAD", "failed", 5, "Connection refused (smoke fixture)"),
+    ]
+    connection = sqlite3.connect(path, timeout=10)
+    try:
+        for entry in rows:
+            for _ in range(3):
+                try:
+                    connection.execute(
+                        "INSERT INTO notification_outbox "
+                        "(url, payload_json, ticket_id, status, attempts, last_error, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (entry[0], entry[1], entry[2], entry[3], entry[4], entry[5], now, now),
+                    )
+                    break
+                except sqlite3.OperationalError:
+                    time.sleep(0.5)
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def wait_ready(url):
     for _ in range(60):
         try:
@@ -22,6 +62,7 @@ def wait_ready(url):
 def main():
     base = os.environ.get("FLOWOPS_BROWSER_URL", "http://127.0.0.1:8787")
     wait_ready(base + "/api/session")
+    _seed_notification_rows()
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch()
         page = browser.new_page(viewport={"width": 1280, "height": 900})
@@ -107,10 +148,23 @@ def main():
         expect(page.get_by_role("navigation", name="Main")).to_be_visible()
         page.get_by_role("link", name="Tickets", exact=True).click()
         expect(page.get_by_role("heading", name="Tickets", exact=True)).to_be_visible()
+        page.set_viewport_size({'width': 1280, 'height': 900})
         page.goto(base + '/deliveries')
         expect(page.get_by_role('heading', name='Notification deliveries')).to_be_visible()
+        dead = page.locator('table:visible tbody tr').filter(has_text='SMOKE-NTF-DEAD')
+        expect(dead).to_be_visible(timeout=15000)
+        requeue = page.get_by_role('button', name='Requeue', exact=True).first
+        expect(requeue).to_be_visible(timeout=15000)
+        requeue.click()
+        dialog = page.get_by_role('dialog', name='Requeue this delivery?')
+        expect(dialog).to_be_visible()
+        dialog.get_by_role('button', name='Requeue', exact=True).click()
+        expect(dialog).not_to_be_visible(timeout=15000)
         page.get_by_label('Delivery state').select_option('pending')
-        expect(page.get_by_text('Page 1', exact=True)).to_be_visible()
+        expect(page.locator('table:visible tbody tr').filter(has_text='SMOKE-NTF-DEAD')).to_be_visible(timeout=15000)
+        page.get_by_role('button', name='Retry pending').click()
+        expect(page.get_by_text('Pending deliveries retried once each.')).to_be_visible(timeout=15000)
+        print('NOTIFICATIONS_PORT_PASS /deliveries', flush=True)
         page.set_viewport_size({'width': 1280, 'height': 900})
         page.goto(base + '/jobs')
         expect(page.get_by_role('heading', name='Workflow jobs')).to_be_visible()

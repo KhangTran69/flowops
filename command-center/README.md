@@ -115,8 +115,13 @@ operator value:
   runtime validation + browser-smoke journey incl. cancel; additive
   `payload`/`result`/lease fields on `WorkflowJobOut` so the console sees
   what the Jinja detail shows)
-- [ ] **Notifications / outbox** (`/ui/notifications`) — pending + dead-letter
+- [x] **Notifications / outbox** (`/ui/notifications`) — pending + dead-letter
   tables, requeue/retry actions
+  — ported 2026-11-28 (Deliveries upgraded to the real `/notifications/
+  pending|failed` APIs with destination/error columns, `Retry pending`
+  operator action, and per-row admin `Requeue` with confirm; typed
+  `NotificationDelivery` contract + runtime validation + browser-smoke
+  journey seeding real dead-letter/pending fixtures)
 - [ ] **Analytics** (`/ui/analytics`) — summary cards, step bottlenecks,
   tenant/window filters
 - [ ] **Triggers** (`/ui/triggers`, trigger detail) — source config, delivery

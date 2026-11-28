@@ -91,6 +91,15 @@ export type DefinitionStep = {
 export type DefinitionVersion = { version: number; checksum: string; steps: DefinitionStep[]; created_by: string | null; created_at: string; published_at: string | null }
 export type WorkflowDefinition = { key: string; name: string; request_type: string; status: string; current_version: number | null; versions: DefinitionVersion[] }
 export type DefinitionDiff = { from_version: number; to_version: number; added: string[]; removed: string[]; changed: string[] }
+export type NotificationDelivery = {
+  id: number
+  url: string
+  ticket_id: string | null
+  status: string
+  attempts: number
+  last_error: string | null
+  created_at: string
+}
 export type WorkflowJob = {
   id: number
   job_type: string

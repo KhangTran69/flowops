@@ -17,6 +17,7 @@ const definitionStep = z.object({ key: text, step: text, queue: text, requires_a
 const definition = z.object({ key: text, name: text, request_type: text, status: text, current_version: integer.nullable(), versions: z.array(z.object({ version: integer, checksum: text, steps: z.array(definitionStep), created_by: nullableText, created_at: text, published_at: nullableText }).passthrough()) }).passthrough()
 const diff = z.object({ from_version: integer, to_version: integer, added: z.array(text), removed: z.array(text), changed: z.array(text) })
 const summary = z.object({ open_tickets: integer.nonnegative(), urgent_tickets: integer.nonnegative(), pending_approvals: integer.nonnegative(), active_runs: integer.nonnegative(), overdue_steps: integer.nonnegative(), recorded_closed_today: integer.nonnegative() })
+const delivery = z.object({ id: integer, url: text, ticket_id: nullableText, status: text, attempts: integer.nonnegative(), last_error: nullableText, created_at: text }).passthrough()
 const job = z.object({ id: integer, job_type: text, status: text, attempts: integer.nonnegative(), max_attempts: integer.nonnegative(), available_at: text, last_error: nullableText, resource_type: nullableText, resource_id: nullableText, label: nullableText, created_at: text, updated_at: text, completed_at: nullableText, payload: z.record(text, z.unknown()).nullable(), result: z.record(text, z.unknown()).nullable(), lease_owner_token: nullableText, lease_expires_at: nullableText }).passthrough()
 const actionExecution = z.object({ id: integer, request_id: integer, checklist_item_id: integer, action: text, actor_subject: nullableText, adapter: text, correlation_id: text, attempt: integer, status: text, error_category: nullableText, error_detail: nullableText, external_reference: nullableText, started_at: text, completed_at: nullableText, duration_ms: integer.nullable() }).passthrough()
 const triage = z.object({ ticket_id: text, summary: z.object({ text, urgency_signals: z.array(text) }).passthrough(), recommendations: z.array(z.object({ id: text, kind: text, title: text, current: nullableText, suggested: nullableText, rationale: text, confidence: integer, applicable: z.boolean() }).passthrough()), knowledge_base: z.array(z.object({ score: integer, article: z.object({ id: text, title: text, summary: text, category: text }).passthrough() }).passthrough()), adapter: text, generated_at: text }).passthrough()
@@ -41,6 +42,9 @@ export function responseSchema(method: string, path: string): z.ZodType | undefi
   if (path.endsWith('/diff') && path.startsWith('/workflow-definitions/')) return diff
   if (path === '/workflow-definitions/validate') return z.object({ steps: z.array(definitionStep), checksum: text })
   if (path.startsWith('/workflow-definitions/')) return definition
+  if (path === '/notifications/pending' || path === '/notifications/failed') return z.array(delivery)
+  if (path === '/notifications/retry') return z.array(delivery)
+  if (/^\/notifications\/[^/]+\/requeue$/.test(path)) return delivery
   if (path === '/workflow-jobs') return z.array(job)
   if (/^\/workflow-jobs\/[^/]+\/history$/.test(path)) return z.array(actionExecution)
   if (path.startsWith('/workflow-jobs/')) return job
