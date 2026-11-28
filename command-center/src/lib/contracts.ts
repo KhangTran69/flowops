@@ -91,5 +91,41 @@ export type DefinitionStep = {
 export type DefinitionVersion = { version: number; checksum: string; steps: DefinitionStep[]; created_by: string | null; created_at: string; published_at: string | null }
 export type WorkflowDefinition = { key: string; name: string; request_type: string; status: string; current_version: number | null; versions: DefinitionVersion[] }
 export type DefinitionDiff = { from_version: number; to_version: number; added: string[]; removed: string[]; changed: string[] }
+export type WorkflowJob = {
+  id: number
+  job_type: string
+  status: string
+  attempts: number
+  max_attempts: number
+  available_at: string
+  last_error: string | null
+  resource_type: string | null
+  resource_id: string | null
+  label: string | null
+  created_at: string
+  updated_at: string
+  completed_at: string | null
+  payload: Record<string, unknown> | null
+  result: Record<string, unknown> | null
+  lease_owner_token: string | null
+  lease_expires_at: string | null
+}
+export type ActionExecution = {
+  id: number
+  request_id: number
+  checklist_item_id: number
+  action: string
+  actor_subject: string | null
+  adapter: string
+  correlation_id: string
+  attempt: number
+  status: string
+  error_category: string | null
+  error_detail: string | null
+  external_reference: string | null
+  started_at: string
+  completed_at: string | null
+  duration_ms: number | null
+}
 export type ExecutionLog = { id: number; run_id: string; action: string; status: string; ticket_id: string | null; duration_ms: number; detail: string | null; actor_subject: string | null; correlation_id: string | null; created_at: string }
 export type Readiness = { status: string; database: string }

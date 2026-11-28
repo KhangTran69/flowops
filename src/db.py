@@ -142,6 +142,22 @@ class WorkflowJobRecord(Base):
     that lost its lease cannot mark the job succeeded or schedule a retry.
     """
 
+    @property
+    def payload(self) -> dict | None:
+        """Parsed ``payload_json`` (None when absent or malformed)."""
+        try:
+            return json.loads(self.payload_json) if self.payload_json else None
+        except (TypeError, json.JSONDecodeError):
+            return None
+
+    @property
+    def result(self) -> dict | None:
+        """Parsed ``result_json`` (None when absent or malformed)."""
+        try:
+            return json.loads(self.result_json) if self.result_json else None
+        except (TypeError, json.JSONDecodeError):
+            return None
+
     __tablename__ = "workflow_jobs"
     __table_args__ = (
         Index("ix_workflow_jobs_status_available", "status", "available_at"),
