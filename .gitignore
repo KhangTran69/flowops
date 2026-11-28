@@ -25,3 +25,7 @@ data/*.db-wal
 
 # Local scratch databases and generated test artifacts
 tmp/
+
+# Coverage data file (CI regenerates it; never ship a local one)
+.coverage
+.coverage.*
