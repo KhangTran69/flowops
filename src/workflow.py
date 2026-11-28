@@ -96,14 +96,14 @@ def step_states(
 def missing_prerequisites(
     item: db.ChecklistItemRecord, items: Sequence[db.ChecklistItemRecord]
 ) -> list[str]:
-    """Prerequisite keys of ``item`` that are not ``completed`` yet."""
+    """Prerequisite keys that still block the item's declared join."""
     return unmet_prerequisites(step_state(item), step_states(items))
 
 
 def is_ready(
     item: db.ChecklistItemRecord, items: Sequence[db.ChecklistItemRecord]
 ) -> bool:
-    """True when every prerequisite step of ``item`` is ``completed``."""
+    """True when the item's declared prerequisite join is satisfied."""
     return is_step_ready(step_state(item), step_states(items))
 
 

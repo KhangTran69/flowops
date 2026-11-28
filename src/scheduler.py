@@ -352,7 +352,9 @@ def advance_from_job(
         return None
     run = session.get(db.WorkflowRunRecord, int(run_id))
     step_run = session.get(db.WorkflowStepRunRecord, int(step_run_id))
-    if run is None or step_run is None:
+    if (run is None or step_run is None or step_run.run_id != run.id
+            or step_run.job_id != job.id or step_run.status not in ACTIVE_STEP_STATUSES
+            or run.status in {"cancelled", "completed", "failed"}):
         return None
     at = _now(now)
     step_run.status = "succeeded" if success else "failed"

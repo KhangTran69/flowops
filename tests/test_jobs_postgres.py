@@ -85,3 +85,40 @@ def test_postgres_enqueue_and_cancel_via_api(client):
     cancelled = client.post(f"/workflow-jobs/{job_id}/cancel")
     assert cancelled.status_code == 200
     assert cancelled.json()["status"] == "cancelled"
+
+
+def test_postgres_expired_lease_cannot_be_renewed_or_finalized(client):
+    with db.SessionLocal() as session:
+        row = jobs.enqueue_job(session, job_type=jobs.JOB_TRIGGER_EXECUTE, payload={})
+        session.commit()
+        at = db.utcnow()
+        claimed = jobs.claim_job(session, "expired-owner", now=at, lease_seconds=1)
+        assert claimed is not None and claimed.id == row.id
+        token = claimed.lease_owner_token
+        expired = at + timedelta(seconds=1)
+        assert not jobs.heartbeat_job(session, row.id, token, now=expired)
+        assert not jobs.complete_job(session, row.id, token, now=expired)
+        assert jobs.fail_job(session, row.id, token, "late failure", now=expired) is None
+        session.commit()
+        replacement = jobs.claim_job(session, "replacement", now=expired)
+        assert replacement is not None and replacement.lease_owner_token != token
+        assert jobs.complete_job(session, row.id, replacement.lease_owner_token, now=expired)
+        session.commit()
+
+
+def test_postgres_exhausted_abandoned_claim_is_terminalized_without_another_attempt(client):
+    with db.SessionLocal() as session:
+        row = jobs.enqueue_job(session, job_type=jobs.JOB_TRIGGER_EXECUTE, payload={}, max_attempts=1)
+        session.commit()
+        job_id = row.id
+        at = db.utcnow()
+        claimed = jobs.claim_job(session, "abandoned", now=at, lease_seconds=1)
+        assert claimed is not None
+        expired = at + timedelta(seconds=2)
+        assert jobs.claim_job(session, "too-late", now=expired) is None
+        terminal = jobs.reap_exhausted_job(session, now=expired)
+        assert terminal is not None and terminal.id == job_id
+        assert terminal.attempts == 1 and terminal.status == "failed"
+        assert terminal.lease_owner_token is None
+        session.commit()
+        assert jobs.reap_exhausted_job(session, now=expired) is None

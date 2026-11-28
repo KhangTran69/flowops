@@ -35,7 +35,7 @@ MAX_BACKOFF_SECONDS = 300
 
 def backoff_seconds(attempts: int) -> int:
     """Exponential backoff capped at five minutes."""
-    return min(MAX_BACKOFF_SECONDS, 2 ** max(0, attempts - 1))
+    return min(MAX_BACKOFF_SECONDS, 2 ** min(9, max(0, attempts - 1)))
 
 
 def enqueue_job(
@@ -84,7 +84,7 @@ def _claimable(now: datetime):
         and_(
             db.WorkflowJobRecord.status == "running",
             db.WorkflowJobRecord.lease_expires_at.is_not(None),
-            db.WorkflowJobRecord.lease_expires_at < now,
+            db.WorkflowJobRecord.lease_expires_at <= now,
         ),
     )
 
@@ -103,7 +103,7 @@ def claim_job(
     table = db.WorkflowJobRecord
     candidate_query = (
         select(table.id)
-        .where(_claimable(now))
+        .where(_claimable(now), table.attempts < table.max_attempts)
         .order_by(table.available_at, table.id)
         .limit(candidate_limit)
     )
@@ -114,7 +114,7 @@ def claim_job(
     for job_id in candidate_ids:
         result = session.execute(
             update(table).execution_options(synchronize_session=False)
-            .where(and_(table.id == job_id, _claimable(now)))
+            .where(and_(table.id == job_id, _claimable(now), table.attempts < table.max_attempts))
             .values(
                 status="running",
                 attempts=table.attempts + 1,
@@ -129,6 +129,32 @@ def claim_job(
             return session.get(table, job_id)
     session.commit()
     return None
+
+
+EXHAUSTED_LEASE_ERROR = "Execution attempt budget exhausted after abandoned ownership; reconcile any external effects before retry."
+
+
+def reap_exhausted_job(session: Session, *, now: datetime | None = None) -> db.WorkflowJobRecord | None:
+    """Terminalize one due, over-budget job without another external attempt.
+
+    The caller must commit the job and associated ledger updates together.
+    """
+    now = now or db.utcnow()
+    table = db.WorkflowJobRecord
+    condition = and_(_claimable(now), table.attempts >= table.max_attempts)
+    query = select(table.id).where(condition).order_by(table.available_at, table.id).limit(1)
+    if session.get_bind().dialect.name == "postgresql":
+        query = query.with_for_update(skip_locked=True)
+    job_id = session.execute(query).scalar_one_or_none()
+    if job_id is None:
+        return None
+    result = session.execute(update(table).execution_options(synchronize_session=False)
+        .where(table.id == job_id, condition)
+        .values(status="failed", last_error=EXHAUSTED_LEASE_ERROR,
+                lease_owner_token=None, lease_expires_at=None, completed_at=now, updated_at=now))
+    if result.rowcount != 1:  # type: ignore[attr-defined]
+        return None
+    return session.get(table, job_id, populate_existing=True)
 
 
 def heartbeat_job(
@@ -148,6 +174,7 @@ def heartbeat_job(
             and_(
                 table.id == job_id,
                 table.lease_owner_token == owner_token,
+                table.lease_expires_at > now,
                 table.status == "running",
             )
         )
@@ -176,6 +203,7 @@ def complete_job(
             and_(
                 table.id == job_id,
                 table.lease_owner_token == owner_token,
+                table.lease_expires_at > now,
                 table.status == "running",
             )
         )
@@ -240,6 +268,7 @@ def fail_job(
             and_(
                 table.id == job_id,
                 table.lease_owner_token == owner_token,
+                table.lease_expires_at > now,
                 table.status == "running",
             )
         )

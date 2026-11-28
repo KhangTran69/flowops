@@ -88,6 +88,8 @@ def _create_onboarding_request(
             )
             if selected is None:
                 raise HTTPException(422, "Definition version not found.")
+            if selected.published_at is None:
+                raise HTTPException(409, "Cannot start a request using an unpublished definition version.")
             version = selected
         steps = json.loads(version.steps_json)
         record.definition_key = definition.key
@@ -114,6 +116,8 @@ def _create_onboarding_request(
             )
         )
     session.flush()
+    _, items = _load_request(session, record.id)
+    workflow.apply_graph_transitions(session, items, request_id=record.id, actor_subject=actor_subject)
     timers.sync_timers(session, record.id)
     db.log_execution(
         session,
