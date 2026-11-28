@@ -35,7 +35,7 @@ MAX_BACKOFF_SECONDS = 300
 
 def backoff_seconds(attempts: int) -> int:
     """Exponential backoff capped at five minutes."""
-    return min(MAX_BACKOFF_SECONDS, 2 ** max(0, attempts - 1))
+    return min(MAX_BACKOFF_SECONDS, 2 ** min(9, max(0, attempts - 1)))
 
 
 def enqueue_job(
@@ -84,7 +84,7 @@ def _claimable(now: datetime):
         and_(
             db.WorkflowJobRecord.status == "running",
             db.WorkflowJobRecord.lease_expires_at.is_not(None),
-            db.WorkflowJobRecord.lease_expires_at < now,
+            db.WorkflowJobRecord.lease_expires_at <= now,
         ),
     )
 
@@ -148,6 +148,7 @@ def heartbeat_job(
             and_(
                 table.id == job_id,
                 table.lease_owner_token == owner_token,
+                table.lease_expires_at > now,
                 table.status == "running",
             )
         )
@@ -176,6 +177,7 @@ def complete_job(
             and_(
                 table.id == job_id,
                 table.lease_owner_token == owner_token,
+                table.lease_expires_at > now,
                 table.status == "running",
             )
         )
@@ -240,6 +242,7 @@ def fail_job(
             and_(
                 table.id == job_id,
                 table.lease_owner_token == owner_token,
+                table.lease_expires_at > now,
                 table.status == "running",
             )
         )
