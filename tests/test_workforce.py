@@ -596,4 +596,8 @@ def test_workforce_production_browser_gate_does_not_disable_bearer_api(workforce
     assert client.get("/workforce/employees").status_code == 403
     set_actor(Actor("hr-bearer", ("HR",), source="bearer", tenant_key="tenant-a"))
     assert client.get("/workforce/ui").status_code == 403
+    # SQLite cannot admit protected requests. Isolate the role contract
+    # with an explicit test double, not a production configuration bypass.
+    assert client.get("/workforce/employees").status_code == 503
+    monkeypatch.setattr("src.routes.workforce._enforce_actor_rate_limit", lambda _: None)
     assert client.get("/workforce/employees").status_code == 200

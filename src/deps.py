@@ -11,7 +11,7 @@ from fastapi import Depends, Header, HTTPException, Request
 from sqlalchemy import String, and_, cast, or_, select
 from sqlalchemy.orm import Session
 
-from src import db, ui_session
+from src import db, rate_limit, ui_session
 from src.auth import (
     Actor,
     AuthenticationError,
@@ -72,7 +72,7 @@ def _operator_actor(
         raise HTTPException(status_code=403, detail="Operator role is required.")
     _actor_tenant(actor)
     _enforce_csrf(request, actor)
-    _enforce_rate_limit(f"actor:{actor.subject}")
+    _enforce_actor_rate_limit(actor)
     return actor
 
 
@@ -84,7 +84,7 @@ def _admin_actor(
         raise HTTPException(status_code=403, detail="Admin role is required.")
     _actor_tenant(actor)
     _enforce_csrf(request, actor)
-    _enforce_rate_limit(f"actor:{actor.subject}")
+    _enforce_actor_rate_limit(actor)
     return actor
 
 
@@ -124,7 +124,7 @@ def _webhook_actor(
         raise HTTPException(status_code=503, detail="Webhook authentication is not configured.")
     if expected and environment != "development" and len(expected) < 32:
         raise HTTPException(status_code=503, detail="Webhook authentication is not securely configured.")
-    if expected and not secrets.compare_digest(x_api_key or "", expected):
+    if expected and not secrets.compare_digest((x_api_key or "").encode(), expected.encode()):
         raise HTTPException(status_code=401, detail="Invalid webhook API key.")
     _enforce_rate_limit("webhook:intake")
     return "webhook-api-key" if expected else "local-development"
@@ -147,7 +147,7 @@ def _event_webhook_actor(
         expected = os.environ.get(f"FLOWOPS_TENANT_{reference.upper()}_WEBHOOK_API_KEY", "")
         if not expected or (environment != "development" and len(expected) < 32):
             raise HTTPException(status_code=503, detail="Tenant webhook authentication is not configured.")
-        if not secrets.compare_digest(x_api_key or "", expected):
+        if not secrets.compare_digest((x_api_key or "").encode(), expected.encode()):
             raise HTTPException(status_code=401, detail="Invalid tenant webhook API key.")
         if secrets.compare_digest(
             expected, os.environ.get("FLOWOPS_WEBHOOK_API_KEY", "")
@@ -172,7 +172,7 @@ def _event_webhook_actor(
         raise HTTPException(status_code=503, detail="Webhook authentication is not configured.")
     if expected and environment != "development" and len(expected) < 32:
         raise HTTPException(status_code=503, detail="Webhook authentication is not securely configured.")
-    if expected and not secrets.compare_digest(x_api_key or "", expected):
+    if expected and not secrets.compare_digest((x_api_key or "").encode(), expected.encode()):
         raise HTTPException(status_code=401, detail="Invalid webhook API key.")
     if not expected and x_api_key:
         raise HTTPException(status_code=401, detail="Invalid webhook API key.")
@@ -221,14 +221,30 @@ _RATE_LIMIT_LOCK = threading.Lock()
 _RATE_LIMIT_BUCKETS: dict[str, tuple[float, int]] = {}
 
 
+def _enforce_actor_rate_limit(actor: Actor) -> None:
+    _enforce_rate_limit(rate_limit.actor_key(actor.subject, actor.tenant_key))
+
+
 def _enforce_rate_limit(actor_key: str) -> None:
-    """Simple in-process token bucket for the prototype (disabled by default)."""
+    """Shared PostgreSQL admission; process-local only in development SQLite."""
     try:
-        limit = int(os.environ.get("FLOWOPS_RATE_LIMIT_PER_MINUTE", "0") or 0)
-    except ValueError:
-        limit = 0
-    if limit <= 0:
+        limit = rate_limit.configured_limit()
+    except ValueError as error:
+        raise HTTPException(503, "Rate limiter is not securely configured.") from error
+    if not limit:
         return
+    if db.engine.dialect.name == "postgresql":
+        try:
+            allowed, retry = rate_limit.consume(actor_key, limit)
+        except rate_limit.Unavailable as error:
+            raise HTTPException(503, "Rate limiter temporarily unavailable.",
+                                headers={"Retry-After": "3"}) from error
+        if not allowed:
+            raise HTTPException(429, "Rate limit exceeded; retry later.",
+                                headers={"Retry-After": str(retry)})
+        return
+    if os.environ.get("FLOWOPS_ENVIRONMENT", "development").strip().lower() != "development":
+        raise HTTPException(503, "Shared rate limiter required.")
     now = time.monotonic()
     with _RATE_LIMIT_LOCK:
         # Bound expired identities and fail closed on excessive active keys.

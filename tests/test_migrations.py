@@ -41,6 +41,7 @@ def test_alembic_upgrade_creates_all_tables_and_is_repeatable(tmp_path):
         "workforce_reminder_events",
         "tenants",
         "alembic_version",
+        "rate_limit_buckets",
     } <= tables
 
 
