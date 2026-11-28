@@ -32,3 +32,6 @@ tmp/
 # Coverage data file (CI regenerates it; never ship a local one)
 .coverage
 .coverage.*
+
+# Backup/restore rehearsal timings (regenerated per run; uploaded as CI artifact)
+backup-restore-timings.txt
