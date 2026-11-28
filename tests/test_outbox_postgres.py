@@ -124,3 +124,24 @@ def test_postgres_retry_dead_letters_then_requeue_delivers(client, monkeypatch):
     assert [entry["status"] for entry in delivered] == ["delivered"]
     assert client.get("/notifications/failed").json() == []
     assert client.get("/notifications/pending").json() == []
+
+
+def test_postgres_manual_retry_does_not_dispatch_worker_owned_row(client, monkeypatch):
+    from src import outbox
+
+    with db.SessionLocal() as session:
+        row = db.NotificationOutboxRecord(url="https://hooks.example/leased",
+            payload_json='{"event":"ticket.created"}', ticket_id="42", status="pending", attempts=0)
+        session.add(row)
+        session.commit()
+        notification_id = row.id
+        claimed = outbox.claim_delivery(session, "background-worker")
+        assert claimed is not None and claimed.id == notification_id
+        token = claimed.lease_owner_token
+    monkeypatch.setattr(monitoring, "deliver_webhook", lambda *args, **kwargs: pytest.fail("double dispatch"))
+    response = client.post("/notifications/retry")
+    assert response.status_code == 200 and response.json() == []
+    with db.SessionLocal() as session:
+        row = session.get(db.NotificationOutboxRecord, notification_id)
+        assert row.lease_owner_token == token
+        assert row.status == "pending" and row.attempts == 0

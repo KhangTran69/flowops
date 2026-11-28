@@ -151,3 +151,18 @@ def test_concurrent_claims_only_one_owner(database):
         assert second is None
     finally:
         session.close()
+
+
+def test_expired_dispatcher_cannot_finalize_without_takeover(database):
+    notification_id = _insert()
+    with db.SessionLocal() as session:
+        at = datetime.now(timezone.utc)
+        first = outbox.claim_delivery(session, now=at, lease_seconds=1)
+        assert first is not None
+        token = first.lease_owner_token or ""
+        expired = at + timedelta(seconds=1)
+        assert outbox.finalize_delivery(session, notification_id, token,
+            success=True, attempt_delta=1, error=None, max_attempts=5, now=expired) is None
+        session.commit()
+        replacement = outbox.claim_delivery(session, now=expired)
+        assert replacement is not None and replacement.lease_owner_token != token

@@ -18,3 +18,11 @@ In n8n, open the failed execution and look at the HTTP node's status code:
 | 5xx | FlowOps is down | Check `/ready`. Escalate if it is not `ready`. |
 
 Re-running an n8n execution is safe: FlowOps de-duplicates by ticket id and `Idempotency-Key`.
+
+Manual retry and the automatic dispatcher use the same lease claim and
+conditional finalization. Manual retry may bypass a scheduled delay but
+cannot take over an unexpired worker lease. A completed send with an expired
+lease is an uncertain external effect: reconcile receiver-side evidence
+before retrying. This is at-least-once delivery, not exactly-once execution.
+The dispatcher backs off after database operational errors; repeated
+outages should be escalated rather than bypassing database fencing.
