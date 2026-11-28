@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from sqlalchemy import and_, select, update
 from sqlalchemy.orm import Session
 
-from src import db
+from src import db, outbox
 from src.auth import Actor
 from src.deps import _admin_actor, _new_run_id, _operator_actor, _scope_execution_log_query, _scope_ticket_or_request_keyed_query
 from src.notify import deliver_webhook
@@ -151,54 +151,49 @@ def retry_failed_notifications(
         db.NotificationOutboxRecord.ticket_id,
         actor,
     )
-    records = session.execute(
-        query
+    ids = list(session.execute(
+        query.with_only_columns(db.NotificationOutboxRecord.id)
         .order_by(db.NotificationOutboxRecord.id)
         .limit(limit)
-    ).scalars().all()
+    ).scalars())
+    # Manual retry can bypass the scheduled delay, never an active lease.
+    # Every claim is committed before the external call; finalization is
+    # conditional on the original unexpired ownership token.
     results = []
-    for record in records:
-        payload = json.loads(record.payload_json)
+    for notification_id in ids:
+        record = outbox.claim_delivery(session, "manual-retry", notification_id=notification_id, manual=True)
+        if record is None:
+            continue
+        owner_token = record.lease_owner_token or ""
         started = time.perf_counter()
-        # One bounded retry per call; the operator can call again later.
+        payload = json.loads(record.payload_json)
         if payload.get("event") == "trigger.fired" and payload.get("tenant"):
-            delivery = deliver_outbox_notification(
-                record.url, payload, session, max_attempts=1
-            )
+            delivery = deliver_outbox_notification(record.url, payload, session, max_attempts=1)
         else:
             delivery = deliver_webhook(record.url, payload, max_attempts=1)
         duration_ms = int((time.perf_counter() - started) * 1000)
-        record.attempts += delivery.attempts
-        if delivery.success:
-            record.status = "delivered"
-            record.last_error = None
-        else:
-            record.last_error = delivery.last_error
-            if record.attempts >= max_attempts:
-                record.status = "failed"
-                db.log_execution(
-                    session,
-                    run_id=_new_run_id(),
-                    action="notification.dead_lettered",
-                    status="failure",
-                    ticket_id=record.ticket_id,
-                    duration_ms=duration_ms,
-                    detail=(
-                        f"outbox #{record.id} exhausted after "
-                        f"{record.attempts} attempts"
-                    ),
-                    actor_subject=actor.subject,
-                )
+        resulting = outbox.finalize_delivery(
+            session, notification_id, owner_token, success=delivery.success,
+            attempt_delta=delivery.attempts or 1, error=delivery.last_error,
+            max_attempts=max_attempts,
+        )
+        if resulting is None:
+            session.rollback()
+            continue
+        if resulting == "failed":
+            db.log_execution(
+                session, run_id=_new_run_id(), action="notification.dead_lettered",
+                status="failure", ticket_id=record.ticket_id, duration_ms=duration_ms,
+                detail=f"outbox #{record.id} exhausted", actor_subject=actor.subject,
+            )
         db.log_execution(
-            session,
-            run_id=_new_run_id(),
-            action="notification.retry",
-            status="success" if delivery.success else "failure",
-            ticket_id=record.ticket_id,
-            duration_ms=duration_ms,
-            detail=f"outbox #{record.id}: now '{record.status}'",
+            session, run_id=_new_run_id(), action="notification.retry",
+            status="success" if delivery.success else "failure", ticket_id=record.ticket_id,
+            duration_ms=duration_ms, detail=f"outbox #{record.id}: now '{resulting}'",
             actor_subject=actor.subject,
         )
+        session.commit()
+        session.refresh(record)
         results.append(_outbox_out(record))
     return results
 
@@ -245,7 +240,8 @@ def requeue_failed_notification(
                 table.c.status == "failed",
             )
         )
-        .values(status="pending", updated_at=now)
+        .values(status="pending", updated_at=now, next_attempt_at=None,
+                lease_owner_token=None, lease_expires_at=None)
     )
     if result.rowcount != 1:
         raise HTTPException(

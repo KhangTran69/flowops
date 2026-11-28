@@ -34,3 +34,21 @@ tests:
               severity: warning
             exp_annotations:
               summary: "FlowOps HTTP error ratio exceeds 5%"
+  - interval: 1m
+    input_series:
+      - series: 'flowops_notification_expired_leases'
+        values: '0 1+0x6 0+0x3'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: FlowOpsExpiredNotificationLease
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: FlowOpsExpiredNotificationLease
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Expired notification delivery ownership requires reconciliation"
+      - eval_time: 9m
+        alertname: FlowOpsExpiredNotificationLease
+        exp_alerts: []

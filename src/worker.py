@@ -12,6 +12,7 @@ Or as a polling daemon:
 import argparse
 import hashlib
 import json
+import logging
 import signal
 import threading
 import time
@@ -20,6 +21,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from src import db, definitions, jobs, scheduler, triggers, workflow
@@ -129,6 +131,7 @@ def _complete_onboarding_job(
     heartbeat_interval: float | None = None,
 ) -> dict[str, Any]:
     """Execute one onboarding item and finish the job in the same transaction."""
+    owner_token = job.lease_owner_token or ""
     started = db.utcnow()
     clock = time.perf_counter()
     request_id = int(payload["request_id"])
@@ -145,7 +148,7 @@ def _complete_onboarding_job(
         finished = jobs.complete_job(
             session,
             job.id,
-            job.lease_owner_token or "",
+            owner_token,
             result={"already_completed": True, "item_id": item.id},
         )
         if not finished:
@@ -189,14 +192,14 @@ def _complete_onboarding_job(
     if interval is None:
         interval = max(0.25, lease_seconds / 3)
     with _LeaseHeartbeat(
-        job.id, job.lease_owner_token, lease_seconds, interval
+        job.id, owner_token, lease_seconds, interval
     ):
         adapter_result: ActionResult = ACTION_ADAPTER.execute(action, context)
     item.status = "completed"
     workflow.record_output(item, adapter_result.output)
     session.flush()
     workflow.apply_graph_transitions(
-        session, items, request_id=request.id, actor_subject=job.lease_owner_token
+        session, items, request_id=request.id, actor_subject="workflow-worker"
     )
 
     items = session.execute(
@@ -230,7 +233,7 @@ def _complete_onboarding_job(
     finished = jobs.complete_job(
         session,
         job.id,
-        job.lease_owner_token or "",
+        owner_token,
         result={"action": action, "item_id": item.id},
     )
     if not finished:
@@ -254,7 +257,7 @@ def _cascade_terminal_failure(session: Session, payload: dict[str, Any]) -> None
     if item_id is None or request_id is None:
         return
     item = session.get(db.ChecklistItemRecord, int(item_id))
-    if item is None or item.status == "completed":
+    if item is None or item.request_id != int(request_id) or item.status in {"completed", "skipped", "cancelled"}:
         return
     item.status = "failed"
     items = session.execute(
@@ -448,27 +451,40 @@ def _execute_job(
     lease_seconds: int = jobs.DEFAULT_LEASE_SECONDS,
     heartbeat_interval: float | None = None,
 ) -> str:
-    if job.job_type == JOB_TRIGGER_EXECUTE:
+    # Preserve the original claim across rollback/refresh; reloading a row
+    # may observe a different worker's lease and must never adopt it.
+    job_id = job.id
+    owner_token = job.lease_owner_token or ""
+    try:
         payload = json.loads(job.payload_json)
+        if not isinstance(payload, dict):
+            raise ValueError("Job payload is not an object.")
+    except (TypeError, ValueError):
+        status = jobs.fail_job(session, job_id, owner_token, "Invalid job payload.", retryable=False)
+        session.commit()
+        return status or "fenced"
+    if job.job_type == JOB_TRIGGER_EXECUTE:
         try:
             _complete_trigger_job(session, job, payload)
-            jobs.complete_job(
+            if not jobs.complete_job(
                 session,
-                job.id,
-                job.lease_owner_token or "",
+                job_id,
+                owner_token,
                 result={"delivery_id": payload.get("delivery_id")},
-            )
+            ):
+                session.rollback()
+                return "fenced"
             session.commit()
             return "succeeded"
         except _PermanentJobError as error:
             session.rollback()
-            reloaded = session.get(db.WorkflowJobRecord, job.id)
+            reloaded = session.get(db.WorkflowJobRecord, job_id)
             if reloaded is None:
                 return "missing"
             status = jobs.fail_job(
                 session,
                 reloaded.id,
-                reloaded.lease_owner_token or "",
+                owner_token,
                 str(error),
                 retryable=False,
             )
@@ -476,13 +492,13 @@ def _execute_job(
             return status or "fenced"
         except Exception as error:
             session.rollback()
-            reloaded = session.get(db.WorkflowJobRecord, job.id)
+            reloaded = session.get(db.WorkflowJobRecord, job_id)
             if reloaded is None:
                 return "missing"
             status = jobs.fail_job(
                 session,
                 reloaded.id,
-                reloaded.lease_owner_token or "",
+                owner_token,
                 str(error),
                 retryable=True,
             )
@@ -493,45 +509,46 @@ def _execute_job(
         jobs.fail_job(
             session,
             job.id,
-            job.lease_owner_token or "",
+            owner_token,
             f"Unsupported job type: {job.job_type}",
             retryable=False,
         )
         session.commit()
         return "failed"
 
-    payload = json.loads(job.payload_json)
     try:
-        _complete_onboarding_job(
+        outcome = _complete_onboarding_job(
             session,
             job,
             payload,
             lease_seconds=lease_seconds,
             heartbeat_interval=heartbeat_interval,
         )
-        return "succeeded"
+        return "fenced" if outcome.get("fenced") else "succeeded"
     except _PermanentJobError as error:
-        jobs.fail_job(
+        session.rollback()
+        status = jobs.fail_job(
             session,
             job.id,
-            job.lease_owner_token or "",
+            owner_token,
             str(error),
             retryable=False,
         )
-        _notify_worker_failure(session, job, payload, str(error))
+        if status == "failed":
+            _notify_worker_failure(session, job, payload, str(error))
         session.commit()
-        return "failed"
+        return status or "fenced"
     except Exception as error:
         # Retryable unless the adapter says otherwise (Graph 4xx, licence
         # exhausted, invalid PowerShell input): those go straight to failed.
         session.rollback()
-        reloaded = session.get(db.WorkflowJobRecord, job.id)
+        reloaded = session.get(db.WorkflowJobRecord, job_id)
         if reloaded is None:
             return "missing"
         status = jobs.fail_job(
             session,
             reloaded.id,
-            reloaded.lease_owner_token or "",
+            owner_token,
             str(error),
             retryable=getattr(error, "retryable", True) is not False,
         )
@@ -555,6 +572,26 @@ def run_once(
     db._ensure_tables()
     session = db.SessionLocal()
     try:
+        exhausted = jobs.reap_exhausted_job(session)
+        if exhausted is not None:
+            try:
+                payload = json.loads(exhausted.payload_json)
+                if not isinstance(payload, dict):
+                    payload = {}
+            except (TypeError, ValueError):
+                payload = {}
+            if exhausted.job_type == JOB_ONBOARDING_ITEM:
+                _cascade_terminal_failure(session, payload)
+                scheduler.advance_from_job(session, exhausted, success=False, error=jobs.EXHAUSTED_LEASE_ERROR)
+            elif exhausted.job_type == JOB_TRIGGER_EXECUTE:
+                delivery = session.get(db.TriggerDeliveryRecord, payload.get("delivery_id"))
+                if delivery is not None and delivery.status in {"received", "queued"}:
+                    triggers.update_delivery(session, delivery, status="failed", error=jobs.EXHAUSTED_LEASE_ERROR)
+            db.log_execution(session, run_id=_new_run_id(), action="workflow.job.exhausted",
+                             status="failure", duration_ms=0, detail=f"job #{exhausted.id}; reconciliation required",
+                             actor_subject="workflow-worker")
+            session.commit()
+            return exhausted
         job = jobs.claim_job(
             session, worker_id, lease_seconds=lease_seconds
         )
@@ -612,12 +649,22 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
+    failures = 0
     while not stopping:
-        job = run_once(
-            worker_id=worker_id,
-            lease_seconds=args.lease_seconds,
-            heartbeat_interval=args.heartbeat_interval,
-        )
+        try:
+            job = run_once(
+                worker_id=worker_id,
+                lease_seconds=args.lease_seconds,
+                heartbeat_interval=args.heartbeat_interval,
+            )
+            failures = 0
+        except OperationalError as error:
+            if args.once:
+                raise
+            failures = min(failures + 1, 6)
+            logging.getLogger(__name__).warning("Workflow database temporarily unavailable: %s", type(error).__name__)
+            time.sleep(min(30.0, max(0.1, args.poll_interval) * 2 ** failures))
+            continue
         if job is not None:
             print(f"{job.id} {job.status} {job.job_type}", flush=True)
             if args.once:

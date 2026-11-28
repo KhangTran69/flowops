@@ -105,3 +105,61 @@ def test_mcp_server_registers_and_calls_tools(client):
     client.post("/tickets", json=TICKET)
     result = asyncio.run(server.call_tool("get_ticket", {"ticket_id": "101"}))
     assert "VPN not connecting" in str(result)
+
+
+def test_mcp_workflow_and_trigger_reads_enforce_backend_scope(client, monkeypatch):
+    _seed_tenants(client)
+    key = "mcp-definition"
+    definition = client.post("/workflow-definitions", json={
+        "key": key, "name": "MCP definition", "request_type": "onboarding",
+        "steps": [{"key": "manual", "step": "Manual step", "queue": "it-service-desk"}],
+    })
+    assert definition.status_code == 200, definition.text
+    assert client.post(f"/workflow-definitions/{key}/publish", json={"version": 1}).status_code == 200
+    with db.SessionLocal() as session:
+        session.add(db.EventSourceRecord(
+            key="mcp-source", name="MCP source", secret="synthetic-test-secret", global_scope=True,
+            secret_generated=True, active=True,
+        ))
+        session.add(db.TriggerRecord(
+            key="mcp-trigger", name="MCP trigger", source_key="mcp-source", event_type="user.created",
+            target_type="onboarding_request", definition_key=key, mapping_json="{}", schedule_kind="webhook", active=True,
+        ))
+        session.commit()
+
+    run_ids = {}
+    for tenant in ("acme", "globex"):
+        request = client.post("/onboarding-requests", json={**ONBOARD, "tenant_key": tenant, "definition_key": key})
+        assert request.status_code == 201, request.text
+        started = client.post(f"/onboarding-requests/{request.json()['id']}/run")
+        assert started.status_code == 200, started.text
+        run_ids[tenant] = started.json()["id"]
+
+    reader = FlowOpsTools(client)
+    assert reader.get_workflow_definition(key)["current_version"] == 1
+    assert key in {row["key"] for row in reader.list_workflow_definitions()}
+    assert reader.get_trigger("mcp-trigger")["definition_key"] == key
+    assert "mcp-trigger" in {row["key"] for row in reader.list_triggers()}
+    assert [row["id"] for row in reader.list_workflow_runs(tenant="acme", definition=key)] == [run_ids["acme"]]
+    assert reader.list_workflow_runs(tenant="acme", offset=1) == []
+    assert reader.get_workflow_run(run_ids["globex"])["id"] == run_ids["globex"]
+    with pytest.raises(FlowOpsToolError, match="Invalid resource key"):
+        reader.get_workflow_definition("../workflow-runs")
+    with pytest.raises(FlowOpsToolError, match="Invalid resource key"):
+        reader.get_trigger("mcp-trigger%2fdeliveries")
+
+    monkeypatch.setenv("FLOWOPS_AUTH_REQUIRED", "true")
+    monkeypatch.setenv("FLOWOPS_ENVIRONMENT", "development")
+    monkeypatch.setenv("FLOWOPS_DEV_BEARER_TOKEN", "mcp-test-token")
+    monkeypatch.setenv("FLOWOPS_DEV_TENANT_KEY", "acme")
+    with pytest.raises(FlowOpsToolError, match="401"):
+        reader.list_workflow_runs()
+    client.headers["Authorization"] = "Bearer mcp-test-token"
+    assert [row["id"] for row in reader.list_workflow_runs()] == [run_ids["acme"]]
+    assert reader.get_workflow_run(run_ids["acme"])["id"] == run_ids["acme"]
+    with pytest.raises(FlowOpsToolError, match="404"):
+        reader.get_workflow_run(run_ids["globex"])
+    for admin_read in (reader.list_workflow_definitions, reader.list_triggers,
+                       lambda: reader.get_workflow_definition(key), lambda: reader.get_trigger("mcp-trigger")):
+        with pytest.raises(FlowOpsToolError, match="403"):
+            admin_read()
