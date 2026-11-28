@@ -83,3 +83,21 @@ def test_authenticated_api_quota_shared_across_clients(database, monkeypatch):
         assert statuses.count(429) == 11
     finally:
         api.app.dependency_overrides.pop(_actor_from_header, None)
+
+
+def test_postgres_lock_contention_fails_closed_then_recovers(database):
+    import hashlib
+
+    key = rate_limit.actor_key("locked-principal", "tenant-a")
+    digest = hashlib.sha256(key.encode()).hexdigest()
+    assert rate_limit.consume(key, 10)[0]
+    # Keep the quota row locked in an independent transaction, as a stalled
+    # process would. The admission call must not fall back to local memory.
+    with db.engine.begin() as connection:
+        connection.execute(select(db.RateLimitBucketRecord.digest).where(
+            db.RateLimitBucketRecord.digest == digest).with_for_update())
+        with pytest.raises(rate_limit.Unavailable):
+            rate_limit.consume(key, 10)
+    assert rate_limit.consume(key, 10)[0]
+    with db.SessionLocal() as session:
+        assert session.get(db.RateLimitBucketRecord, digest).count == 2

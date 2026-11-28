@@ -144,7 +144,9 @@ def main(argv: list[str] | None = None) -> int:
             last_sweep = time.monotonic()
             removed = sweep_idempotency_keys()
             try:
-                rate_limit.sweep_expired()
+                for _ in range(10):
+                    if rate_limit.sweep_expired() < 1000:
+                        break
             except Exception as error:  # retention must not interrupt dispatch
                 import logging
 

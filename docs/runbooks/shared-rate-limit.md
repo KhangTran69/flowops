@@ -24,3 +24,8 @@ controls authenticated operations, not unauthenticated brute-force or network
 DDoS; configure ingress limits, request-size caps and trusted proxy policy.
 Staging acceptance still requires multi-host representative traffic,
 capacity sizing and alert delivery verification.
+
+The PostgreSQL regression suite also holds an independent quota-row lock,
+asserts admission fails closed at the lock timeout, releases it, and verifies
+that admission resumes without counting the failed attempt. This is a
+controlled contention fault, not a full database outage or host-loss test.
