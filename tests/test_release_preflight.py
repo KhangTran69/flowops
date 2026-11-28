@@ -9,6 +9,7 @@ def release_env():
     return {
         "FLOWOPS_ENVIRONMENT": "production",
         "FLOWOPS_RUN_MIGRATIONS": "false",
+        "FLOWOPS_RATE_LIMIT_PER_MINUTE": "120",
         "FLOWOPS_ACTION_ADAPTER": "simulated",
         "FLOWOPS_AUTOMATION_ADAPTER": "simulated",
         "FLOWOPS_AI_ADAPTER": "simulated",
@@ -33,6 +34,10 @@ def test_release_configuration(release_env):
     [
         ("FLOWOPS_ENVIRONMENT", "development"),
         ("FLOWOPS_RUN_MIGRATIONS", "true"),
+        ("FLOWOPS_RATE_LIMIT_PER_MINUTE", "0"),
+        ("FLOWOPS_RATE_LIMIT_PER_MINUTE", "-1"),
+        ("FLOWOPS_RATE_LIMIT_PER_MINUTE", "100001"),
+        ("FLOWOPS_RATE_LIMIT_PER_MINUTE", "bad"),
         ("FLOWOPS_DEV_BEARER_TOKEN", "not-for-production"),
         ("FLOWOPS_DEMO_USERS", "{}"),
         ("FLOWOPS_DATABASE_URL", "sqlite:///local.db"),

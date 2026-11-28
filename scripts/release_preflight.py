@@ -46,6 +46,12 @@ def validate_release(environ: dict[str, str]) -> None:
         raise ValueError("A valid PostgreSQL database URL is required.") from None
     if url.drivername != "postgresql+psycopg" or not url.host or not url.database:
         raise ValueError("A PostgreSQL psycopg database URL with host and database is required.")
+    try:
+        limit = int(environ.get("FLOWOPS_RATE_LIMIT_PER_MINUTE", "0"))
+    except ValueError:
+        raise ValueError("Protected releases require a valid positive rate limit.") from None
+    if not 1 <= limit <= 100000:
+        raise ValueError("Protected releases require a positive rate limit no greater than 100000.")
     validate_auth_configuration(environ)
     ui_session.validate_ui_auth_configuration(environ)
     validate_webhook_configuration(environ)
