@@ -485,10 +485,10 @@ def tick_all(*, now: datetime | None = None, worker_id: str = "scheduler") -> li
             TRIGGER_TICK_COUNTS["skipped"] = TRIGGER_TICK_COUNTS.get("skipped", 0) + 1
         session.commit()
 
-        # Poll due source connectors (v1.4). Imported lazily: src.connectors
-        # imports this module, so a top-level import would be circular. The
-        # poller owns its sessions and isolates per-connector failures.
-        from src import connectors
+        # Poll due source connectors (v1.4). Imported lazily: the service
+        # module imports this module, so a top-level import would be circular.
+        # The poller owns its sessions and isolates per-connector failures.
+        from src.services import connectors
 
         try:
             CONNECTOR_TICK_COUNTS["ingested"] += connectors.poll_all_connectors(now=now)

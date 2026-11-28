@@ -20,10 +20,10 @@ from sqlalchemy.orm import Session
 
 from src import db
 from src.auth import Actor
-from src.connectors import deliver_outbox_notification
 from src.deps import _admin_actor, _new_run_id, _operator_actor, _scope_execution_log_query, _scope_ticket_or_request_keyed_query
 from src.notify import deliver_webhook
 from src.schemas import ExecutionLogOut, NotificationOutboxOut
+from src.services.connectors import deliver_outbox_notification
 
 router = APIRouter()
 

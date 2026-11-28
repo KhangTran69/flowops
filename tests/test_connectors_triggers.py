@@ -5,8 +5,9 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 
-from src import api, connectors, db
+from src import api, db
 from src.routes import connectors as connector_routes
+from src.services import connectors
 
 
 @pytest.fixture
