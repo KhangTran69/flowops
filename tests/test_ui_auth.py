@@ -287,3 +287,21 @@ def test_logout_revokes_copied_cookie_without_revoking_other_session(client):
         record = session_db.get(db.RevokedUISessionRecord, ui_session._revocation_digest(session))
         assert record is not None
         assert record.digest != session.csrf_token
+
+
+@pytest.mark.parametrize("payload", [
+    [],
+    {"subject": "user", "roles": {"automation.admin": False}, "csrf": "token"},
+    {"subject": ["user"], "roles": ["automation.admin"], "csrf": "token"},
+    {"subject": "user", "roles": [42], "csrf": "token"},
+    {"subject": "user", "roles": ["automation.admin"], "csrf": 42},
+    {"subject": "user", "roles": ["automation.admin"], "csrf": "token", "tenant_key": False},
+    {"subject": "user", "roles": ["automation.admin"], "csrf": "token", "tenant_key": ""},
+])
+def test_malformed_signed_session_is_denied(client, payload):
+    serializer = URLSafeTimedSerializer(SECRET, salt=ui_session.SESSION_SALT)
+    signed = serializer.dumps(payload)
+    with pytest.raises(ui_session.UISessionError):
+        ui_session.decode_session(signed, secret=SECRET)
+    client.cookies.set(ui_session.SESSION_COOKIE, signed)
+    assert client.get("/command-center/session").status_code == 401

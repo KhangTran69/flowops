@@ -20,7 +20,7 @@ from sqlalchemy import delete
 from sqlalchemy.exc import SQLAlchemyError
 
 from src import db
-from src.auth import Actor
+from src.auth import Actor, AuthenticationError, _identity_subject, _identity_tenant
 
 SESSION_COOKIE = "flowops_ui_session"
 SESSION_SALT = "flowops-ui-session"
@@ -155,13 +155,17 @@ def authenticate_admin(username: str, password: str) -> Actor | None:
     account = users.get(username)
     if not isinstance(account, dict) or not _verify_password(password, str(account.get("password_hash", ""))):
         return None
-    roles = tuple(str(role) for role in account.get("roles", []))
-    if not roles or any(role not in _WORKFORCE_ROLES for role in roles):
+    values = account.get("roles")
+    if not isinstance(values, list) or not values or any(
+        not isinstance(role, str) or role not in _WORKFORCE_ROLES for role in values
+    ):
         return None
-    tenant_key = account.get("tenant_key")
-    if tenant_key is not None and (not isinstance(tenant_key, str) or not tenant_key.strip()):
+    try:
+        subject = _identity_subject(username)
+        tenant_key = _identity_tenant(account.get("tenant_key"))
+    except AuthenticationError:
         return None
-    return Actor(subject=username, roles=roles, source="session", tenant_key=tenant_key)
+    return Actor(subject=subject, roles=tuple(values), source="session", tenant_key=tenant_key)
 
 
 def create_session(actor: Actor) -> UISession:
@@ -196,17 +200,22 @@ def decode_session(
         )
     except (BadSignature, SignatureExpired, TypeError, ValueError) as error:
         raise UISessionError("Invalid or expired UI session.") from error
-    subject = str(data.get("subject", "")).strip()
-    roles = tuple(str(role) for role in data.get("roles", []))
-    csrf = str(data.get("csrf", ""))
-    tenant_key = data.get("tenant_key")
-    if tenant_key is not None:
-        tenant_key = str(tenant_key).strip()
-        if not tenant_key:
-            raise UISessionError("Invalid UI session tenant.")
-    if not subject or not csrf or not roles:
+    if not isinstance(data, dict):
         raise UISessionError("Invalid UI session payload.")
-    return UISession(subject=subject, roles=roles, csrf_token=csrf, tenant_key=tenant_key)
+    roles = data.get("roles")
+    csrf = data.get("csrf")
+    if (
+        not isinstance(roles, list) or not roles
+        or any(not isinstance(role, str) or not role or role != role.strip() for role in roles)
+        or not isinstance(csrf, str) or not csrf or csrf != csrf.strip()
+    ):
+        raise UISessionError("Invalid UI session payload.")
+    try:
+        subject = _identity_subject(data.get("subject"))
+        tenant_key = _identity_tenant(data.get("tenant_key"))
+    except AuthenticationError as error:
+        raise UISessionError("Invalid UI session identity.") from error
+    return UISession(subject=subject, roles=tuple(roles), csrf_token=csrf, tenant_key=tenant_key)
 
 
 def _revocation_digest(session: UISession) -> str:

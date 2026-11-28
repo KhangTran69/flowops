@@ -253,3 +253,72 @@ def test_rate_limit_returns_429(client, monkeypatch):
     assert limited.status_code == 429
     assert limited.headers.get("Retry-After") == "60"
     api._RATE_LIMIT_BUCKETS.clear()
+
+
+def test_production_runtime_never_falls_back_to_local_actor():
+    with pytest.raises(AuthenticationError, match="mandatory"):
+        authenticate_bearer(None, environ={"FLOWOPS_ENVIRONMENT": "production", "FLOWOPS_AUTH_REQUIRED": "false"})
+
+
+def test_signed_entra_claims_fail_closed_on_ambiguous_identity(monkeypatch):
+    import jwt
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from jwt.algorithms import RSAAlgorithm
+
+    from src.auth import _authenticate_jwt
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    jwk = json.loads(RSAAlgorithm.to_jwk(key.public_key()))
+    jwk.update({"kid": "shape-test", "use": "sig"})
+    environ = {
+        "FLOWOPS_AUTH_REQUIRED": "true", "FLOWOPS_ENVIRONMENT": "production",
+        "FLOWOPS_ENTRA_ISSUER": "https://shape-issuer.example", "FLOWOPS_ENTRA_AUDIENCE": "flowops",
+        "FLOWOPS_ENTRA_JWKS_URL": "https://shape-issuer.example/keys",
+    }
+    monkeypatch.setattr(_authenticate_jwt, "cache", {}, raising=False)
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"keys": [jwk]}
+
+    monkeypatch.setattr("src.auth.requests.get", lambda *args, **kwargs: Response())
+    base = {"iss": environ["FLOWOPS_ENTRA_ISSUER"], "aud": "flowops", "sub": "verified-user",
+            "exp": 4102444800, "roles": ["automation.operator", "automation.admin"]}
+
+    def authenticate(claims, headers=None):
+        token = jwt.encode(claims, key, algorithm="RS256", headers=headers or {"kid": "shape-test"})
+        return authenticate_bearer(f"Bearer {token}", environ=environ)
+
+    assert authenticate(base).tenant_key is None
+    assert authenticate({**base, "flowops_tenant_key": "tenant-a"}).tenant_key == "tenant-a"
+    for change in (
+        {"roles": {"automation.operator": False, "automation.admin": False}},
+        {"roles": "automation.operator automation.admin"},
+        {"roles": ["automation.operator", 42]},
+        {"flowops_tenant_key": ""},
+        {"flowops_tenant_key": False},
+        {"flowops_tenant_key": []},
+        {"flowops_tenant_key": "tenant-a", "tenant_key": "tenant-b"},
+        {"flowops_tenant_key": None, "tenant_key": "tenant-a"},
+        {"sub": " "},
+        {"sub": "a" * 257},
+    ):
+        with pytest.raises(AuthenticationError):
+            authenticate({**base, **change})
+    with pytest.raises(AuthenticationError):
+        authenticate(base, {"kid": ""})
+
+    # Duplicate kid entries and non-signing keys must not be trusted.
+    for bad_keys in ([jwk, jwk], [{**jwk, "use": "enc"}], ["not a key"]):
+        monkeypatch.setattr(_authenticate_jwt, "cache", {}, raising=False)
+
+        class BadResponse(Response):
+            def json(self):
+                return {"keys": bad_keys}
+
+        monkeypatch.setattr("src.auth.requests.get", lambda *args, **kwargs: BadResponse())
+        with pytest.raises(AuthenticationError):
+            authenticate(base)

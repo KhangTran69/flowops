@@ -24,10 +24,33 @@ class AuthenticationError(ValueError):
 
 
 def _roles(claims: dict[str, Any]) -> tuple[str, ...]:
-    values = claims.get("roles", claims.get("scp", ""))
-    if isinstance(values, str):
-        return tuple(values.split())
-    return tuple(str(value) for value in values or ())
+    # Entra application roles are an array; delegated scopes are a string.
+    # Never treat dictionary keys or coerced numbers as granted permissions.
+    if "roles" in claims:
+        values = claims["roles"]
+        if not isinstance(values, list) or any(
+            not isinstance(value, str) or not value or value != value.strip() for value in values
+        ):
+            raise AuthenticationError("Invalid bearer roles claim.")
+        return tuple(values)
+    scopes = claims.get("scp", "")
+    if not isinstance(scopes, str):
+        raise AuthenticationError("Invalid bearer scope claim.")
+    return tuple(scopes.split())
+
+
+def _identity_subject(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip() or value != value.strip() or len(value) > 256:
+        raise AuthenticationError("Invalid identity subject.")
+    return value
+
+
+def _identity_tenant(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip() or value != value.strip() or len(value) > 64:
+        raise AuthenticationError("Invalid identity tenant.")
+    return value
 
 
 def _authenticate_jwt(token: str, values: dict[str, str]) -> Actor:
@@ -46,13 +69,23 @@ def _authenticate_jwt(token: str, values: dict[str, str]) -> Actor:
             response = requests.get(jwks_url, timeout=5)
             response.raise_for_status()
             keys = response.json()["keys"]
+            if not isinstance(keys, list) or not all(isinstance(item, dict) for item in keys):
+                raise ValueError("Malformed signing key set.")
             cache[jwks_url] = (keys, now + 300)
         except (requests.RequestException, KeyError, TypeError, ValueError) as error:
             raise AuthenticationError("Unable to retrieve Entra signing keys.") from error
 
     try:
         header = jwt.get_unverified_header(token)
-        key_data = next(item for item in keys if item.get("kid") == header.get("kid"))
+        kid = header.get("kid")
+        if not isinstance(kid, str) or not kid or header.get("alg") != "RS256":
+            raise ValueError("Missing key identifier or unsupported algorithm.")
+        matches = [item for item in keys if item.get("kid") == kid]
+        if len(matches) != 1:
+            raise ValueError("Missing or ambiguous signing key.")
+        key_data = matches[0]
+        if key_data.get("kty") != "RSA" or key_data.get("use", "sig") != "sig" or key_data.get("alg", "RS256") != "RS256":
+            raise ValueError("Unexpected signing key type or purpose.")
         key = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(key_data))
         claims = jwt.decode(
             token,
@@ -68,9 +101,11 @@ def _authenticate_jwt(token: str, values: dict[str, str]) -> Actor:
     roles = _roles(claims)
     if required_role and required_role not in roles:
         raise AuthenticationError("Bearer token lacks the required automation role.")
-    tenant_key = claims.get("flowops_tenant_key", claims.get("tenant_key"))
-    return Actor(subject=claims["sub"], roles=roles,
-                 tenant_key=str(tenant_key).strip() if tenant_key else None)
+    tenant_keys = [_identity_tenant(claims[key]) for key in ("flowops_tenant_key", "tenant_key") if key in claims]
+    if len(set(tenant_keys)) > 1:
+        raise AuthenticationError("Conflicting bearer tenant claims.")
+    return Actor(subject=_identity_subject(claims["sub"]), roles=roles,
+                 tenant_key=tenant_keys[0] if tenant_keys else None)
 
 
 def validate_auth_configuration(
@@ -108,6 +143,8 @@ def authenticate_bearer(
     values = environ if environ is not None else os.environ
     environment = values.get("FLOWOPS_ENVIRONMENT", "development").lower()
     if values.get("FLOWOPS_AUTH_REQUIRED", "false").lower() != "true":
+        if environment != "development":
+            raise AuthenticationError("Authentication is mandatory outside development.")
         return Actor(
             subject="local-development",
             roles=("automation.operator", "automation.admin"),
