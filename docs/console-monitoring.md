@@ -85,3 +85,12 @@ syntax and synthetic alert behavior. Neither substitutes for a full WCAG
 configuration, secure logout at the identity provider, workforce browser
 sign-in, production backup/restore rehearsals and live connector verification
 remain release gates.
+
+Data-safety gate (ROADMAP 2b) evidence: the backup/restore rehearsal runs in
+CI as a `docker-postgres` job step ("Backup-restore rehearsal") — dump of the
+paused stack, restore into a clean `postgres:16-alpine`, migration 0016
+roundtrip replayed on the restored copy, nine-table reconciliation, timings
+uploaded as the `backup-restore-timings` artifact (first dated run
+2026-11-28; measured window in `docs/runbooks/backup-restore.md`). A
+rehearsal at production data volume remains part of the eventual production
+deployment.

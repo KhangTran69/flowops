@@ -9,6 +9,7 @@ You do not need to read code to follow them.
 | A job shows **failed** / dead-letter on the Jobs page | [failed-jobs.md](failed-jobs.md) |
 | Teams/n8n alerts stopped arriving, or a webhook says "failed" | [webhook-failure.md](webhook-failure.md) |
 | The morning digest reports tenant drift | [tenant-drift.md](tenant-drift.md) |
+| The database must be restored after an incident, or a restore must be proven | [backup-restore.md](backup-restore.md) |
 | Errors mention 401, 403, "consent", "token" or "credentials" | [credentials-and-access.md](credentials-and-access.md) |
 
 **Golden rules**

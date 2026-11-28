@@ -184,13 +184,23 @@ These are the project's *own* declared gates (PR #51–#53, console-monitoring).
 
 ### 2b. Data safety rehearsal (gate 2)
 
-- [ ] Script a backup/restore rehearsal: `pg_dump`/restore into a clean
+- [x] Script a backup/restore rehearsal: `pg_dump`/restore into a clean
       stack, `alembic upgrade head` replay, row-count + spot-check
       reconciliation, measure the window. Document as
       `docs/runbooks/backup-restore.md` with the actual commands and timings.
-- [ ] Run the manual-ticket migration (0016) on a restored copy before ever
+      — done 2026-11-28: `scripts/backup_restore_rehearsal.sh` (writers
+      paused for a deterministic dump, restore with `ON_ERROR_STOP=1`,
+      9-table reconciliation + verbatim fixture spot checks, per-stage wall
+      time; both failure gates proven red on planted violations) runs as a
+      "Backup-restore rehearsal" CI step with a timings artifact; measured
+      window 5.9 s at demo scale (2026-11-28).
+- [x] Run the manual-ticket migration (0016) on a restored copy before ever
       running it on "real" data — the command-center README already requires
       this; make the rehearsal the proof.
+      — done 2026-11-28: the rehearsal runs
+      `scripts/check_manual_ticket_migration.py` (0016 down/up roundtrip)
+      against the restored, explicitly-disposable copy; verified
+      `MIGRATION_ROUNDTRIP: PASS` on 2026-11-28.
 
 ### 2c. Accessibility audit (gate 3)
 
