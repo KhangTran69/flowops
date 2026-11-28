@@ -261,7 +261,7 @@ def main():
             page.get_by_role('button', name='Approvals', exact=True).click()
             row = page.locator('table:visible tbody tr').filter(has_text='Synthetic Workforce Employee')
             expect(row).to_be_visible(timeout=15000)
-            page.once('dialog', lambda dialog: dialog.accept())
+            row.get_by_label('Approval comment').fill('Synthetic manager approval')
             row.get_by_role('button', name='Approve', exact=True).click()
             expect(row).not_to_be_visible(timeout=15000)
             page.get_by_role('button', name='IT tasks', exact=True).click()

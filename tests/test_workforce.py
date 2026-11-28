@@ -407,6 +407,7 @@ def test_worker_lease_token_fences_stale_worker_after_reclaim(workforce_client, 
     monkeypatch.setenv("FLOWOPS_N8N_WEBHOOK_SECRET", "webhook-secret")
 
     class Response:
+        status_code = 200
         def raise_for_status(self):
             pass
 
@@ -614,3 +615,54 @@ def test_provisioning_cannot_be_completed_manually_or_simulated_in_live_mode(wor
     assert client.patch(path, json={"status": "DONE", "completion_notes": "Verified"}).status_code == 200
     assert client.patch(path, json={"status": "DONE", "completion_notes": "Overwrite"}).status_code == 409
     assert next(row for row in client.get("/workforce/tasks").json() if row["id"] == task["id"])["completion_notes"] == "Verified"
+
+
+def test_global_admin_cannot_move_existing_draft_between_tenants(workforce_client):
+    client, set_actor = workforce_client
+    employee_a = _employee(client)
+    draft = client.post("/workforce/onboarding-requests", json={"employee_id": employee_a["id"]}).json()
+    set_actor(Actor("hr-b", ("HR",), source="session", tenant_key="tenant-b"))
+    employee_b = client.post("/workforce/employees", json={
+        "employee_number": "EMP-B", "full_name": "Synthetic B", "work_email": "b@example.test",
+        "department": "IT", "job_title": "Operator", "start_date": "2027-01-01",
+        "manager_subject": "manager-b",
+    }).json()
+    set_actor(Actor("global-admin", ("automation.admin",), source="bearer"))
+    response = client.patch(f"/workforce/onboarding-requests/{draft['id']}",
+                            json={"employee_id": employee_b["id"]})
+    assert response.status_code == 404
+    assert client.get(f"/workforce/onboarding-requests/{draft['id']}").json()["employee_id"] == employee_a["id"]
+
+
+def test_conflicting_callback_and_inactive_tenant_rejected(workforce_client):
+    client, set_actor = workforce_client
+    _, _ = _approved_request(client, set_actor)
+    event_id = client.get("/workforce/automation/events").json()[0]["event_id"]
+    headers = {"X-FlowOps-Automation-Key": "callback-test-secret"}
+    payload = {"eventId": event_id, "tenantKey": "tenant-a", "outcome": "success"}
+    path = "/workforce/automation/callbacks/provisioning"
+    assert client.post(path, json=payload, headers=headers).status_code == 200
+    assert client.post(path, json={**payload, "outcome": "failure"}, headers=headers).status_code == 409
+    with db.SessionLocal() as session:
+        session.get(db.TenantRecord, "tenant-a").active = False
+        session.commit()
+    assert client.post(path, json=payload, headers=headers).status_code == 404
+
+
+def test_workforce_abandoned_claims_consume_attempt_budget(workforce_client, monkeypatch):
+    client, set_actor = workforce_client
+    _, _ = _approved_request(client, set_actor)
+    from src.workforce_worker import MAX_ATTEMPTS, _claim, run_once
+    for attempt in range(MAX_ATTEMPTS):
+        with db.SessionLocal() as session:
+            claim = _claim(session)
+            assert claim is not None and claim[4] == attempt + 1
+            row = session.get(db.WorkforceAutomationEventRecord, claim[0])
+            row.lease_until = db.utcnow() - timedelta(seconds=1)
+            session.commit()
+    monkeypatch.setenv("FLOWOPS_AUTOMATION_ADAPTER", "n8n")
+    monkeypatch.setattr("src.workforce_worker.requests.post", lambda *a, **kw: pytest.fail("exhausted claim dispatched"))
+    assert run_once() is None
+    with db.SessionLocal() as session:
+        row = session.execute(select(db.WorkforceAutomationEventRecord)).scalar_one()
+        assert row.delivery_status == "FAILED" and row.attempts == MAX_ATTEMPTS

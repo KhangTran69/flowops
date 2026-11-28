@@ -263,9 +263,10 @@ def _request(session: Session, request_id: int, actor: Actor) -> tuple[db.StaffO
     if item is None:
         raise HTTPException(404, "Onboarding request not found.")
     employee = session.get(db.EmployeeRecord, item.employee_id)
-    if employee.tenant_key != item.tenant_key:
+    if employee is None or employee.tenant_key != item.tenant_key:
         raise HTTPException(404, "Onboarding request not found.")
-    if "MANAGER" in {x.upper() for x in actor.roles} and actor.subject != employee.manager_subject:
+    roles = {x.upper() for x in actor.roles}
+    if "MANAGER" in roles and not (roles & {"HR", "IT_ADMIN", "AUTOMATION.ADMIN"}) and actor.subject != employee.manager_subject:
         raise HTTPException(404, "Onboarding request not found.")
     return item, employee
 
@@ -411,12 +412,18 @@ def request_detail(request_id: int, actor: Actor = Depends(role_actor("HR", "MAN
 @router.patch("/onboarding-requests/{request_id}")
 def update_draft(request_id: int, payload: DraftUpdateIn,
                  actor: Actor = Depends(role_actor("HR")), session: Session = Depends(db.get_session)):
-    row, _ = _request(session, request_id, actor)
+    initial, _ = _request(session, request_id, actor)
+    # Lock the target employee before the request, matching approval and
+    # termination ordering. Never transfer an existing request across tenants.
+    employee = session.execute(_scope(select(db.EmployeeRecord).where(
+        db.EmployeeRecord.id == payload.employee_id).with_for_update(), db.EmployeeRecord, actor)).scalar_one_or_none()
+    row = _request_row(session, request_id, actor, lock=True)
+    if row is None or row.employee_id != initial.employee_id:
+        raise HTTPException(409, "Draft changed concurrently.")
     if row.status != "DRAFT":
         raise HTTPException(409, "Only a draft can be edited.")
-    employee = _employee(session, payload.employee_id, actor)
-    if employee is None or employee.status != "ACTIVE":
-        raise HTTPException(404, "Active employee not found.")
+    if employee is None or employee.status != "ACTIVE" or employee.tenant_key != row.tenant_key:
+        raise HTTPException(404, "Active employee not found in this request tenant.")
     if session.execute(_scope(select(db.StaffOnboardingRecord.id).where(
         db.StaffOnboardingRecord.employee_id == employee.id,
         db.StaffOnboardingRecord.id != row.id,
@@ -424,7 +431,6 @@ def update_draft(request_id: int, payload: DraftUpdateIn,
         db.StaffOnboardingRecord, actor)).first():
         raise HTTPException(409, "Employee already has another active onboarding request.")
     row.employee_id = employee.id
-    row.tenant_key = employee.tenant_key
     try:
         session.flush()
     except IntegrityError as exc:
@@ -436,7 +442,12 @@ def update_draft(request_id: int, payload: DraftUpdateIn,
 
 @router.post("/onboarding-requests/{request_id}/submit")
 def submit_request(request_id: int, actor: Actor = Depends(role_actor("HR")), session: Session = Depends(db.get_session)):
-    row, employee = _request(session, request_id, actor)
+    initial, _ = _request(session, request_id, actor)
+    employee = session.execute(_scope(select(db.EmployeeRecord).where(
+        db.EmployeeRecord.id == initial.employee_id).with_for_update(), db.EmployeeRecord, actor)).scalar_one_or_none()
+    row = _request_row(session, request_id, actor, lock=True)
+    if row is None or employee is None or row.employee_id != employee.id or row.tenant_key != employee.tenant_key:
+        raise HTTPException(409, "Draft changed concurrently.")
     if row.status != "DRAFT":
         raise HTTPException(409, "Only a draft can be submitted.")
     if employee.status != "ACTIVE":
@@ -520,7 +531,7 @@ def cancel_request(request_id: int, actor: Actor = Depends(role_actor("HR")), se
     if row is None:
         raise HTTPException(404, "Onboarding request not found.")
     employee = session.get(db.EmployeeRecord, row.employee_id)
-    if employee.tenant_key != row.tenant_key:
+    if employee is None or employee.tenant_key != row.tenant_key:
         raise HTTPException(404, "Onboarding request not found.")
     if row.status not in {"DRAFT", "PENDING_APPROVAL", "APPROVED", "IN_PROGRESS"}:
         raise HTTPException(409, "This request cannot be cancelled from its current state.")
@@ -533,6 +544,10 @@ def cancel_request(request_id: int, actor: Actor = Depends(role_actor("HR")), se
 @router.post("/onboarding-requests/{request_id}/copy-rejected", status_code=201)
 def copy_rejected(request_id: int, actor: Actor = Depends(role_actor("HR")), session: Session = Depends(db.get_session)):
     source, employee = _request(session, request_id, actor)
+    employee = session.execute(_scope(select(db.EmployeeRecord).where(
+        db.EmployeeRecord.id == employee.id).with_for_update(), db.EmployeeRecord, actor)).scalar_one_or_none()
+    if employee is None or employee.status != "ACTIVE":
+        raise HTTPException(409, "Only active employees can be copied to a draft.")
     if source.status != "REJECTED":
         raise HTTPException(409, "Only a rejected request can be copied to a new draft.")
     active = session.execute(_scope(select(db.StaffOnboardingRecord.id).where(
@@ -681,7 +696,8 @@ def update_asset_status(asset_id: int, payload: AssetStatusIn,
 @router.post("/assets/{asset_id}/assign")
 def assign_asset(asset_id: int, payload: AssignIn,
                  actor: Actor = Depends(role_actor("IT_ADMIN")), session: Session = Depends(db.get_session)):
-    employee = _employee(session, payload.employee_id, actor)
+    employee = session.execute(_scope(select(db.EmployeeRecord).where(
+        db.EmployeeRecord.id == payload.employee_id).with_for_update(), db.EmployeeRecord, actor)).scalar_one_or_none()
     if employee is None or employee.status != "ACTIVE":
         raise HTTPException(404, "Active employee not found.")
     asset_update = update(db.ITAssetRecord).where(
@@ -767,6 +783,26 @@ def _complete_provisioning(session: Session, event: db.WorkforceAutomationEventR
                tenant_key=request.tenant_key)
 
 
+def _locked_automation_event(session: Session, event_id: str, actor: Actor | None = None):
+    query = select(db.WorkforceAutomationEventRecord).where(db.WorkforceAutomationEventRecord.event_id == event_id)
+    if actor is not None:
+        query = _scope(query, db.WorkforceAutomationEventRecord, actor)
+    initial = session.execute(query).scalar_one_or_none()
+    if initial is None:
+        return None
+    request_id, tenant_key = initial.request_id, initial.tenant_key
+    parent = session.execute(select(db.StaffOnboardingRecord).where(
+        db.StaffOnboardingRecord.id == request_id,
+        _same_tenant(db.StaffOnboardingRecord.tenant_key, tenant_key)
+    ).with_for_update()).scalar_one_or_none()
+    if parent is None:
+        return None
+    return session.execute(query.where(
+        db.WorkforceAutomationEventRecord.request_id == request_id,
+        _same_tenant(db.WorkforceAutomationEventRecord.tenant_key, tenant_key)
+    ).with_for_update().execution_options(populate_existing=True)).scalar_one_or_none()
+
+
 class CallbackIn(BaseModel):
     eventId: str = Field(min_length=1, max_length=64)
     tenantKey: str | None = Field(min_length=1, max_length=64)
@@ -789,13 +825,17 @@ def provisioning_callback(payload: CallbackIn,
     secret = os.environ.get("FLOWOPS_AUTOMATION_CALLBACK_SECRET", "")
     if not secret or not hmac.compare_digest(x_flowops_automation_key or "", secret):
         raise HTTPException(401, "Invalid automation callback credential.")
-    event = session.execute(select(db.WorkforceAutomationEventRecord).where(
-        db.WorkforceAutomationEventRecord.event_id == payload.eventId).with_for_update()).scalar_one_or_none()
+    event = _locked_automation_event(session, payload.eventId)
     if event is None:
         raise HTTPException(404, "Automation event not found.")
     if payload.tenantKey != event.tenant_key:
         raise HTTPException(404, "Automation event not found.")
+    if event.tenant_key:
+        _tenant_record(session, event.tenant_key)
     if event.workflow_status in {"SUCCEEDED", "FAILED"}:
+        expected = "SUCCEEDED" if payload.outcome == "success" else "FAILED"
+        if event.workflow_status != expected:
+            raise HTTPException(409, "Conflicting automation outcome for this event.")
         return {"eventId": event.event_id, "workflowStatus": event.workflow_status, "duplicate": True}
     _complete_provisioning(session, event, "n8n", payload.outcome, payload.detail or "")
     return {"eventId": event.event_id, "workflowStatus": event.workflow_status, "duplicate": False}
@@ -806,9 +846,7 @@ def simulate_provisioning(event_id: str, actor: Actor = Depends(role_actor("IT_A
     if (os.environ.get("FLOWOPS_ENVIRONMENT", "development").lower() != "development"
             or os.environ.get("FLOWOPS_AUTOMATION_ADAPTER", "simulated").lower() != "simulated"):
         raise HTTPException(404, "Mock automation requires development and the simulated adapter.")
-    event = session.execute(_scope(select(db.WorkforceAutomationEventRecord).where(
-        db.WorkforceAutomationEventRecord.event_id == event_id).with_for_update(),
-        db.WorkforceAutomationEventRecord, actor)).scalar_one_or_none()
+    event = _locked_automation_event(session, event_id, actor)
     if event is None:
         raise HTTPException(404, "Automation event not found.")
     if event.workflow_status in {"SUCCEEDED", "FAILED"}:
@@ -846,9 +884,7 @@ def reminder_history(offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, 
 
 @router.post("/automation/events/{event_id}/retry")
 def retry_event(event_id: str, actor: Actor = Depends(role_actor("IT_ADMIN")), session: Session = Depends(db.get_session)):
-    event = session.execute(_scope(select(db.WorkforceAutomationEventRecord).where(
-        db.WorkforceAutomationEventRecord.event_id == event_id).with_for_update(),
-        db.WorkforceAutomationEventRecord, actor)).scalar_one_or_none()
+    event = _locked_automation_event(session, event_id, actor)
     if event is None:
         raise HTTPException(404, "Automation event not found.")
     request = session.execute(select(db.StaffOnboardingRecord).where(
