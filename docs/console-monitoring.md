@@ -94,3 +94,25 @@ uploaded as the `backup-restore-timings` artifact (first dated run
 2026-11-28; measured window in `docs/runbooks/backup-restore.md`). A
 rehearsal at production data volume remains part of the eventual production
 deployment.
+
+
+## Synthetic benchmark evidence format (roadmap 2d)
+
+The disposable PostgreSQL CI benchmark retains the existing single-endpoint
+40-request runs at concurrency 1 and 4, and adds 120 balanced mixed reads at
+concurrency 8. Each record reports successful-request p50, p95, p99 and maximum
+latency, status counts (including exception classes), total and successful
+throughput, and whether the provisional 500 ms p95 target was observed. The
+aggregate mixed throughput uses the complete mixed interval; per-endpoint
+throughput uses the same interval to remain additive. Any non-200 response
+fails the benchmark after evidence is written. The latency target is
+observational in shared CI, not a hard production SLA or an alert threshold.
+
+Set `FLOWOPS_BENCHMARK_REPORT` to a local output path to retain the JSON report.
+CI uploads it as `postgres-console-benchmark` even if measured requests fail.
+The report identifies its synthetic TestClient environment, database dialect,
+fixture sizes and CI commit. It contains no connection strings, credentials,
+response bodies or tenant data. The run is closed-loop: it does not model
+real arrival rates, backlog drainage, external providers, HTTPS, or WAN
+latency. A protected representative staging rehearsal and production alert
+calibration remain open; do not close roadmap 2d from this artifact alone.
