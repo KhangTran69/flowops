@@ -78,8 +78,9 @@ jobs:
         run: mypy src/definitions.py src/expressions.py src/graph.py src/jobs.py src/outbox.py src/ticket_processor.py
 
   docker-postgres:
-
-    runs-on: ubuntu-latest
+    # ubuntu-24.04 pin, same as console-browser: the screenshot step's
+    # Playwright 1.51 has no chromium build for ubuntu-26.04 runners.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: Validate development compose configuration
