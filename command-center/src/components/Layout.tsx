@@ -20,10 +20,11 @@ const nav = [
   { to: '/analytics', label: 'Analytics', icon: BarChart3 },
   { to: '/triggers', label: 'Triggers', icon: GitBranch },
   { to: '/knowledge-base', label: 'Knowledge base', icon: BookOpen },
+  { to: '/workforce', label: 'Workforce (local)', icon: ClipboardList },
 ]
 
 export function Layout({ children }: { children: ReactNode }) {
-  const { role, email, configured, loading: sessionLoading } = useSession()
+  const { role, email, configured, workforceDemo, loading: sessionLoading } = useSession()
   const [mobile, setMobile] = useState(false)
   const menuTrigger = useRef<HTMLButtonElement>(null)
   const closeMenu = useRef<HTMLButtonElement>(null)
@@ -51,7 +52,7 @@ export function Layout({ children }: { children: ReactNode }) {
         <button ref={closeMenu} className="md:hidden" onClick={() => { setMobile(false); menuTrigger.current?.focus() }} aria-label="Close menu"><X size={18} /></button>
       </div>
       <nav id="main-navigation" className="space-y-1" aria-label="Main">
-        {nav.filter(item => item.to !== '/triggers' || role === 'admin').map(({ to, label, icon: Icon }) => <NavLink key={to} to={to} end={to === '/'} className={({ isActive }) => cn('flex items-center gap-2 rounded px-3 py-2 text-sm text-slate-300 hover:bg-white/10', isActive && 'bg-white/10 text-white')}><Icon size={16} /> {label}</NavLink>)}
+        {nav.filter(item => (item.to !== '/triggers' || role === 'admin') && (item.to !== '/workforce' || workforceDemo)).map(({ to, label, icon: Icon }) => <NavLink key={to} to={to} end={to === '/'} className={({ isActive }) => cn('flex items-center gap-2 rounded px-3 py-2 text-sm text-slate-300 hover:bg-white/10', isActive && 'bg-white/10 text-white')}><Icon size={16} /> {label}</NavLink>)}
       </nav>
       <div className="mt-auto rounded bg-white/5 p-3 text-xs text-slate-400"><div className="mb-1 flex items-center gap-1"><Activity size={13} /> {healthLabel}</div><div className="truncate">{email}</div><div className="capitalize">{role}</div></div>
     </aside>

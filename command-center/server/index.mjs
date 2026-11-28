@@ -10,6 +10,12 @@ app.use(express.json({ limit: '1mb' }))
 const API_URL = (process.env.FLOWOPS_API_URL || '').replace(/\/+$/, '')
 const API_TOKEN = process.env.FLOWOPS_API_TOKEN || ''
 const DEV = process.env.NODE_ENV !== 'production' && (process.env.FLOWOPS_ENVIRONMENT || 'development') === 'development' && process.env.FLOWOPS_COMMAND_CENTER_DEV === 'true'
+// Workforce console access is deliberately limited to an explicit loopback
+// synthetic demo; production identity does not yet carry workforce roles.
+function isLoopbackUpstream() {
+  try { return ['127.0.0.1', 'localhost', '[::1]'].includes(new URL(API_URL).hostname) } catch { return false }
+}
+const WORKFORCE_DEV = DEV && process.env.FLOWOPS_COMMAND_CENTER_WORKFORCE_DEV === 'true' && isLoopbackUpstream()
 const SEG = '[A-Za-z0-9_.:-]+'
 const rr = (s) => new RegExp(`^${s}$`)
 
@@ -42,6 +48,18 @@ const ADMIN_POST = [
   rr('/triggers'), rr(`/triggers/${SEG}/test`),
 ]
 const ADMIN_PUT = [rr(`/workflow-definitions/${SEG}`), rr(`/triggers/${SEG}`)]
+const WORKFORCE_GET = [
+  rr('/workforce/dashboard'), rr('/workforce/employees'), rr('/workforce/onboarding-requests'),
+  rr('/workforce/onboarding-requests/[0-9]+'), rr('/workforce/tasks'), rr('/workforce/assets'),
+  rr('/workforce/assets/[0-9]+/history'), rr('/workforce/automation/events'),
+  rr('/workforce/automation/reminders'), rr('/workforce/audit'),
+]
+const WORKFORCE_POST = [
+  rr('/workforce/employees'), rr('/workforce/onboarding-requests'),
+  rr('/workforce/onboarding-requests/[0-9]+/(submit|approve|reject|cancel|copy-rejected)'),
+  rr('/workforce/assets'), rr('/workforce/assets/[0-9]+/(assign|return)'),
+  rr('/workforce/automation/events/[A-Za-z0-9_-]+/simulate'),
+]
 const GLOBAL_ADMIN_PATHS = [rr('/event-sources'), rr('/triggers'), rr(`/triggers/${SEG}`), rr(`/triggers/${SEG}/(deliveries|test)`)]
 
 function configured() { return Boolean(API_URL && (!DEV || API_TOKEN)) }
@@ -68,6 +86,7 @@ async function identity(req) {
 
 function allowed(method, p) {
   if (p.split('/').some(segment => segment === '.' || segment === '..')) return false
+  if (p.startsWith('/workforce/')) return WORKFORCE_DEV && (method === 'GET' ? WORKFORCE_GET : method === 'POST' ? WORKFORCE_POST : []).some(r => r.test(p))
   if (method === 'GET') return GET_PATHS.some((r) => r.test(p))
   if (method === 'POST') return OPERATOR_POST.some((r) => r.test(p)) || ADMIN_POST.some((r) => r.test(p))
   if (method === 'PUT') return ADMIN_PUT.some((r) => r.test(p))
@@ -103,7 +122,7 @@ app.get('/api/session', async (req, res) => {
   try {
     const actor = await identity(req)
     if (!actor) return res.status(401).json({ role: 'viewer', configured: false, email: '' })
-    return res.json({ role: actor.role, configured: true, email: actor.subject })
+    return res.json({ role: actor.role, configured: true, email: actor.subject, ...(WORKFORCE_DEV && actor.role === 'admin' ? { workforceDemo: true } : {}) })
   } catch {
     return res.status(503).json({ role: 'viewer', configured: false, email: '' })
   }
@@ -119,6 +138,7 @@ app.post('/api/flowops', async (req, res) => {
   try { actor = await identity(req) } catch { return res.status(503).json({ ok: false, status: 503, error: 'Identity verification unavailable.' }) }
   if (!actor) return res.status(401).json({ ok: false, status: 401, error: 'Authentication required.' })
   const { role } = actor
+  if (p.startsWith('/workforce/') && (!WORKFORCE_DEV || role !== 'admin')) return res.status(403).json({ ok: false, status: 403, error: 'Local workforce demo administrator required.' })
   if (GLOBAL_ADMIN_PATHS.some(r => r.test(p)) && (role !== 'admin' || actor.tenant_key != null)) return res.status(403).json({ ok: false, status: 403, error: 'Global administrator access required.' })
   if (method !== 'GET' && role === 'viewer') return res.status(403).json({ ok: false, status: 403, error: 'Viewers cannot perform this action.' })
   if (adminOnly(method, p) && role !== 'admin') return res.status(403).json({ ok: false, status: 403, error: 'Admin role required.' })

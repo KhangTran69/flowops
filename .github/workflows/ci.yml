@@ -246,6 +246,7 @@ jobs:
           FLOWOPS_API_URL: http://127.0.0.1:8000
           FLOWOPS_API_TOKEN: local-browser-test
           FLOWOPS_COMMAND_CENTER_DEV: 'true'
+          FLOWOPS_COMMAND_CENTER_WORKFORCE_DEV: 'true'
           DEV_USER_ROLE: admin
           SERVE_STATIC: 'true'
           FLOWOPS_AXE_PATH: /tmp/flowops-axe/node_modules/axe-core/axe.min.js

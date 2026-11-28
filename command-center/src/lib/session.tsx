@@ -1,8 +1,8 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from 'react'
 
 export type Role = 'admin' | 'operator' | 'viewer'
-type Session = { role: Role; email: string; configured: boolean; loading: boolean }
-const denied: Session = { role: 'viewer', email: '', configured: false, loading: false }
+type Session = { role: Role; email: string; configured: boolean; loading: boolean; workforceDemo: boolean }
+const denied: Session = { role: 'viewer', email: '', configured: false, loading: false, workforceDemo: false }
 const Ctx = createContext<Session>({ ...denied, loading: true })
 export const useSession = () => useContext(Ctx)
 
@@ -23,7 +23,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
           setSession(denied)
           return
         }
-        setSession({ role: s.role, email: s.email, configured: true, loading: false })
+        setSession({ role: s.role, email: s.email, configured: true, loading: false, workforceDemo: s.workforceDemo === true && s.role === 'admin' })
       } catch {
         if (current === generation) setSession(denied)
       }

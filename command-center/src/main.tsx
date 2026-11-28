@@ -22,6 +22,7 @@ import Analytics from './pages/Analytics'
 import Triggers from './pages/Triggers'
 import TriggerDetail from './pages/TriggerDetail'
 import KnowledgeBase from './pages/KnowledgeBase'
+import Workforce from './pages/Workforce'
 import './index.css'
 
 createRoot(document.getElementById('root')!).render(
@@ -48,6 +49,7 @@ createRoot(document.getElementById('root')!).render(
             <Route path="/triggers" element={<Triggers />} />
             <Route path="/triggers/:key" element={<TriggerDetail />} />
             <Route path="/knowledge-base" element={<KnowledgeBase />} />
+            <Route path="/workforce" element={<Workforce />} />
             <Route path="*" element={<div className="card p-6">Page not found.</div>} />
           </Routes>
         </Layout>

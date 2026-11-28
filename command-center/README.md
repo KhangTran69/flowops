@@ -127,8 +127,10 @@ operator value:
 - [x] **Triggers** (`/ui/triggers`, trigger detail) — source metadata, trigger creation/update,
   delivery history and non-executing mapping preview. Secret creation/rotation remains in backend administration.
 - [x] **Knowledge base** (`/ui/knowledge-base`) — read-only search and category filtering
-- [ ] **Workforce module** (`/workforce/ui`) — gated behind the browser
-  release gate until production identity ships
+- [ ] **Workforce module** (`/workforce/ui`) — local synthetic port covers overview,
+  employees, requests/approvals, task list, asset assignment/history, simulated automation,
+  reminders and audit. Task editing and real-provider retry controls remain pending.
+  Production browser release remains gated until real role/identity validation.
 
 Every port must, in the same PR:
 
@@ -142,3 +144,16 @@ Retirement rule: once the checklist is empty, hide `/ui/*` behind a feature
 flag for one release, then delete the Jinja templates and their routes.
 Apply the additive Alembic manual-ticket migration in a non-production
 representative database first. No production deployment is part of this branch.
+
+
+### Local workforce preview
+
+Only set `FLOWOPS_COMMAND_CENTER_WORKFORCE_DEV=true` together with the existing
+explicit loopback development proxy, local simulated backend, and
+`DEV_USER_ROLE=admin`. Use synthetic records only. The proxy denies all
+workforce paths in production, including when the flag is set. The new React
+surface intentionally does not proxy integration callbacks, live delivery
+retries or credential management. The existing backend continues to enforce
+roles, manager ownership, tenant scope and state transitions. This local
+journey is not evidence of production workforce role parity; the production
+browser release gate remains open.
