@@ -60,6 +60,11 @@ const WORKFORCE_POST = [
   rr('/workforce/assets'), rr('/workforce/assets/[0-9]+/(assign|return)'),
   rr('/workforce/automation/events/[A-Za-z0-9_-]+/simulate'),
 ]
+const WORKFORCE_PATCH = [
+  rr('/workforce/employees/[0-9]+'), rr('/workforce/employees/[0-9]+/status'),
+  rr('/workforce/onboarding-requests/[0-9]+'), rr('/workforce/tasks/[0-9]+'),
+  rr('/workforce/assets/[0-9]+/status'),
+]
 const GLOBAL_ADMIN_PATHS = [rr('/event-sources'), rr('/triggers'), rr(`/triggers/${SEG}`), rr(`/triggers/${SEG}/(deliveries|test)`)]
 
 function configured() { return Boolean(API_URL && (!DEV || API_TOKEN)) }
@@ -86,7 +91,7 @@ async function identity(req) {
 
 function allowed(method, p) {
   if (p.split('/').some(segment => segment === '.' || segment === '..')) return false
-  if (p.startsWith('/workforce/')) return WORKFORCE_DEV && (method === 'GET' ? WORKFORCE_GET : method === 'POST' ? WORKFORCE_POST : []).some(r => r.test(p))
+  if (p.startsWith('/workforce/')) return WORKFORCE_DEV && (method === 'GET' ? WORKFORCE_GET : method === 'POST' ? WORKFORCE_POST : method === 'PATCH' ? WORKFORCE_PATCH : []).some(r => r.test(p))
   if (method === 'GET') return GET_PATHS.some((r) => r.test(p))
   if (method === 'POST') return OPERATOR_POST.some((r) => r.test(p)) || ADMIN_POST.some((r) => r.test(p))
   if (method === 'PUT') return ADMIN_PUT.some((r) => r.test(p))

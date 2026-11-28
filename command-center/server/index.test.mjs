@@ -46,7 +46,7 @@ test('production proxy verifies identity and forwards only authenticated credent
     }
     assert.equal((await invoke('POST', '/webhooks/triggers/example', { Authorization: 'Bearer admin' })).status, 400)
     assert.equal((await invoke('POST', '/event-sources', { Authorization: 'Bearer admin' })).status, 400)
-    for (const [method, path] of [['GET', '/workforce/dashboard'], ['GET', '/workforce/employees'], ['POST', '/workforce/onboarding-requests'], ['POST', '/workforce/automation/events/test/simulate']]) {
+    for (const [method, path] of [['GET', '/workforce/dashboard'], ['GET', '/workforce/employees'], ['POST', '/workforce/onboarding-requests'], ['POST', '/workforce/automation/events/test/simulate'], ['PATCH', '/workforce/tasks/1'], ['PATCH', '/workforce/assets/1/status']]) {
       assert.equal((await invoke(method, path, { Authorization: 'Bearer admin' })).status, 400)
     }
     const session = await fetch(url + '/api/session', { headers: { Authorization: 'Bearer operator', 'X-User-Email': 'forged' } })

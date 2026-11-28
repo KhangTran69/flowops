@@ -157,3 +157,5 @@ retries or credential management. The existing backend continues to enforce
 roles, manager ownership, tenant scope and state transitions. This local
 journey is not evidence of production workforce role parity; the production
 browser release gate remains open.
+
+Workforce preview now supports task assignment, due dates, completion notes and status, draft employee changes, employee status, asset return notes and inventory status. Provisioning completion is restricted to automation outcomes; simulation requires the simulated adapter. Production browser access and real delivery retries remain disabled.

@@ -593,10 +593,16 @@ def update_task(task_id: int, payload: TaskUpdateIn,
     request = _request_row(session, task.request_id, actor, lock=True)
     if request is None or request.tenant_key != task.tenant_key:
         raise HTTPException(404, "IT task not found.")
+    # Serialize task mutations with callbacks and request completion. Refresh
+    # after taking the parent lock: the first task read may predate a concurrent
+    # callback or task update.
+    session.refresh(task)
     if request.status in {"CANCELLED", "REJECTED", "COMPLETED"}:
         raise HTTPException(409, "Tasks for a terminal onboarding request cannot be changed.")
-    if task.status == "DONE" and payload.status != "DONE":
-        raise HTTPException(409, "Completed tasks cannot be reopened.")
+    if task.status == "DONE":
+        raise HTTPException(409, "Completed tasks cannot be changed.")
+    if task.task_key == "provision_account" and payload.status == "DONE":
+        raise HTTPException(409, "Provisioning completion requires an automation outcome.")
     task.status = payload.status
     if "assignee_subject" in payload.model_fields_set:
         task.assignee_subject = payload.assignee_subject
@@ -797,8 +803,9 @@ def provisioning_callback(payload: CallbackIn,
 
 @router.post("/automation/events/{event_id}/simulate")
 def simulate_provisioning(event_id: str, actor: Actor = Depends(role_actor("IT_ADMIN")), session: Session = Depends(db.get_session)):
-    if os.environ.get("FLOWOPS_ENVIRONMENT", "development").lower() != "development":
-        raise HTTPException(404, "Mock automation is available only in development.")
+    if (os.environ.get("FLOWOPS_ENVIRONMENT", "development").lower() != "development"
+            or os.environ.get("FLOWOPS_AUTOMATION_ADAPTER", "simulated").lower() != "simulated"):
+        raise HTTPException(404, "Mock automation requires development and the simulated adapter.")
     event = session.execute(_scope(select(db.WorkforceAutomationEventRecord).where(
         db.WorkforceAutomationEventRecord.event_id == event_id).with_for_update(),
         db.WorkforceAutomationEventRecord, actor)).scalar_one_or_none()

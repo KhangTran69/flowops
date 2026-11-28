@@ -73,9 +73,13 @@ export function responseSchema(method: string, path: string): z.ZodType | undefi
   if (path === '/workforce/dashboard') return wfDashboard
   if (path === '/workforce/employees') return method === 'GET' ? z.array(wfEmployee) : wfEmployee
   if (path === '/workforce/onboarding-requests') return method === 'GET' ? z.array(wfRequest) : wfRequest
-  if (/^\/workforce\/onboarding-requests\/\d+$/.test(path)) return wfRequestDetail
+  if (/^\/workforce\/onboarding-requests\/\d+$/.test(path)) return method === 'PATCH' ? wfRequest : wfRequestDetail
   if (/^\/workforce\/onboarding-requests\/\d+\/(submit|approve|reject|copy-rejected)$/.test(path)) return wfRequest
   if (/^\/workforce\/onboarding-requests\/\d+\/cancel$/.test(path)) return z.object({ id: integer, status: text })
+  if (/^\/workforce\/employees\/\d+$/.test(path)) return wfEmployee
+  if (/^\/workforce\/employees\/\d+\/status$/.test(path)) return z.object({ id: integer, status: text })
+  if (/^\/workforce\/tasks\/\d+$/.test(path)) return wfTask
+  if (/^\/workforce\/assets\/\d+\/status$/.test(path)) return wfAsset
   if (path === '/workforce/tasks') return z.array(wfTask)
   if (path === '/workforce/assets') return method === 'GET' ? z.array(wfAsset) : wfAsset
   if (/^\/workforce\/assets\/\d+\/history$/.test(path)) return z.array(wfAssignment)

@@ -597,3 +597,20 @@ def test_workforce_production_browser_gate_does_not_disable_bearer_api(workforce
     set_actor(Actor("hr-bearer", ("HR",), source="bearer", tenant_key="tenant-a"))
     assert client.get("/workforce/ui").status_code == 403
     assert client.get("/workforce/employees").status_code == 200
+
+
+def test_provisioning_cannot_be_completed_manually_or_simulated_in_live_mode(workforce_client, monkeypatch):
+    client, set_actor = workforce_client
+    _, request_id = _approved_request(client, set_actor)
+    tasks = client.get("/workforce/tasks").json()
+    provision = next(task for task in tasks if task["task_key"] == "provision_account")
+    assert client.patch(f"/workforce/tasks/{provision['id']}", json={"status": "DONE"}).status_code == 409
+    event = client.get("/workforce/automation/events").json()[0]
+    monkeypatch.setenv("FLOWOPS_AUTOMATION_ADAPTER", "n8n")
+    assert client.post(f"/workforce/automation/events/{event['event_id']}/simulate").status_code == 404
+    assert client.get(f"/workforce/onboarding-requests/{request_id}").json()["status"] == "IN_PROGRESS"
+    task = next(task for task in tasks if task["task_key"] != "provision_account")
+    path = f"/workforce/tasks/{task['id']}"
+    assert client.patch(path, json={"status": "DONE", "completion_notes": "Verified"}).status_code == 200
+    assert client.patch(path, json={"status": "DONE", "completion_notes": "Overwrite"}).status_code == 409
+    assert next(row for row in client.get("/workforce/tasks").json() if row["id"] == task["id"])["completion_notes"] == "Verified"
