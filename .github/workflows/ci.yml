@@ -98,6 +98,19 @@ jobs:
           echo "$response"
           echo "$response" | grep -q '"priority":"urgent"'
           echo "$response" | grep -q '"queue":"it-network"'
+      - name: Seed the demo dataset and assert key rows
+        run: |
+          docker compose exec -T app python -m scripts.seed_demo
+          # A second run must be a no-op (idempotency of the seed itself).
+          docker compose exec -T app python -m scripts.seed_demo | grep -q 'already present'
+          docker compose exec -T postgres psql -U flowops -d flowops -tAc \
+            "SELECT count(*) FROM tickets WHERE tenant_key = 'demo'" | grep -qx '30'
+          docker compose exec -T postgres psql -U flowops -d flowops -tAc \
+            "SELECT count(*) FROM workflow_runs" | grep -qx '2'
+          docker compose exec -T postgres psql -U flowops -d flowops -tAc \
+            "SELECT count(*) FROM workflow_jobs WHERE status = 'failed'" | grep -qx '1'
+          docker compose exec -T postgres psql -U flowops -d flowops -tAc \
+            "SELECT count(*) FROM notification_outbox WHERE status = 'failed'" | grep -qx '1'
       - name: Collect service logs
         if: always()
         run: docker compose logs

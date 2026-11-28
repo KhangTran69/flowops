@@ -20,6 +20,37 @@ The tenant proof covers the direct ticket-read API boundary only; it is not a
 complete authorization audit. Microsoft Graph and external provider behavior
 remain simulated. The UI walkthrough below is an optional follow-on.
 
+## Seeding the demo dataset
+
+An empty database shows empty dashboards. Seed a plausible dataset first:
+
+```bash
+python -m scripts.seed_demo          # no-op if the demo data already exists
+python -m scripts.seed_demo --reset  # clear every table and reseed from scratch
+```
+
+The seed writes everything through the normal SQLAlchemy models (no schema
+bypass), works on SQLite and PostgreSQL, and creates:
+
+- the `demo` tenant, six employees, and three assigned laptop assets;
+- 30 tickets routed by the real rule set (`src/routing.py`) across all six
+  queues, with a mix of open/closed and urgent/high/normal priorities;
+- one onboarding run mid-flight (two steps done, one approved and queued as a
+  durable job) and one paused run awaiting approval, with a pending SLA timer;
+- one exhausted (failed) workflow job and one dead-letter notification so the
+  jobs and notifications pages show failure handling;
+- two published workflow definitions matching the built-in DAG templates.
+
+With the compose stack running, seed it inside the app container:
+
+```bash
+docker compose exec app python -m scripts.seed_demo
+```
+
+All adapters stay simulated; no external system is contacted. The
+`docker-postgres` CI job runs the seed against the PostgreSQL stack and
+asserts the key rows exist.
+
 ## Five-minute path
 
 | Time | Show | What the viewer should notice |
