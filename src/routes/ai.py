@@ -8,7 +8,7 @@ keep the OpenAPI surface byte-identical across this decomposition.
 """
 
 import time
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import select
@@ -16,16 +16,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src import ai_agent, chatops, db, scheduler, timers, workflow
+from src.api import _record_ai_apply, _record_ai_triage  # noqa: E402
 from src.auth import Actor
 from src.deps import _new_run_id, _operator_actor, _require_ticket_access
-from src.schemas import (
-    AIApplyOut,
-    AIApplyRequest,
-    AITriageOut,
-    KnowledgeBaseArticleOut,
-    Ticket,
-)
-
 from src.routes.tickets import (  # noqa: E402
     _analyze_ticket,
     _article_out,
@@ -33,9 +26,13 @@ from src.routes.tickets import (  # noqa: E402
     _ticket_history,
     _triage_out,
 )
-
-from src.api import _record_ai_apply, _record_ai_triage  # noqa: E402
-
+from src.schemas import (
+    AIApplyOut,
+    AIApplyRequest,
+    AITriageOut,
+    KnowledgeBaseArticleOut,
+    Ticket,
+)
 
 router = APIRouter()
 
@@ -160,8 +157,8 @@ def apply_ai_recommendations(
 
 @router.get("/knowledge-base", response_model=list[KnowledgeBaseArticleOut])
 def get_knowledge_base(
-    query: Optional[str] = Query(default=None),
-    category: Optional[str] = Query(default=None),
+    query: str | None = Query(default=None),
+    category: str | None = Query(default=None),
     limit: int = Query(default=20, ge=1, le=50),
 ) -> list[KnowledgeBaseArticleOut]:
     """List or search the simulated IT knowledge base."""
@@ -190,7 +187,7 @@ def chatops_approve(
 def chatops_reject(
     request: Request,
     token: str = Query(...),
-    reason: Optional[str] = Query(default=None),
+    reason: str | None = Query(default=None),
     source: str = Query(default="webhook"),
     session: Session = Depends(db.get_session),
 ) -> dict[str, Any]:
@@ -204,7 +201,7 @@ def _chatops_action(
     token: str,
     action: str,
     source: str,
-    reason: Optional[str],
+    reason: str | None,
 ) -> dict[str, Any]:
     try:
         claims = chatops.verify_token(token)

@@ -10,12 +10,13 @@ coupling is that :class:`WorkflowGraphError` is an ``HTTPException`` carrying
 status 422, so a rejected template never surfaces as an unhandled 500.
 """
 
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Optional, Sequence, TypedDict
-
-from src import expressions
+from typing import Any, TypedDict
 
 from fastapi import HTTPException
+
+from src import expressions
 
 VALID_REQUEST_TYPES = ("onboarding", "offboarding")
 
@@ -96,15 +97,19 @@ class StepTransition:
 
 
 ONBOARDING_STEPS: tuple[ChecklistStep, ...] = (
-    {"step": "Create user account", "key": "create_user_account", "queue": "it-access-management", "requires_approval": True, "action": "none"},
-    {"step": "Provision laptop and peripherals", "key": "provision_laptop", "queue": "it-hardware", "requires_approval": False, "action": "none"},
+    {"step": "Create user account", "key": "create_user_account", "queue": "it-access-management",
+     "requires_approval": True, "action": "none"},
+    {"step": "Provision laptop and peripherals", "key": "provision_laptop", "queue": "it-hardware",
+     "requires_approval": False, "action": "none"},
     {"step": "Grant software licenses", "key": "grant_licenses", "queue": "it-software", "requires_approval": True, "action": "none"},
     {"step": "Configure email mailbox", "key": "configure_mailbox", "queue": "it-messaging", "requires_approval": False, "action": "none"},
 )
 
 OFFBOARDING_STEPS: tuple[ChecklistStep, ...] = (
-    {"step": "Disable user account", "key": "disable_user_account", "queue": "it-access-management", "requires_approval": True, "action": "none"},
-    {"step": "Recover laptop and peripherals", "key": "recover_laptop", "queue": "it-hardware", "requires_approval": False, "action": "none"},
+    {"step": "Disable user account", "key": "disable_user_account", "queue": "it-access-management",
+     "requires_approval": True, "action": "none"},
+    {"step": "Recover laptop and peripherals", "key": "recover_laptop", "queue": "it-hardware",
+     "requires_approval": False, "action": "none"},
     {"step": "Revoke software licenses", "key": "revoke_licenses", "queue": "it-software", "requires_approval": False, "action": "none"},
     {"step": "Archive email mailbox", "key": "archive_mailbox", "queue": "it-messaging", "requires_approval": True, "action": "none"},
 )
@@ -115,10 +120,14 @@ OFFBOARDING_STEPS: tuple[ChecklistStep, ...] = (
 #:                                    +--> [Grant licenses (gated)] +--> request complete
 #:   [Provision hardware (independent)] ---------------------------+
 ONBOARDING_DAG_STEPS: tuple[ChecklistStep, ...] = (
-    {"step": "Create user account", "key": "create_user_account", "queue": "it-access-management", "requires_approval": True, "action": "none", "depends_on": []},
-    {"step": "Provision laptop and peripherals", "key": "provision_laptop", "queue": "it-hardware", "requires_approval": False, "action": "none", "depends_on": []},
-    {"step": "Grant software licenses", "key": "grant_licenses", "queue": "it-software", "requires_approval": True, "action": "none", "depends_on": ["create_user_account"]},
-    {"step": "Configure email mailbox", "key": "configure_mailbox", "queue": "it-messaging", "requires_approval": False, "action": "none", "depends_on": ["create_user_account"]},
+    {"step": "Create user account", "key": "create_user_account", "queue": "it-access-management",
+     "requires_approval": True, "action": "none", "depends_on": []},
+    {"step": "Provision laptop and peripherals", "key": "provision_laptop", "queue": "it-hardware",
+     "requires_approval": False, "action": "none", "depends_on": []},
+    {"step": "Grant software licenses", "key": "grant_licenses", "queue": "it-software",
+     "requires_approval": True, "action": "none", "depends_on": ["create_user_account"]},
+    {"step": "Configure email mailbox", "key": "configure_mailbox", "queue": "it-messaging",
+     "requires_approval": False, "action": "none", "depends_on": ["create_user_account"]},
 )
 
 #: Offboarding DAG shape. The flat v0.5 template stays the default for
@@ -127,10 +136,14 @@ ONBOARDING_DAG_STEPS: tuple[ChecklistStep, ...] = (
 #: prerequisites and skipped steps return 409 (see
 #: ``complete_offboarding_step`` and ``tests/test_offboarding.py``).
 OFFBOARDING_DAG_SHAPE: tuple[ChecklistStep, ...] = (
-    {"step": "Disable user account", "key": "disable_user_account", "queue": "it-access-management", "requires_approval": True, "action": "none", "depends_on": []},
-    {"step": "Recover laptop and peripherals", "key": "recover_laptop", "queue": "it-hardware", "requires_approval": False, "action": "none", "depends_on": []},
-    {"step": "Revoke software licenses", "key": "revoke_licenses", "queue": "it-software", "requires_approval": False, "action": "none", "depends_on": ["disable_user_account"]},
-    {"step": "Archive email mailbox", "key": "archive_mailbox", "queue": "it-messaging", "requires_approval": True, "action": "none", "depends_on": ["disable_user_account"]},
+    {"step": "Disable user account", "key": "disable_user_account", "queue": "it-access-management",
+     "requires_approval": True, "action": "none", "depends_on": []},
+    {"step": "Recover laptop and peripherals", "key": "recover_laptop", "queue": "it-hardware",
+     "requires_approval": False, "action": "none", "depends_on": []},
+    {"step": "Revoke software licenses", "key": "revoke_licenses", "queue": "it-software",
+     "requires_approval": False, "action": "none", "depends_on": ["disable_user_account"]},
+    {"step": "Archive email mailbox", "key": "archive_mailbox", "queue": "it-messaging",
+     "requires_approval": True, "action": "none", "depends_on": ["disable_user_account"]},
 )
 
 # v0.6 placeholder: an extra onboarding step that provisions a *simulated*
@@ -206,7 +219,7 @@ def resolve_blocked_steps(
     states: Mapping[str, StepState],
     *,
     pre_approved: Iterable[str] = (),
-    scope: Optional[Mapping[str, Any]] = None,
+    scope: Mapping[str, Any] | None = None,
 ) -> list[StepTransition]:
     """Promote or cascade every ``blocked`` step and return the transitions.
 
@@ -409,7 +422,7 @@ def template_for(name: str, request_type: str) -> list[ChecklistStep]:
 def checklist_for(
     request_type: str,
     include_m365: bool = False,
-    template: Optional[str] = None,
+    template: str | None = None,
 ) -> list[ChecklistStep]:
     """Return the checklist template for a request type.
 

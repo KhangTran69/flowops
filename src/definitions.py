@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Mapping, Optional, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -72,7 +73,7 @@ def validate_steps(steps: Sequence[Mapping[str, Any]], request_type: str) -> lis
     return normalized
 
 
-def get_definition(session: Session, key: str) -> Optional[db.WorkflowDefinitionRecord]:
+def get_definition(session: Session, key: str) -> db.WorkflowDefinitionRecord | None:
     return session.get(db.WorkflowDefinitionRecord, key)
 
 
@@ -96,7 +97,7 @@ def list_versions(session: Session, key: str) -> list[db.WorkflowDefinitionVersi
 
 def get_version(
     session: Session, key: str, version: int
-) -> Optional[db.WorkflowDefinitionVersionRecord]:
+) -> db.WorkflowDefinitionVersionRecord | None:
     return session.execute(
         select(db.WorkflowDefinitionVersionRecord).where(
             db.WorkflowDefinitionVersionRecord.definition_key == key,
@@ -124,7 +125,7 @@ def create_definition(
     name: str,
     request_type: str,
     steps: Sequence[Mapping[str, Any]],
-    actor: Optional[str] = None,
+    actor: str | None = None,
 ) -> db.WorkflowDefinitionRecord:
     key = key.strip().lower()
     if not key:
@@ -160,7 +161,7 @@ def create_version(
     key: str,
     steps: Sequence[Mapping[str, Any]],
     *,
-    actor: Optional[str] = None,
+    actor: str | None = None,
 ) -> db.WorkflowDefinitionVersionRecord:
     definition = session.execute(select(db.WorkflowDefinitionRecord).where(
         db.WorkflowDefinitionRecord.key == key
@@ -184,7 +185,7 @@ def create_version(
 
 
 def publish_version(
-    session: Session, key: str, version: int, *, actor: Optional[str] = None
+    session: Session, key: str, version: int, *, actor: str | None = None
 ) -> db.WorkflowDefinitionRecord:
     definition = session.execute(select(db.WorkflowDefinitionRecord).where(
         db.WorkflowDefinitionRecord.key == key

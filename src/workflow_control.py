@@ -7,7 +7,6 @@ consistent.
 """
 
 import uuid
-from typing import Any, Optional
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -26,8 +25,8 @@ def enqueue_onboarding_item(
     item_id: int,
     action: str,
     label: str,
-    actor_subject: Optional[str],
-    correlation: Optional[str] = None,
+    actor_subject: str | None,
+    correlation: str | None = None,
 ) -> db.WorkflowJobRecord:
     """Enqueue one onboarding action and audit the control-plane transition."""
     correlation = correlation or correlation_id()
@@ -66,7 +65,7 @@ def get_job(session: Session, job_id: int) -> db.WorkflowJobRecord:
     return job
 
 
-def retry(session: Session, job_id: int, actor_subject: Optional[str]) -> db.WorkflowJobRecord:
+def retry(session: Session, job_id: int, actor_subject: str | None) -> db.WorkflowJobRecord:
     job = get_job(session, job_id)
     if not jobs.retry_failed_job(session, job_id):
         raise ValueError(f"Workflow job {job_id} is not failed.")
@@ -79,7 +78,7 @@ def retry(session: Session, job_id: int, actor_subject: Optional[str]) -> db.Wor
     return get_job(session, job_id)
 
 
-def cancel(session: Session, job_id: int, actor_subject: Optional[str]) -> db.WorkflowJobRecord:
+def cancel(session: Session, job_id: int, actor_subject: str | None) -> db.WorkflowJobRecord:
     job = get_job(session, job_id)
     if not jobs.cancel_job(session, job_id):
         raise ValueError(f"Workflow job {job_id} cannot be cancelled from '{job.status}'.")

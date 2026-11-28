@@ -134,7 +134,7 @@ def test_pg_trigger_worker_creates_onboarding_request(pg_session, monkeypatch):
     from src.actions import ActionResult
 
     _create_event_source(pg_session)
-    definition = _create_definition(pg_session)
+    _create_definition(pg_session)
     trigger = _create_trigger(pg_session, definition_key="pg-test-def")
 
     # Create delivery
@@ -147,7 +147,7 @@ def test_pg_trigger_worker_creates_onboarding_request(pg_session, monkeypatch):
     )
 
     # Enqueue job
-    job = jobs.enqueue_job(
+    jobs.enqueue_job(
         pg_session,
         job_type=jobs.JOB_TRIGGER_EXECUTE,
         payload={

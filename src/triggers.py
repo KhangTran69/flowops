@@ -16,12 +16,13 @@ import math
 import re
 import secrets
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from datetime import time as datetime_time
-from typing import Any, Mapping, Optional
+from typing import Any
 
-from sqlalchemy import and_, select, update
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from src import db
@@ -262,7 +263,7 @@ def lease_trigger(
     session: Session,
     trigger_key: str,
     lease_duration_seconds: int = 60,
-) -> Optional[str]:
+) -> str | None:
     """Atomically acquire a lease on a trigger to prevent double-firing.
 
     Returns the lease token if acquired, None if already leased.
@@ -306,8 +307,8 @@ def record_delivery(
     event_id: str,
     payload: dict[str, Any],
     status: str = "received",
-    request_id: Optional[str] = None,
-    error: Optional[str] = None,
+    request_id: str | None = None,
+    error: str | None = None,
 ) -> db.TriggerDeliveryRecord:
     """Record a trigger delivery, handling deduplication.
 
@@ -342,8 +343,8 @@ def update_delivery(
     session: Session,
     delivery: db.TriggerDeliveryRecord,
     status: str,
-    request_id: Optional[str] = None,
-    error: Optional[str] = None,
+    request_id: str | None = None,
+    error: str | None = None,
 ) -> None:
     """Update a delivery's status and optional fields."""
     delivery.status = status
@@ -367,7 +368,7 @@ def is_due_interval(trigger: db.TriggerRecord, now: datetime) -> bool:
     return now >= trigger.last_fired_at + timedelta(seconds=seconds)
 
 
-def parse_daily_time(value: Optional[str]) -> Optional[datetime_time]:
+def parse_daily_time(value: str | None) -> datetime_time | None:
     """Parse a daily UTC clock time, including previously accepted unpadded values."""
     if not isinstance(value, str):
         return None
@@ -428,7 +429,7 @@ class ScheduledTick:
 
 def tick_scheduler(
     session: Session,
-    now: Optional[datetime] = None,
+    now: datetime | None = None,
     *,
     commit: bool = True,
 ) -> list[ScheduledTick]:
@@ -444,7 +445,7 @@ def tick_scheduler(
 
     triggers = session.execute(
         select(db.TriggerRecord).where(
-            db.TriggerRecord.active == True,
+            db.TriggerRecord.active.is_(True),
             db.TriggerRecord.schedule_kind.in_(("interval", "daily")),
         )
     ).scalars().all()

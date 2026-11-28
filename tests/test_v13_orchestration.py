@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from src import db, definitions, onboarding, timers
+from src import db, timers
 from src.onboarding import StepState, resolve_blocked_steps
 
 STEPS = [

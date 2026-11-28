@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from src import api, db, jobs, scheduler, worker
+from src import api, db, scheduler, worker
 
 
 @pytest.fixture
@@ -123,7 +123,7 @@ def test_cancel_cancels_queued_jobs_and_prevents_scheduling(client):
 
 def test_terminal_failure_cascades_and_fails_run(client, monkeypatch):
     request_id, items = _create(client)
-    run = _start(client, request_id)
+    _start(client, request_id)
 
     class BrokenAdapter:
         def execute(self, action, context):

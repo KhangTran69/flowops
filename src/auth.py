@@ -1,11 +1,11 @@
 """Authentication boundary for protected automation actions."""
 
-from dataclasses import dataclass
 import json
 import os
 import secrets
 import time
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any
 
 import jwt
 import requests
@@ -16,7 +16,7 @@ class Actor:
     subject: str
     roles: tuple[str, ...]
     source: str = "local"  # local | bearer | session
-    tenant_key: Optional[str] = None
+    tenant_key: str | None = None
 
 
 class AuthenticationError(ValueError):
@@ -74,7 +74,7 @@ def _authenticate_jwt(token: str, values: dict[str, str]) -> Actor:
 
 
 def validate_auth_configuration(
-    environ: Optional[dict[str, str]] = None,
+    environ: dict[str, str] | None = None,
 ) -> None:
     """Fail fast when protected mode lacks a usable credential source."""
     values = environ if environ is not None else os.environ
@@ -102,7 +102,7 @@ def validate_auth_configuration(
 
 
 def authenticate_bearer(
-    authorization: Optional[str], *, environ: Optional[dict[str, str]] = None
+    authorization: str | None, *, environ: dict[str, str] | None = None
 ) -> Actor:
     """Validate Entra JWTs in protected mode, with an explicit local fallback."""
     values = environ if environ is not None else os.environ

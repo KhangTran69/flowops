@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from src import api, db, ui_session
+from src import api, db
 from src.auth import Actor
 from src.deps import _actor_from_header
 
@@ -333,7 +333,8 @@ def test_n8n_worker_does_not_dispatch_legacy_event_without_tenant(workforce_clie
     finally:
         session.close()
     monkeypatch.setenv("FLOWOPS_AUTOMATION_ADAPTER", "n8n")
-    monkeypatch.setattr("src.workforce_worker.requests.post", lambda *_args, **_kwargs: pytest.fail("tenantless legacy event must not be dispatched"))
+    monkeypatch.setattr("src.workforce_worker.requests.post",
+                        lambda *_args, **_kwargs: pytest.fail("tenantless legacy event must not be dispatched"))
     from src.workforce_worker import run_once
     result = run_once()
     assert result["status"] == "FAILED"

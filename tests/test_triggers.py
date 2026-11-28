@@ -567,7 +567,7 @@ def test_trigger_worker_creates_onboarding_request(session, monkeypatch):
     )
 
     # Enqueue job
-    job = jobs.enqueue_job(
+    jobs.enqueue_job(
         session,
         job_type=jobs.JOB_TRIGGER_EXECUTE,
         payload={
@@ -621,7 +621,7 @@ def test_trigger_worker_mapping_error_permanent_failure(session, monkeypatch):
         status="queued",
     )
 
-    job = jobs.enqueue_job(
+    jobs.enqueue_job(
         session,
         job_type=jobs.JOB_TRIGGER_EXECUTE,
         payload={

@@ -11,8 +11,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src import api, db
-from src.routes import monitoring, tickets
 from src.notify import DeliveryResult
+from src.routes import monitoring, tickets
 
 POSTGRES_URL = os.environ.get("FLOWOPS_TEST_POSTGRES_URL")
 

@@ -13,16 +13,16 @@ concerns that must stay identical on both execution paths in one place:
 
 import json
 import uuid
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any
 
 from sqlalchemy.orm import Session
 
 from src import db
 from src.onboarding import (
-    STATUS_BLOCKED,
-    STATUS_SKIPPED,
     STATUS_CASCADE_BLOCKED,
     STATUS_COMPLETED,
+    STATUS_SKIPPED,
     StepState,
     StepTransition,
     is_step_ready,
@@ -124,7 +124,7 @@ def step_output(item: db.ChecklistItemRecord) -> dict[str, Any]:
 
 
 def record_output(
-    item: db.ChecklistItemRecord, output: Optional[Mapping[str, Any]]
+    item: db.ChecklistItemRecord, output: Mapping[str, Any] | None
 ) -> dict[str, Any]:
     """Persist an action's structured output, keeping ``result`` in sync."""
     payload = dict(output or {})
@@ -190,9 +190,9 @@ def apply_graph_transitions(
     items: Sequence[db.ChecklistItemRecord],
     *,
     request_id: int,
-    actor_subject: Optional[str] = None,
-    reason: Optional[str] = None,
-    context: Optional[Mapping[str, Any]] = None,
+    actor_subject: str | None = None,
+    reason: str | None = None,
+    context: Mapping[str, Any] | None = None,
 ) -> list[StepTransition]:
     """Resolve the graph after a status change and persist the transitions.
 

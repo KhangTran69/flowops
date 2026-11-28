@@ -7,21 +7,20 @@ cookie flags, expiry, and CSRF behavior stay explicit and testable offline.
 
 from __future__ import annotations
 
-import os
-import secrets
 import hashlib
 import json
+import os
+import secrets
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
 
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlalchemy import delete
 from sqlalchemy.exc import SQLAlchemyError
-from typing import Mapping, Optional
 
-from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
-
-from src.auth import Actor
 from src import db
+from src.auth import Actor
 
 SESSION_COOKIE = "flowops_ui_session"
 SESSION_SALT = "flowops-ui-session"
@@ -37,18 +36,18 @@ class UISession:
     subject: str
     roles: tuple[str, ...]
     csrf_token: str
-    tenant_key: Optional[str] = None
+    tenant_key: str | None = None
 
 
-def _values(environ: Optional[Mapping[str, str]] = None) -> Mapping[str, str]:
+def _values(environ: Mapping[str, str] | None = None) -> Mapping[str, str]:
     return environ if environ is not None else os.environ
 
 
-def ui_auth_required(environ: Optional[Mapping[str, str]] = None) -> bool:
+def ui_auth_required(environ: Mapping[str, str] | None = None) -> bool:
     return _values(environ).get("FLOWOPS_UI_AUTH_REQUIRED", "false").lower() == "true"
 
 
-def session_secret(environ: Optional[Mapping[str, str]] = None) -> str:
+def session_secret(environ: Mapping[str, str] | None = None) -> str:
     secret = _values(environ).get("FLOWOPS_SESSION_SECRET", "")
     if not secret:
         raise UISessionError(
@@ -57,7 +56,7 @@ def session_secret(environ: Optional[Mapping[str, str]] = None) -> str:
     return secret
 
 
-def session_max_age(environ: Optional[Mapping[str, str]] = None) -> int:
+def session_max_age(environ: Mapping[str, str] | None = None) -> int:
     try:
         configured = int(
             _values(environ).get(
@@ -69,18 +68,18 @@ def session_max_age(environ: Optional[Mapping[str, str]] = None) -> int:
     return max(60, min(configured, 86_400))
 
 
-def cookie_secure(environ: Optional[Mapping[str, str]] = None) -> bool:
+def cookie_secure(environ: Mapping[str, str] | None = None) -> bool:
     return _values(environ).get("FLOWOPS_SESSION_COOKIE_SECURE", "false").lower() == "true"
 
 
-def _serializer(secret: Optional[str] = None) -> URLSafeTimedSerializer:
+def _serializer(secret: str | None = None) -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(
         secret or session_secret(), salt=SESSION_SALT
     )
 
 
 def validate_ui_auth_configuration(
-    environ: Optional[Mapping[str, str]] = None,
+    environ: Mapping[str, str] | None = None,
 ) -> None:
     """Fail fast when protected UI mode lacks a secret or auth source."""
     values = _values(environ)
@@ -125,7 +124,7 @@ _PASSWORD_HASH_ROUNDS = 310_000
 _WORKFORCE_ROLES = {"HR", "MANAGER", "IT_ADMIN", "automation.operator", "automation.admin"}
 
 
-def hash_demo_password(password: str, *, salt: Optional[str] = None) -> str:
+def hash_demo_password(password: str, *, salt: str | None = None) -> str:
     """Create a PBKDF2-SHA256 hash for a development demo account."""
     salt = salt or secrets.token_hex(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), _PASSWORD_HASH_ROUNDS).hex()
@@ -143,7 +142,7 @@ def _verify_password(password: str, encoded: str) -> bool:
         return False
 
 
-def authenticate_admin(username: str, password: str) -> Optional[Actor]:
+def authenticate_admin(username: str, password: str) -> Actor | None:
     """Authenticate only explicitly configured, development-gated accounts."""
     if os.environ.get("FLOWOPS_ENVIRONMENT", "development").lower() != "development":
         return None
@@ -174,7 +173,7 @@ def create_session(actor: Actor) -> UISession:
     )
 
 
-def encode_session(session: UISession, secret: Optional[str] = None) -> str:
+def encode_session(session: UISession, secret: str | None = None) -> str:
     return _serializer(secret).dumps(
         {
             "subject": session.subject,
@@ -188,8 +187,8 @@ def encode_session(session: UISession, secret: Optional[str] = None) -> str:
 def decode_session(
     value: str,
     *,
-    max_age: Optional[int] = None,
-    secret: Optional[str] = None,
+    max_age: int | None = None,
+    secret: str | None = None,
 ) -> UISession:
     try:
         data = _serializer(secret).loads(
@@ -231,7 +230,7 @@ def revoke_session(session_db, session: UISession) -> None:
     ).on_conflict_do_nothing(index_elements=["digest"]))
 
 
-def read_session(request) -> Optional[UISession]:
+def read_session(request) -> UISession | None:
     value = request.cookies.get(SESSION_COOKIE)
     if not value:
         return None
@@ -273,7 +272,7 @@ def csrf_matches(request, session: UISession) -> bool:
     return secrets.compare_digest(supplied, session.csrf_token)
 
 
-def safe_next(value: Optional[str], default: str = "/dashboard") -> str:
+def safe_next(value: str | None, default: str = "/dashboard") -> str:
     """Only allow same-site absolute paths; reject schemes/protocol-relative."""
     if not value or not value.startswith("/") or value.startswith("//"):
         return default

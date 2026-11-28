@@ -8,7 +8,6 @@ overwrite a takeover or double-finalize the row.
 import os
 import uuid
 from datetime import datetime, timedelta
-from typing import Optional
 
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
@@ -33,11 +32,11 @@ def _due(now: datetime):
 
 def claim_delivery(
     session: Session,
-    worker_id: Optional[str] = None,
+    worker_id: str | None = None,
     *,
     lease_seconds: int = DEFAULT_LEASE_SECONDS,
-    now: Optional[datetime] = None,
-) -> Optional[db.NotificationOutboxRecord]:
+    now: datetime | None = None,
+) -> db.NotificationOutboxRecord | None:
     """Claim one due pending delivery for this dispatcher."""
     now = now or db.utcnow()
     token = uuid.uuid4().hex
@@ -74,11 +73,11 @@ def finalize_delivery(
     *,
     success: bool,
     attempt_delta: int,
-    error: Optional[str],
+    error: str | None,
     max_attempts: int,
-    now: Optional[datetime] = None,
-    delay_seconds: Optional[int] = None,
-) -> Optional[str]:
+    now: datetime | None = None,
+    delay_seconds: int | None = None,
+) -> str | None:
     """Finalize a claimed delivery, or return None if the lease was lost."""
     now = now or db.utcnow()
     table = db.NotificationOutboxRecord

@@ -4,18 +4,18 @@ import json
 import secrets
 import time
 from collections import Counter
-from typing import Optional
 
-from fastapi import Depends, Form, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import String, cast, func, select
 from sqlalchemy.orm import Session
 
 from src import ai_agent, chatops, db, definitions, jobs, scheduler, ui_session, web, workflow
-
-from fastapi import APIRouter
-
 from src import metrics as _metrics
+from src.api import (
+    AITriageOut,
+    Ticket,
+)
 from src.auth import Actor
 from src.deps import (
     _actor_tenant,
@@ -33,17 +33,11 @@ from src.routes.onboarding import (  # noqa: E402
     _load_request,
     _workflow_run_out,
 )
-
 from src.routes.tickets import (  # noqa: E402
     _analyze_ticket,
     _load_ticket,
     _ticket_history,
     _triage_out,
-)
-
-from src.api import (
-    AITriageOut,
-    Ticket,
 )
 
 router = APIRouter()
@@ -222,8 +216,8 @@ def ui_tickets(
 def ui_knowledge_base(
     request: Request,
     actor: Actor = Depends(_operator_actor),
-    query: Optional[str] = Query(default=None, max_length=200),
-    category: Optional[str] = Query(default=None, max_length=64),
+    query: str | None = Query(default=None, max_length=200),
+    category: str | None = Query(default=None, max_length=64),
 ) -> HTMLResponse:
     """Render knowledge-base results for operators instead of raw JSON."""
     articles = list(ai_agent.list_knowledge_base())
@@ -264,7 +258,7 @@ def ui_ticket_detail(
     """Ticket detail page with an optional AI-triage panel."""
     record = _load_ticket(session, ticket_id)
     _require_ticket_access(actor, record)
-    result: Optional[AITriageOut] = None
+    result: AITriageOut | None = None
     if triage:
         history = _ticket_history(session, ticket_id)
         analysis = _analyze_ticket(record, history)
@@ -442,7 +436,7 @@ def ui_workflow_definition(
 @router.get("/ui/workflow-runs", response_class=HTMLResponse, include_in_schema=False)
 def ui_workflow_runs(
     request: Request,
-    status: Optional[str] = Query(default=None),
+    status: str | None = Query(default=None),
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
 ) -> HTMLResponse:
@@ -553,8 +547,8 @@ def ui_audit(
     request: Request,
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
-    status_filter: Optional[str] = Query(default=None, alias="status"),
-    actor_filter: Optional[str] = Query(default=None, alias="actor"),
+    status_filter: str | None = Query(default=None, alias="status"),
+    actor_filter: str | None = Query(default=None, alias="actor"),
     page: int = Query(default=1, ge=1),
 ) -> HTMLResponse:
     """Operator audit page for actor-attributed execution rows."""
@@ -638,7 +632,7 @@ def dashboard(
     request: Request,
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
-    status_filter: Optional[str] = Query(default=None, alias="status"),
+    status_filter: str | None = Query(default=None, alias="status"),
     auto_refresh: bool = Query(default=False),
 ) -> HTMLResponse:
     """Server-rendered monitoring dashboard over tickets and execution logs."""

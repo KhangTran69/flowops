@@ -6,90 +6,62 @@ onboarding/offboarding checklists, idempotency keys, and delivery retries;
 the v1.0 preview keeps failed webhook deliveries in a retryable outbox.
 """
 
-import hashlib
 import json
 import os
 import re
-import threading
 import time
 import uuid
-from collections import defaultdict
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
-from typing import Any, AsyncIterator, Literal, Optional
+from datetime import timedelta
+from typing import Any
 from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi import status as http_status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
-from sqlalchemy import Integer, String, and_, cast, delete, func, or_, select, text, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import String, cast, func, select, text
 from sqlalchemy.orm import Session
 
-from src import chatops, db, definitions, idempotency, jobs, logging_config, metrics, scheduler, timers, ui_session, web, workflow, workflow_control
-from src.connectors import deliver_outbox_notification
+from src import (
+    db,
+    idempotency,
+    jobs,
+    metrics,
+    scheduler,
+    ui_session,
+    web,
+    workflow,
+    workflow_control,
+)
 from src.actions import action_for_step
 from src.auth import (
     Actor,
     validate_auth_configuration,
 )
-from src.m365_simulator import M365Simulator
-from src.notify import deliver_webhook
-from src.onboarding import checklist_for, initial_status_for
-from src.routing import route_ticket
-from src.ticket_processor import normalize_ticket
 from src.deps import (
-    _local_ui_actor,
+    _RATE_LIMIT_BUCKETS,  # noqa: F401  (re-exported for tests)
     _actor_from_header,
-    _operator_actor,
-    _admin_actor,
-    _webhook_actor,
     _actor_tenant,
+    _admin_actor,
     _global_admin_actor,
+    _local_ui_actor,
     _new_run_id,
+    _operator_actor,
     _require_request_access,
     _require_workflow_job_access,
     validate_webhook_configuration,
     validate_workforce_integration_configuration,
-    _RATE_LIMIT_BUCKETS,  # noqa: F401  (re-exported for tests)
 )
+from src.notify import deliver_webhook
 from src.schemas import (
-    TicketIntakeRequest,
-    Ticket,
-    TicketDetailOut,
-    TicketHistoryOut,
-    ManualTicketIn,
-    KnowledgeBaseArticleOut,
-    KnowledgeBaseMatchOut,
-    AISummaryOut,
-    AIRecommendationOut,
-    AITriageOut,
-    AIApplyRequest,
-    AIApplyOut,
-    WorkflowJobOut,
-    ExecutionLogOut,
     ActionExecutionOut,
-    ChecklistItemOut,
-    DefinitionCreateIn,
-    DefinitionVersionIn,
-    DefinitionPublishIn,
-    DefinitionMigrationIn,
-    DefinitionVersionOut,
-    WorkflowDefinitionOut,
-    OnboardingRequestIn,
-    OnboardingRequestOut,
-    WorkflowStepRunOut,
-    WorkflowEventOut,
-    WorkflowRunOut,
-    OnboardingStatusSummaryOut,
-    OffboardingStepResultOut,
-    OffboardingCompletionOut,
-    M365StatusOut,
-    NotificationOutboxOut,
+    AITriageOut,  # noqa: F401  (re-exported: consumed by src.routes.ui)
+    Ticket,  # noqa: F401  (re-exported: consumed by src.routes.ui and tests via api.Ticket)
+    WorkflowJobOut,
 )
 
 DEFAULT_ACTION_ATTEMPTS = 3
@@ -300,7 +272,7 @@ def metrics_endpoint(
     ])
     for (method, route), (counts, total, seconds) in sorted(metrics.snapshot_latency().items()):
         labels = f'method="{method}",route="{route}"'
-        for upper, count in zip(metrics.LATENCY_BUCKETS, counts):
+        for upper, count in zip(metrics.LATENCY_BUCKETS, counts, strict=True):
             lines.append(f'flowops_http_request_duration_seconds_bucket{{{labels},le="{upper}"}} {count}')
         lines.append(f'flowops_http_request_duration_seconds_bucket{{{labels},le="+Inf"}} {total}')
         lines.append(f'flowops_http_request_duration_seconds_count{{{labels}}} {total}')
@@ -461,7 +433,7 @@ def enqueue_onboarding_item_job(
 def list_workflow_jobs(
     session: Session = Depends(db.get_session),
     actor: Actor = Depends(_operator_actor),
-    status_filter: Optional[str] = Query(default=None, alias="status"),
+    status_filter: str | None = Query(default=None, alias="status"),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> list[WorkflowJobOut]:
@@ -578,18 +550,18 @@ def cancel_workflow_job(
     return WorkflowJobOut.model_validate(job)
 
 
-from src.routes import analytics as _analytics_routes  # noqa: E402  (v1.5)
 from src.routes import ai as _ai_routes  # noqa: E402
-from src.routes import onboarding as _onboarding_routes  # noqa: E402
-from src.routes import tickets as _tickets_routes  # noqa: E402
-from src.routes.onboarding import _get_item, _load_request  # noqa: E402  (used by durable-job routes below)
+from src.routes import analytics as _analytics_routes  # noqa: E402  (v1.5)
 from src.routes import connectors as _connector_routes  # noqa: E402  (v1.4)
 from src.routes import monitoring as _monitoring_routes  # noqa: E402
+from src.routes import onboarding as _onboarding_routes  # noqa: E402
 from src.routes import reports as _report_routes  # noqa: E402
 from src.routes import tenants as _tenant_routes  # noqa: E402
+from src.routes import tickets as _tickets_routes  # noqa: E402
 from src.routes import triggers as _trigger_routes  # noqa: E402
 from src.routes import ui as _ui_routes  # noqa: E402  (registered last: owns the /ui catch-all)
 from src.routes import workforce as _workforce_routes  # noqa: E402
+from src.routes.onboarding import _get_item, _load_request  # noqa: E402  (used by durable-job routes below)
 
 app.include_router(_tenant_routes.router)
 app.include_router(_report_routes.router)

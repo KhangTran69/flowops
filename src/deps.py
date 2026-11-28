@@ -6,23 +6,17 @@ import threading
 import time
 import uuid
 from dataclasses import replace
-from typing import Optional
 
 from fastapi import Depends, Header, HTTPException, Request
-
-from sqlalchemy import String, and_, cast, or_, select
-from sqlalchemy.orm import Session
-
 from sqlalchemy import String, and_, cast, or_, select
 from sqlalchemy.orm import Session
 
 from src import db, ui_session
 from src.auth import (
-    AuthenticationError,
     Actor,
+    AuthenticationError,
     authenticate_bearer,
 )
-
 
 
 def _local_ui_actor() -> Actor:
@@ -35,7 +29,7 @@ def _local_ui_actor() -> Actor:
 
 def _actor_from_header(
     request: Request,
-    authorization: Optional[str] = Header(default=None),
+    authorization: str | None = Header(default=None),
 ) -> Actor:
     """Resolve a bearer actor or an authenticated browser session."""
     if authorization:
@@ -56,7 +50,7 @@ def _actor_from_header(
     return actor
 
 
-def _enforce_csrf(request: Optional[Request], actor: Actor) -> None:
+def _enforce_csrf(request: Request | None, actor: Actor) -> None:
     """CSRF applies only to cookie-authenticated browser mutations."""
     if request is None or actor.source != "session":
         return
@@ -101,7 +95,7 @@ def _global_admin_actor(actor: Actor = Depends(_admin_actor)) -> Actor:
     return actor
 
 
-def _actor_tenant(actor: Actor) -> Optional[str]:
+def _actor_tenant(actor: Actor) -> str | None:
     """Return the actor's tenant, allowing global access only in dev or for admins."""
     if actor.source == "local":
         return None
@@ -122,7 +116,7 @@ def _actor_tenant(actor: Actor) -> Optional[str]:
 
 
 def _webhook_actor(
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> str:
     expected = os.environ.get("FLOWOPS_WEBHOOK_API_KEY")
     environment = os.environ.get("FLOWOPS_ENVIRONMENT", "development").strip().lower()
@@ -137,8 +131,8 @@ def _webhook_actor(
 
 
 def _event_webhook_actor(
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
-    x_tenant_key: Optional[str] = Header(default=None, alias="X-Tenant-Key"),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_tenant_key: str | None = Header(default=None, alias="X-Tenant-Key"),
     session=Depends(db.get_session),
 ) -> Actor:
     """Authenticate event ingress as either global or a tenant-bound identity."""
@@ -187,7 +181,7 @@ def _event_webhook_actor(
                  roles=("automation.operator", "automation.admin"), source="webhook")
 
 
-def validate_webhook_configuration(environ: Optional[dict[str, str]] = None) -> None:
+def validate_webhook_configuration(environ: dict[str, str] | None = None) -> None:
     """Fail startup when non-development webhook intake has no shared key."""
     values = environ if environ is not None else os.environ
     environment = values.get("FLOWOPS_ENVIRONMENT", "development").strip().lower()
@@ -202,7 +196,7 @@ def validate_webhook_configuration(environ: Optional[dict[str, str]] = None) -> 
 
 
 def validate_workforce_integration_configuration(
-    environ: Optional[dict[str, str]] = None,
+    environ: dict[str, str] | None = None,
 ) -> None:
     """Reject short configured workforce integration secrets outside development."""
     values = environ if environ is not None else os.environ

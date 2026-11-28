@@ -12,8 +12,9 @@ import json
 import os
 import time
 import uuid
+from collections.abc import Iterable, Sequence
 from datetime import datetime, timedelta
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any
 
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
@@ -45,11 +46,11 @@ def lease_seconds_default() -> int:
     return _env_int("FLOWOPS_DAG_LEASE_SECONDS", DEFAULT_LEASE_SECONDS)
 
 
-def _now(value: Optional[datetime] = None) -> datetime:
+def _now(value: datetime | None = None) -> datetime:
     return value or db.utcnow()
 
 
-def _events(session: Session, run_id: int, event_type: str, payload: dict[str, Any], step_run_id: Optional[int] = None) -> None:
+def _events(session: Session, run_id: int, event_type: str, payload: dict[str, Any], step_run_id: int | None = None) -> None:
     session.add(
         db.WorkflowEventRecord(
             run_id=run_id,
@@ -73,13 +74,13 @@ def _log(session: Session, action: str, request_id: int, detail: str, actor: str
     )
 
 
-def get_run_for_request(session: Session, request_id: int) -> Optional[db.WorkflowRunRecord]:
+def get_run_for_request(session: Session, request_id: int) -> db.WorkflowRunRecord | None:
     return session.execute(
         select(db.WorkflowRunRecord).where(db.WorkflowRunRecord.request_id == request_id)
     ).scalar_one_or_none()
 
 
-def get_run(session: Session, run_id: int) -> Optional[db.WorkflowRunRecord]:
+def get_run(session: Session, run_id: int) -> db.WorkflowRunRecord | None:
     return session.get(db.WorkflowRunRecord, run_id)
 
 
@@ -88,8 +89,8 @@ def start_run(
     request_id: int,
     *,
     actor_subject: str = "scheduler",
-    max_parallel: Optional[int] = None,
-    now: Optional[datetime] = None,
+    max_parallel: int | None = None,
+    now: datetime | None = None,
 ) -> db.WorkflowRunRecord:
     """Start one run per request, idempotently."""
     # Serialize concurrent starts using the existing request row. The unique
@@ -119,11 +120,11 @@ def start_run(
 def claim_run(
     session: Session,
     *,
-    run_id: Optional[int] = None,
+    run_id: int | None = None,
     worker_id: str = "scheduler",
-    now: Optional[datetime] = None,
-    lease_seconds: Optional[int] = None,
-) -> Optional[db.WorkflowRunRecord]:
+    now: datetime | None = None,
+    lease_seconds: int | None = None,
+) -> db.WorkflowRunRecord | None:
     """Atomically claim a due run lease; returns None if another tick owns it."""
     at = _now(now)
     token = f"{worker_id}:{uuid.uuid4().hex[:16]}"
@@ -165,7 +166,7 @@ def plan_ready_steps(
     items: Sequence[db.ChecklistItemRecord],
     step_runs: Sequence[db.WorkflowStepRunRecord],
     *,
-    max_parallel: Optional[int] = None,
+    max_parallel: int | None = None,
 ) -> list[db.ChecklistItemRecord]:
     """Pure planning: pick ready, executable, not-yet-active steps."""
     if run.status != "running":
@@ -195,7 +196,8 @@ def plan_ready_steps(
     return ready
 
 
-def _finish_if_done(session: Session, run: db.WorkflowRunRecord, items: Sequence[db.ChecklistItemRecord], step_runs: Sequence[db.WorkflowStepRunRecord], now: datetime) -> None:
+def _finish_if_done(session: Session, run: db.WorkflowRunRecord, items: Sequence[db.ChecklistItemRecord],
+                    step_runs: Sequence[db.WorkflowStepRunRecord], now: datetime) -> None:
     if run.status != "running":
         return
     done = {row.status for row in items}
@@ -220,13 +222,13 @@ def _finish_if_done(session: Session, run: db.WorkflowRunRecord, items: Sequence
 
 def tick(
     session: Session,
-    run_id: Optional[int] = None,
+    run_id: int | None = None,
     *,
-    now: Optional[datetime] = None,
+    now: datetime | None = None,
     worker_id: str = "scheduler",
-    lease_seconds: Optional[int] = None,
+    lease_seconds: int | None = None,
     commit: bool = True,
-) -> Optional[db.WorkflowRunRecord]:
+) -> db.WorkflowRunRecord | None:
     """Claim one run and enqueue every currently ready step."""
     at = _now(now)
     run = claim_run(
@@ -335,10 +337,10 @@ def advance_from_job(
     job: db.WorkflowJobRecord,
     *,
     success: bool,
-    output: Optional[dict[str, Any]] = None,
-    error: Optional[str] = None,
-    now: Optional[datetime] = None,
-) -> Optional[db.WorkflowRunRecord]:
+    output: dict[str, Any] | None = None,
+    error: str | None = None,
+    now: datetime | None = None,
+) -> db.WorkflowRunRecord | None:
     """Update a scheduled step ledger and advance its run after a job result."""
     try:
         payload = json.loads(job.payload_json)
@@ -379,13 +381,13 @@ def advance_from_job(
     return tick(session, run.id, now=at, worker_id="event", commit=False)
 
 
-def _locked_run(session: Session, run_id: int) -> Optional[db.WorkflowRunRecord]:
+def _locked_run(session: Session, run_id: int) -> db.WorkflowRunRecord | None:
     return session.execute(select(db.WorkflowRunRecord).where(
         db.WorkflowRunRecord.id == run_id
     ).with_for_update().execution_options(populate_existing=True)).scalar_one_or_none()
 
 
-def pause_run(session: Session, run_id: int, actor_subject: str, now: Optional[datetime] = None) -> db.WorkflowRunRecord:
+def pause_run(session: Session, run_id: int, actor_subject: str, now: datetime | None = None) -> db.WorkflowRunRecord:
     run = _locked_run(session, run_id)
     if run is None:
         raise LookupError("Workflow run not found.")
@@ -396,7 +398,7 @@ def pause_run(session: Session, run_id: int, actor_subject: str, now: Optional[d
     return run
 
 
-def resume_run(session: Session, run_id: int, actor_subject: str, now: Optional[datetime] = None) -> db.WorkflowRunRecord:
+def resume_run(session: Session, run_id: int, actor_subject: str, now: datetime | None = None) -> db.WorkflowRunRecord:
     run = _locked_run(session, run_id)
     if run is None:
         raise LookupError("Workflow run not found.")
@@ -409,7 +411,7 @@ def resume_run(session: Session, run_id: int, actor_subject: str, now: Optional[
     return run
 
 
-def cancel_run(session: Session, run_id: int, actor_subject: str, now: Optional[datetime] = None) -> db.WorkflowRunRecord:
+def cancel_run(session: Session, run_id: int, actor_subject: str, now: datetime | None = None) -> db.WorkflowRunRecord:
     run = _locked_run(session, run_id)
     if run is None:
         raise LookupError("Workflow run not found.")
@@ -433,7 +435,7 @@ def cancel_run(session: Session, run_id: int, actor_subject: str, now: Optional[
     return run
 
 
-def tick_all(*, now: Optional[datetime] = None, worker_id: str = "scheduler") -> list[db.WorkflowRunRecord]:
+def tick_all(*, now: datetime | None = None, worker_id: str = "scheduler") -> list[db.WorkflowRunRecord]:
     session = db.SessionLocal()
     try:
         claimed: list[db.WorkflowRunRecord] = []
@@ -507,7 +509,7 @@ def tick_all(*, now: Optional[datetime] = None, worker_id: str = "scheduler") ->
         session.close()
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--poll", action="store_true")

@@ -11,7 +11,7 @@ import json
 import os
 import time
 from datetime import datetime
-from typing import Literal, Optional
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -21,12 +21,9 @@ from sqlalchemy.orm import Session
 from src import db
 from src.auth import Actor
 from src.connectors import deliver_outbox_notification
-from src.deps import _admin_actor, _new_run_id, _operator_actor
+from src.deps import _admin_actor, _new_run_id, _operator_actor, _scope_execution_log_query, _scope_ticket_or_request_keyed_query
 from src.notify import deliver_webhook
 from src.schemas import ExecutionLogOut, NotificationOutboxOut
-
-from src.deps import _scope_execution_log_query, _scope_ticket_or_request_keyed_query
-
 
 router = APIRouter()
 
@@ -58,7 +55,7 @@ def _outbox_out(record: db.NotificationOutboxRecord) -> NotificationOutboxOut:
 
 class ConsoleDeliveryOut(BaseModel):
     id: int
-    ticket_id: Optional[str] = None
+    ticket_id: str | None = None
     status: str
     attempts: int
     created_at: datetime
@@ -279,8 +276,8 @@ def requeue_failed_notification(
 def list_execution_logs(
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
-    status_filter: Optional[str] = Query(default=None, alias="status"),
-    actor_filter: Optional[str] = Query(default=None, alias="actor"),
+    status_filter: str | None = Query(default=None, alias="status"),
+    actor_filter: str | None = Query(default=None, alias="actor"),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> list[ExecutionLogOut]:
@@ -310,12 +307,12 @@ def list_execution_logs(
 def list_audit_trail(
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
-    status_filter: Optional[str] = Query(default=None, alias="status"),
-    actor_filter: Optional[str] = Query(default=None, alias="actor"),
-    action: Optional[str] = Query(default=None, max_length=64),
-    ticket_id: Optional[str] = Query(default=None, max_length=64),
-    created_from: Optional[datetime] = Query(default=None, alias="from"),
-    created_to: Optional[datetime] = Query(default=None, alias="to"),
+    status_filter: str | None = Query(default=None, alias="status"),
+    actor_filter: str | None = Query(default=None, alias="actor"),
+    action: str | None = Query(default=None, max_length=64),
+    ticket_id: str | None = Query(default=None, max_length=64),
+    created_from: datetime | None = Query(default=None, alias="from"),
+    created_to: datetime | None = Query(default=None, alias="to"),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> list[ExecutionLogOut]:

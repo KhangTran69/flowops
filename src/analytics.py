@@ -17,8 +17,9 @@ Two entry points power ``/analytics/*`` and ``/ui/analytics``:
 from __future__ import annotations
 
 import math
-from datetime import datetime, timedelta, timezone as dt_timezone
-from typing import Any, Optional
+from datetime import datetime, timedelta
+from datetime import timezone as dt_timezone
+from typing import Any
 
 from sqlalchemy import Select, select
 from sqlalchemy.orm import Session
@@ -35,7 +36,7 @@ MAX_STUCK_MINUTES = 7 * 24 * 60
 MIN_STEP_SAMPLE = 2
 
 
-def _at(now: Optional[datetime]) -> datetime:
+def _at(now: datetime | None) -> datetime:
     """Return a timezone-aware reference time for comparisons.
 
     SQLite commonly gives us naive values even though the columns are
@@ -46,11 +47,11 @@ def _at(now: Optional[datetime]) -> datetime:
     return at.replace(tzinfo=dt_timezone.utc) if at.tzinfo is None else at
 
 
-def _cutoff(days: int, now: Optional[datetime]) -> datetime:
+def _cutoff(days: int, now: datetime | None) -> datetime:
     return _at(now) - timedelta(days=days)
 
 
-def percentile(values: list[float], pct: float) -> Optional[float]:
+def percentile(values: list[float], pct: float) -> float | None:
     """Nearest-rank percentile of seconds; None for an empty sample."""
     if not values:
         return None
@@ -59,7 +60,7 @@ def percentile(values: list[float], pct: float) -> Optional[float]:
     return round(ordered[min(rank, len(ordered)) - 1], 1)
 
 
-def _seconds(start: Optional[datetime], end: Optional[datetime]) -> Optional[float]:
+def _seconds(start: datetime | None, end: datetime | None) -> float | None:
     if start is None or end is None:
         return None
     if start.tzinfo is None:
@@ -69,18 +70,18 @@ def _seconds(start: Optional[datetime], end: Optional[datetime]) -> Optional[flo
     return round(max(0.0, (end - start).total_seconds()), 1)
 
 
-def _label(value: Optional[str], fallback: str) -> str:
+def _label(value: str | None, fallback: str) -> str:
     return value if value else fallback
 
 
-def _scoped(stmt: Select, tenant_key: Optional[str]) -> Select:
+def _scoped(stmt: Select, tenant_key: str | None) -> Select:
     if tenant_key is not None:
         return stmt.where(db.OnboardingRequestRecord.tenant_key == tenant_key)
     return stmt
 
 
 def _request_ids(
-    session: Session, *, days: int, tenant_key: Optional[str], now: Optional[datetime]
+    session: Session, *, days: int, tenant_key: str | None, now: datetime | None
 ) -> list[int]:
     stmt = select(db.OnboardingRequestRecord.id).where(
         db.OnboardingRequestRecord.created_at >= _cutoff(days, now)
@@ -88,7 +89,7 @@ def _request_ids(
     return list(session.execute(_scoped(stmt, tenant_key)).scalars())
 
 
-def _round_or_none(value: Optional[float]) -> Optional[float]:
+def _round_or_none(value: float | None) -> float | None:
     return None if value is None else round(value, 1)
 
 
@@ -96,8 +97,8 @@ def health(
     session: Session,
     *,
     stuck_minutes: int = DEFAULT_STUCK_MINUTES,
-    tenant_key: Optional[str] = None,
-    now: Optional[datetime] = None,
+    tenant_key: str | None = None,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Return actionable health signals for active workflow runs.
 
@@ -154,8 +155,8 @@ def summary(
     session: Session,
     *,
     days: int = DEFAULT_DAYS,
-    tenant_key: Optional[str] = None,
-    now: Optional[datetime] = None,
+    tenant_key: str | None = None,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Aggregate run outcomes, durations, approvals, and SLA figures."""
     request_ids = _request_ids(session, days=days, tenant_key=tenant_key, now=now)
@@ -323,8 +324,8 @@ def steps(
     session: Session,
     *,
     days: int = DEFAULT_DAYS,
-    tenant_key: Optional[str] = None,
-    now: Optional[datetime] = None,
+    tenant_key: str | None = None,
+    now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Per-step duration and failure stats, slowest median first."""
     request_ids = _request_ids(session, days=days, tenant_key=tenant_key, now=now)

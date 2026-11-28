@@ -1,6 +1,6 @@
 """Read-only run analytics endpoints + operator page (v1.5)."""
 
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
@@ -14,7 +14,7 @@ from src.deps import _actor_tenant, _operator_actor
 router = APIRouter(tags=["analytics"])
 
 
-def _effective_tenant(actor: Actor, requested: Optional[str]) -> Optional[str]:
+def _effective_tenant(actor: Actor, requested: str | None) -> str | None:
     """Prevent a tenant operator from selecting another tenant's analytics."""
     tenant_key = _actor_tenant(actor)
     if tenant_key is not None and requested is not None and requested != tenant_key:
@@ -25,7 +25,7 @@ def _effective_tenant(actor: Actor, requested: Optional[str]) -> Optional[str]:
 @router.get("/analytics/summary")
 def analytics_summary(
     days: int = Query(default=analytics.DEFAULT_DAYS, ge=1, le=analytics.MAX_DAYS),
-    tenant: Optional[str] = Query(default=None, max_length=64),
+    tenant: str | None = Query(default=None, max_length=64),
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
 ) -> dict[str, Any]:
@@ -35,7 +35,7 @@ def analytics_summary(
 @router.get("/analytics/steps")
 def analytics_steps(
     days: int = Query(default=analytics.DEFAULT_DAYS, ge=1, le=analytics.MAX_DAYS),
-    tenant: Optional[str] = Query(default=None, max_length=64),
+    tenant: str | None = Query(default=None, max_length=64),
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
 ) -> list[dict[str, Any]]:
@@ -49,7 +49,7 @@ def analytics_health(
         ge=1,
         le=analytics.MAX_STUCK_MINUTES,
     ),
-    tenant: Optional[str] = Query(default=None, max_length=64),
+    tenant: str | None = Query(default=None, max_length=64),
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
 ) -> dict[str, Any]:
@@ -60,14 +60,14 @@ def analytics_health(
     )
 
 
-def _bar_width(value: Optional[float], ceiling: float) -> int:
+def _bar_width(value: float | None, ceiling: float) -> int:
     """Percent width for a CSS bar; 0 when the value is unknown."""
     if not value or ceiling <= 0:
         return 0
     return max(2, min(100, round(100.0 * value / ceiling)))
 
 
-def _fmt_duration(seconds: Optional[float]) -> str:
+def _fmt_duration(seconds: float | None) -> str:
     if seconds is None:
         return "—"
     if seconds < 60:
@@ -89,7 +89,7 @@ def ui_analytics(
         ge=1,
         le=analytics.MAX_STUCK_MINUTES,
     ),
-    tenant: Optional[str] = Query(default=None, max_length=64),
+    tenant: str | None = Query(default=None, max_length=64),
     session: Session = Depends(db.get_session),
 ) -> HTMLResponse:
     tenant_key = _effective_tenant(actor, tenant)

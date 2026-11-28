@@ -1,6 +1,5 @@
 """Deterministic offline quality evaluation for the simulated AI agent."""
 
-import pytest
 
 from src import ai_agent
 
