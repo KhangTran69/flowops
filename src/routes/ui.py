@@ -117,6 +117,9 @@ def login_submit(
     """Validate the admin username and password and create a signed browser session."""
     if not ui_session.ui_auth_required():
         return RedirectResponse("/dashboard", status_code=303)
+    # Reject browser cross-site form submissions before credential work.
+    if request.headers.get("sec-fetch-site") == "cross-site":
+        raise HTTPException(403, "Cross-site login is not permitted.")
     actor = ui_session.authenticate_admin(username.strip(), password)
     if actor is None:
         return web.render(
@@ -129,6 +132,9 @@ def login_submit(
             },
             status_code=401,
         )
+    previous = ui_session.read_session(request)
+    if previous is not None:
+        ui_session.revoke_session(db_session, previous)
     ui_data = ui_session.create_session(actor)
     response = RedirectResponse(ui_session.safe_next(next), status_code=303)
     ui_session.set_session_cookie(response, ui_data)
@@ -158,7 +164,7 @@ def logout(
         response = RedirectResponse("/login", status_code=303)
         ui_session.clear_session_cookie(response)
         return response
-    if not csrf_token or not secrets.compare_digest(csrf_token, session.csrf_token):
+    if not csrf_token or not secrets.compare_digest(csrf_token.encode(), session.csrf_token.encode()):
         raise HTTPException(status_code=403, detail="CSRF token missing or invalid.")
     ui_session.revoke_session(session_db, session)
     db.log_execution(
