@@ -49,8 +49,8 @@ cleanup() {
   local code=$?
   if [[ $code -ne 0 ]]; then
     docker inspect --format 'Rehearsal container state: {{.State.Status}} (exit {{.State.ExitCode}})' "$REHEARSAL_CONTAINER" >&2 || true
-    # Only the disposable restore container: do not dump source DB logs or SQL.
-    docker logs --tail 60 "$REHEARSAL_CONTAINER" >&2 || true
+    # Do not emit database logs: failed restore statements may contain data.
+    # Inspect the disposable container locally before cleanup if needed.
   fi
   docker rm -f "$REHEARSAL_CONTAINER" >/dev/null 2>&1 || true
   docker compose unpause "${WRITER_SERVICES[@]}" >/dev/null 2>&1 || true
