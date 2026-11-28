@@ -184,12 +184,12 @@ def test_scheduler_killed_mid_tick_does_not_double_enqueue(client):
     assert len(completed) == len(per_item)
 
 
-def test_outbox_worker_killed_mid_delivery_delivers_exactly_once(client, monkeypatch):
-    """An outbox worker that dies between claim and delivery loses nothing.
+def test_outbox_worker_killed_mid_delivery_recovers_with_counted_attempts(client, monkeypatch):
+    """An abandoned claim consumes its attempt before recovery.
 
     The claimed row keeps its lease, so the next dispatcher skips it until
-    the lease expires; the recovery dispatcher then delivers exactly once
-    and the row reaches its terminal state through the fenced finalize.
+    the lease expires; the recovery dispatcher then completes a successful
+    simulated delivery. This does not prove exactly-once external effects.
     """
     session = db.SessionLocal()
     try:
@@ -215,11 +215,13 @@ def test_outbox_worker_killed_mid_delivery_delivers_exactly_once(client, monkeyp
         outbox_worker.run_once(worker_id="crashed-dispatcher")
 
     # The row keeps its unexpired claim; the next dispatcher must skip it.
-    monkeypatch.setattr(
-        outbox_worker,
-        "deliver_webhook",
-        lambda url, payload, **kwargs: DeliveryResult(success=True, attempts=1, last_error=None),
-    )
+    successful_calls = []
+
+    def recovered_delivery(url, payload, **kwargs):
+        successful_calls.append(payload)
+        return DeliveryResult(success=True, attempts=1, last_error=None)
+
+    monkeypatch.setattr(outbox_worker, "deliver_webhook", recovered_delivery)
     assert outbox_worker.run_once(worker_id="early-dispatcher") is None
 
     # Crash aftermath: lease expires on disk; recovery delivers once.
@@ -234,7 +236,8 @@ def test_outbox_worker_killed_mid_delivery_delivers_exactly_once(client, monkeyp
     delivered = outbox_worker.run_once(worker_id="recovery-dispatcher")
     assert delivered is not None and delivered.id == row_id
     assert delivered.status == "delivered"
-    assert delivered.attempts == 1
+    assert delivered.attempts == 2
+    assert len(successful_calls) == 1
 
     # A terminal row is never picked up again.
     assert outbox_worker.run_once(worker_id="idle-dispatcher") is None
