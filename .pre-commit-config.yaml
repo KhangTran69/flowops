@@ -12,7 +12,9 @@ repos:
     # Latest stable tag.
     rev: v6.0.0
     hooks:
+      # CI byte-diffs tests/openapi_snapshot.json; a whitespace "fix" would fail that diff.
       - id: trailing-whitespace
+        exclude: ^tests/openapi_snapshot\.json$
       # CI byte-diffs tests/openapi_snapshot.json against a fresh re-dump
       # (scripts/dump_openapi.py); an EOF newline "fix" would fail that diff.
       - id: end-of-file-fixer
