@@ -98,9 +98,9 @@ The outbox worker leases due events with a unique fencing token, signs the exact
 
 `FLOWOPS_AUTOMATION_ADAPTER=simulated` completes the account-provisioning task with an explicit simulated note. It creates no external account. n8n mode requires `FLOWOPS_N8N_WEBHOOK_URL`, `FLOWOPS_N8N_WEBHOOK_SECRET`, `FLOWOPS_N8N_API_KEY`, and `FLOWOPS_AUTOMATION_CALLBACK_SECRET`; use unique random values stored in environment or a secret manager.
 
-The importable workflows in `n8n/workflows/` cover approved onboarding provisioning, daily overdue-task reminders, and n8n execution errors. They are inactive exports with URL and credential placeholders. Configure Header Auth credentials (API key for FlowOps integration endpoints and event ingress; separate callback key for provisioning), set the FlowOps base URL, and set an approved operations-notification webhook URL in the error workflow before activation. The daily reminder flow lists active tenants, then requests overdue work separately for each tenant; outcomes carry the tenant key and use a stable tenant/task/UTC-day event ID. The outcome is `SIMULATED` and does not message employees by default. Authoritative business changes remain behind FlowOps APIs.
+The importable workflows in `n8n/workflows/` cover approved onboarding provisioning, daily overdue-task reminders, and n8n execution errors. They are inactive exports with URL and credential placeholders. Configure Header Auth credentials (API key for FlowOps integration endpoints and event ingress; separate callback key for provisioning), set the FlowOps base URL, and set an approved operations-notification webhook URL in the error workflow before activation. In that error workflow, map each tenant-owned workflow ID to its FlowOps tenant key in **Resolve tenant context**; n8n's default Error Trigger payload does not include the failed execution's business tenant. The daily reminder flow lists active tenants, then requests overdue work separately for each tenant; outcomes carry the tenant key and use a stable tenant/task/UTC-day event ID. The outcome is `SIMULATED` and does not message employees by default. Authoritative business changes remain behind FlowOps APIs.
 
-The exports target n8n **2.44.5 stable**, checked against the official release list on 2026-10-22. They use built-in Webhook, Schedule Trigger, Code, HTTP Request, and Error Trigger nodes. Refer to [n8n Webhook documentation](https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.webhook/) and [official releases](https://github.com/n8n-io/n8n/releases) when importing into a later version. No live n8n cloud instance was available, so live execution is unverified.
+The exports target n8n **2.44.5 stable**, checked against the official release list on 2026-10-22. They use built-in Webhook, Schedule Trigger, Code, HTTP Request, and Error Trigger nodes. Refer to [n8n Webhook documentation](https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.webhook/) and [official releases](https://github.com/n8n-io/n8n/releases) when importing into a later version. On 2026-10-30, the error workflow ran in n8n Cloud 2.45.5 against an isolated SQLite FlowOps instance: a synthetic Error Trigger event recorded one `automation.error` audit. The notification node was disabled for this test; deployed URL, credentials, and notification delivery remain unverified.
 
 In n8n choose **Workflows → Import from File** for each JSON export. Configure credentials and placeholder URLs, test using the Webhook test URL, then publish the workflow and configure FlowOps with the production URL. Avoid using the n8n editor URL as the Webhook URL.
 
@@ -115,7 +115,19 @@ In n8n choose **Workflows → Import from File** for each JSON export. Configure
 
 ## Limitations and next steps
 
-- Seed data, account provisioning, and reminders are synthetic/mock. n8n cloud was not available for live verification.
+- Seed data, account provisioning, and reminders are synthetic/mock. Only the error-recording path has been live-tested in n8n Cloud against an isolated API; provisioning, reminders, and notification delivery remain unverified.
 - Production role issuance must be configured in Entra for HR, MANAGER, and IT_ADMIN. Demo users only operate in development.
 - Existing workforce records remain unassigned until manually mapped to a tenant; scoped users cannot see these legacy rows before mapping.
 - Bulk HR imports, asset depreciation, and real identity provisioning are possible follow-up work.
+
+### Tenant reliability guarantees
+
+The workforce tenant rollout keeps these guarantees:
+
+- The simulated provisioning worker completes default/local records whose `tenant_key` is `NULL`; callback lookup must remain fenced by request and tenant, including the `NULL` case.
+- Global operators can list legacy `NULL`-tenant requests, tasks, and dashboard data. Tenant-scoped queries must continue to exclude unassigned rows, and joins must match tenant ownership without losing valid legacy parent/child rows.
+- Migration `0012_workforce_tenant_fencing` checks for duplicate active requests and duplicate automation-error records before changing the schema. If it finds conflicts, it reports the affected IDs and leaves the database at its prior migration level so the records can be reviewed and remediated before retrying.
+- n8n automation-error events include their tenant key when available, so tenant-scoped administrators can see their own failures while global failures remain visible to global operators.
+- Audits for a global operator's changes to tenant-owned records are attributed to the affected record's tenant, so that tenant's audit view includes the action; truly global actions remain global.
+
+Regression tests cover the simulated worker, global and tenant-scoped views, audit attribution, migration conflict reporting, and tenant-aware error recording. Live n8n execution remains unverified.
