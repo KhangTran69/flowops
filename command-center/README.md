@@ -105,13 +105,23 @@ the landing page stay server-rendered — they are monitoring surfaces, not
 operator surfaces.
 
 Coverage today (React pages: Approvals, Audit, Dashboard, Definitions,
-DefinitionDetail, Deliveries, Requests, RequestDetail, Runs, RunDetail,
-Tickets, TicketDetail). Still Jinja-only, in port order by operator value:
+DefinitionDetail, Deliveries, JobDetail, Jobs, Requests, RequestDetail,
+Runs, RunDetail, Tickets, TicketDetail). Still Jinja-only, in port order by
+operator value:
 
-- [ ] **Workflow jobs** (`/ui/workflow-jobs`, job detail) — queue health,
+- [x] **Workflow jobs** (`/ui/workflow-jobs`, job detail) — queue health,
   retry/cancel controls, attempt history
-- [ ] **Notifications / outbox** (`/ui/notifications`) — pending + dead-letter
+  — ported 2026-11-28 (`/jobs`, `/jobs/:id`; typed `WorkflowJob` contract +
+  runtime validation + browser-smoke journey incl. cancel; additive
+  `payload`/`result`/lease fields on `WorkflowJobOut` so the console sees
+  what the Jinja detail shows)
+- [x] **Notifications / outbox** (`/ui/notifications`) — pending + dead-letter
   tables, requeue/retry actions
+  — ported 2026-11-28 (Deliveries upgraded to the real `/notifications/
+  pending|failed` APIs with destination/error columns, `Retry pending`
+  operator action, and per-row admin `Requeue` with confirm; typed
+  `NotificationDelivery` contract + runtime validation + browser-smoke
+  journey seeding real dead-letter/pending fixtures)
 - [ ] **Analytics** (`/ui/analytics`) — summary cards, step bottlenecks,
   tenant/window filters
 - [ ] **Triggers** (`/ui/triggers`, trigger detail) — source config, delivery

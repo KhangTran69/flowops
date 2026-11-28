@@ -197,6 +197,21 @@ def test_job_api_list_get_cancel_and_retry(client):
     assert retried.json()["attempts"] == 0
 
 
+def test_job_api_exposes_console_parity_fields(client):
+    """Additive fields the React job detail renders (payload/result/lease)."""
+    request_id, item_id = _create_onboarding_item(client)
+    created = client.post(
+        f"/onboarding-requests/{request_id}/items/{item_id}/jobs"
+    ).json()
+    job_id = created["id"]
+    job = client.get(f"/workflow-jobs/{job_id}").json()
+    assert job["payload"]["request_id"] == request_id
+    assert job["payload"]["item_id"] == item_id
+    assert job["result"] is None
+    assert job["lease_owner_token"] is None
+    assert job["lease_expires_at"] is None
+
+
 def test_jobs_page_lists_queue(client):
     request_id, item_id = _create_onboarding_item(client)
     client.post(f"/onboarding-requests/{request_id}/items/{item_id}/jobs")

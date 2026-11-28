@@ -137,6 +137,12 @@ class WorkflowJobOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None = None
+    # Additive parity fields for the React console job detail (the Jinja
+    # detail page reads the ORM row directly; the console reads this schema).
+    payload: dict[str, Any] | None = None
+    result: dict[str, Any] | None = None
+    lease_owner_token: str | None = None
+    lease_expires_at: datetime | None = None
 
 
 class ExecutionLogOut(BaseModel):

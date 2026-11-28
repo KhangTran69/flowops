@@ -127,13 +127,19 @@ docker run -d --name "$REHEARSAL_CONTAINER" --network "$COMPOSE_NETWORK" \
   -e POSTGRES_DB=flowops -e POSTGRES_USER=flowops -e POSTGRES_PASSWORD=flowops \
   ${REHEARSAL_HOST_PORT:+-p "127.0.0.1:${REHEARSAL_HOST_PORT}:5432"} \
   postgres:16-alpine >/dev/null
-for _ in $(seq 1 60); do
-  if docker exec "$REHEARSAL_CONTAINER" pg_isready -U flowops -d flowops >/dev/null 2>&1; then
+# Probe with a real query, not pg_isready: the official image runs a
+# transient server during first-boot init, so pg_isready can succeed before
+# the final server (and the flowops role/db) exists.
+server_ready() {
+  docker exec "$REHEARSAL_CONTAINER" psql -U flowops -d flowops -tAc "SELECT 1" >/dev/null 2>&1
+}
+for _ in $(seq 1 120); do
+  if server_ready; then
     break
   fi
   sleep 1
 done
-docker exec "$REHEARSAL_CONTAINER" pg_isready -U flowops -d flowops >/dev/null
+server_ready || { echo "Rehearsal postgres never became ready." >&2; exit 1; }
 docker exec -i "$REHEARSAL_CONTAINER" psql -U flowops -d flowops \
   -v ON_ERROR_STOP=1 -q < "${WORK_DIR}/dump.sql" > /dev/null
 stage "restore" "$START"

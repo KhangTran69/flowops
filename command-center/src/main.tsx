@@ -9,6 +9,8 @@ import Tickets from './pages/Tickets'
 import TicketDetail from './pages/TicketDetail'
 import Requests from './pages/Requests'
 import RequestDetail from './pages/RequestDetail'
+import JobDetail from './pages/JobDetail'
+import Jobs from './pages/Jobs'
 import Runs from './pages/Runs'
 import RunDetail from './pages/RunDetail'
 import Approvals from './pages/Approvals'
@@ -31,6 +33,8 @@ createRoot(document.getElementById('root')!).render(
             <Route path="/requests/:id" element={<RequestDetail />} />
             <Route path="/runs" element={<Runs />} />
             <Route path="/runs/:id" element={<RunDetail />} />
+            <Route path="/jobs" element={<Jobs />} />
+            <Route path="/jobs/:id" element={<JobDetail />} />
             <Route path="/approvals" element={<Approvals />} />
             <Route path="/definitions" element={<Definitions />} />
             <Route path="/definitions/:key" element={<DefinitionDetail />} />
