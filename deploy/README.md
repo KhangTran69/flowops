@@ -1,6 +1,6 @@
 # Deploying FlowOps
 
-Two supported paths for a public demo:
+Two deployment candidates (not a verified public release):
 
 - **Fly.io (recommended)** — one Fly app runs the full topology as process
   groups, with Fly Postgres for data. Chosen over Render because FlowOps
@@ -69,79 +69,49 @@ If `fly postgres connection-string` is unavailable in your flyctl version,
 rerun `fly postgres attach` and copy the printed `DATABASE_URL` into the same
 `sed` expression.
 
-Next, the secrets the demo profile needs (values are examples — generate your
-own):
+Before the first protected release, configure the real Entra issuer, audience
+and HTTPS JWKS URL, a strong session secret and a distinct webhook API key.
+Use the Fly secret manager and do not print values in release logs. Development
+bearer tokens and demo password accounts must not be configured on this app.
+Run the identity, tenant-isolation, backup and staging acceptance checks in
+the roadmap before approving any public rollout.
 
-```bash
-# Session signing key (>= 32 chars)
-fly secrets set FLOWOPS_SESSION_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
-
-# API bearer token (the demo's operator credential for API clients)
-fly secrets set FLOWOPS_DEV_BEARER_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
-
-# UI login account for the operator console (password hash, not plaintext).
-# Generate the JSON snippet with: python -m src.demo_users hash
-fly secrets set FLOWOPS_DEMO_USERS='{"demo-operator":{"password_hash":"<paste>","roles":["automation.operator"],"tenant_key":"demo"}}'
-```
-
-Deploy, migrate, seed, verify:
-
-```bash
-# 3. Build and release
-fly deploy --config deploy/fly.toml
-
-# 4. Run migrations once per release (see "Migrations are a release step")
-fly ssh console --select -C "alembic upgrade head"
-
-# 5. Seed the demo dataset (needs the seed script from the demo-seed PR;
-#    otherwise create data through the API/UI)
-fly ssh console --select -C "python -m scripts.seed_demo"
-
-# 6. Verify
-fly status
-curl --fail https://flowops-demo.fly.dev/ready
-curl --fail https://flowops-demo.fly.dev/health
-fly logs
-```
+The release command runs the local configuration checks and Alembic upgrade
+before replacing application machines. It does not establish that the real
+provider is working or that a release is approved. After the separately
+authorized rollout, check `/ready`, `/health`, machine counts, worker
+heartbeats and the protected operator journey. Do not seed production data;
+use an isolated synthetic staging database for portfolio demonstrations.
 
 Then scale-check: `fly machine list` should show one machine per process
 group, and `fly scale count app=1 worker=1 scheduler=1 timers=1 outbox=1
 workforce-outbox=1` pins that if anything drifts.
 
-Optional: point `FLOWOPS_NOTIFICATION_WEBHOOK_URL` at an external request
-inspector (e.g. a webhook.site URL via `fly secrets set`) so webhook delivery
-and dead-letter retries are visible in the demo. Unset, notification delivery
-is skipped cleanly.
+Keep outbound webhook delivery disabled on the simulated public candidate.
 
 ## Migrations are a release step (Fly)
 
-`deploy/fly.toml` sets `FLOWOPS_RUN_MIGRATIONS=false`. With six machines
-booting concurrently, a container-start migration would race alembic against
-itself, so each release runs `fly ssh console --select -C "alembic upgrade
-head"` after `fly deploy` (step 4 above). Recording the follow-up decision
-here: moving this into the release pipeline (a Fly release command or CI
-deploy job) is pending — tracked in ROADMAP Phase 4. The Compose `prod`
-profile keeps container-start migrations because it runs a single app
-container on one host.
+`FLOWOPS_RUN_MIGRATIONS=false` prevents each process from independently
+running migrations. Fly's `[deploy].release_command` invokes
+`python -m scripts.release_preflight` once before rollout. Invalid security
+configuration, missing PostgreSQL configuration or a failed migration
+aborts the release. See https://fly.io/docs/reference/configuration/#the-deploy-section.
 
-## Auth on the demo (and the Entra follow-up)
+Before migration, record the previous image, schema revision and verified
+backup. Keep concurrent releases serialized. Confirm compatibility between
+the old and new images while the release command runs; a nonzero release
+command does not reverse database changes already applied. If rollback is
+needed, stop writes, evaluate schema compatibility, restore the verified
+backup where necessary, and redeploy the recorded image only after approval.
+Do not automatically downgrade a live database.
 
-The demo profile enforces auth — `FLOWOPS_AUTH_REQUIRED=true` for API calls
-(bearer token) and `FLOWOPS_UI_AUTH_REQUIRED=true` with secure cookies for
-the console — but it runs with the app's `development` environment label.
-That is deliberate: **outside `development`, the app requires an Entra
-identity provider at startup** (issuer, audience, and JWKS URL — validated
-fail-fast in `src/api.py`), and Entra registration is release gate 2a, which
-only the maintainer can complete. Once that gate closes:
+## Authentication and remaining release gates
 
-```bash
-fly secrets set FLOWOPS_ENTRA_ISSUER=... FLOWOPS_ENTRA_AUDIENCE=... \
-  FLOWOPS_ENTRA_JWKS_URL=... FLOWOPS_ENVIRONMENT=production
-```
-
-and the demo token path is replaced by real per-user sign-in. The gateway
-must also strip client-supplied identity headers when that lands (ROADMAP
-2a; tracked as its own task with an offline test).
+The Fly configuration defaults to production mode with simulated adapters.
+It does not permit the previous development bearer-token or password-account
+fallback. A real Entra registration and live authentication/authorization
+validation remain mandatory. Workforce browser access and a protected React
+gateway deployment remain separate acceptance criteria.
 
 ## Self-hosting with the Compose `prod` profile
 
