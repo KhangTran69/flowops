@@ -5,10 +5,10 @@ about ticket events. Failures are reported, never raised, so a flaky
 webhook cannot fail ticket intake.
 """
 
-import time
 import ssl
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 from urllib.parse import urlsplit
 
 import requests

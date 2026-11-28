@@ -3,7 +3,7 @@
 import pytest
 
 from src import expressions
-from src.expressions import ExpressionError, MISSING, compile_predicate, evaluate
+from src.expressions import MISSING, ExpressionError, compile_predicate, evaluate
 
 SCOPE = {
     "context": {"department": "R&D", "employee_name": "Ada", "requester_id": 3},

@@ -11,8 +11,9 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
+from typing import Any, Protocol
 
 import httpx
 
@@ -136,11 +137,11 @@ class TicketSnapshot:
     title: str
     status: str
     priority: str
-    category: Optional[str] = None
-    queue: Optional[str] = None
+    category: str | None = None
+    queue: str | None = None
 
     @classmethod
-    def from_record(cls, record: Any) -> "TicketSnapshot":
+    def from_record(cls, record: Any) -> TicketSnapshot:
         return cls(
             ticket_id=str(record.ticket_id),
             requester_id=record.requester_id,
@@ -159,8 +160,8 @@ class TicketSummary:
     title: str
     status: str
     priority: str
-    category: Optional[str]
-    queue: Optional[str]
+    category: str | None
+    queue: str | None
     urgency_signals: tuple[str, ...]
     history_count: int
 
@@ -170,8 +171,8 @@ class Recommendation:
     id: str
     kind: str
     title: str
-    current: Optional[str]
-    suggested: Optional[str]
+    current: str | None
+    suggested: str | None
     rationale: str
     confidence: int
     applicable: bool
@@ -473,7 +474,7 @@ class SimulatedAIAdapter:
         )
 
 
-PROVIDER_DEFAULTS: dict[str, tuple[str, Optional[str]]] = {
+PROVIDER_DEFAULTS: dict[str, tuple[str, str | None]] = {
     "gemini": (
         "https://generativelanguage.googleapis.com/v1beta/openai",
         "gemini-2.5-flash",
@@ -491,8 +492,8 @@ ANTHROPIC_VERSION = "2023-06-01"
 
 
 def provider_settings(
-    provider: str, environ: Optional[Mapping[str, str]] = None
-) -> tuple[Optional[str], Optional[str], float]:
+    provider: str, environ: Mapping[str, str] | None = None
+) -> tuple[str | None, str | None, float]:
     """Resolve base URL, model, and timeout from provider defaults and env."""
     values = environ if environ is not None else os.environ
     default_base, default_model = PROVIDER_DEFAULTS.get(provider, (None, None))
@@ -520,7 +521,7 @@ class OpenAICompatibleClient:
         *,
         api_key: str = "",
         timeout: float = 30.0,
-        http_client: Optional[httpx.Client] = None,
+        http_client: httpx.Client | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -592,7 +593,7 @@ class AnthropicMessagesClient:
         api_key: str,
         timeout: float = 30.0,
         max_tokens: int = 1024,
-        http_client: Optional[httpx.Client] = None,
+        http_client: httpx.Client | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -661,11 +662,11 @@ class LLMAIAdapter:
         api_key: str,
         *,
         provider: str = "openai",
-        client: Optional[Callable[[str], str]] = None,
-        base_url: Optional[str] = None,
-        model: Optional[str] = None,
+        client: Callable[[str], str] | None = None,
+        base_url: str | None = None,
+        model: str | None = None,
         timeout: float = 30.0,
-        http_client: Optional[httpx.Client] = None,
+        http_client: httpx.Client | None = None,
     ) -> None:
         self.api_key = api_key
         self.provider = provider
@@ -758,7 +759,7 @@ class LLMAIAdapter:
         )
 
 
-def adapter_from_environment(environ: Optional[Mapping[str, str]] = None) -> AIAdapter:
+def adapter_from_environment(environ: Mapping[str, str] | None = None) -> AIAdapter:
     """Select the LLM adapter only when explicitly configured with a key."""
     values = environ if environ is not None else {}
     from os import environ as process_environ

@@ -154,6 +154,8 @@ rpds-py==2026.9.1 ; python_full_version >= '3.11'
     # via
     #   jsonschema
     #   referencing
+ruff==0.17.6
+    # via -r requirements-dev.in
 sqlalchemy==2.0.58 ; python_full_version < '3.11'
     # via
     #   -r requirements.in

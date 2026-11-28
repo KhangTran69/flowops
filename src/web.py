@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import Request
 from fastapi.responses import HTMLResponse
@@ -15,7 +15,7 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 def render(
     request: Request,
     template: str,
-    context: Optional[dict[str, Any]] = None,
+    context: dict[str, Any] | None = None,
     *,
     status_code: int = 200,
 ) -> HTMLResponse:

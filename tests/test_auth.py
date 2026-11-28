@@ -1,14 +1,14 @@
 """Offline tests for authenticated Microsoft action boundaries."""
 
-import base64
 import json
+
 import pytest
 from fastapi.testclient import TestClient
 
 from src import api, db
+from src.actions import ActionResult, MicrosoftGraphAdapter, adapter_from_environment
 from src.auth import AuthenticationError, authenticate_bearer
 from src.routes import onboarding as onboarding_routes
-from src.actions import ActionResult, MicrosoftGraphAdapter, adapter_from_environment
 
 
 @pytest.fixture
@@ -74,7 +74,6 @@ def test_protected_mode_requires_entra_configuration():
 
 def test_entra_jwt_claims_and_jwks_cache(monkeypatch):
     from cryptography.hazmat.primitives.asymmetric import rsa
-    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
     from jwt.algorithms import RSAAlgorithm
 
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -90,7 +89,9 @@ def test_entra_jwt_claims_and_jwks_cache(monkeypatch):
         def json(self): return {"keys": [public_jwk]}
 
     monkeypatch.setattr("src.auth.requests.get", lambda *args, **kwargs: calls.append(args) or Response())
-    environ = {"FLOWOPS_AUTH_REQUIRED": "true", "FLOWOPS_ENVIRONMENT": "production", "FLOWOPS_ENTRA_ISSUER": "https://issuer", "FLOWOPS_ENTRA_AUDIENCE": "client", "FLOWOPS_ENTRA_JWKS_URL": "https://issuer/keys"}
+    environ = {"FLOWOPS_AUTH_REQUIRED": "true", "FLOWOPS_ENVIRONMENT": "production",
+               "FLOWOPS_ENTRA_ISSUER": "https://issuer", "FLOWOPS_ENTRA_AUDIENCE": "client",
+               "FLOWOPS_ENTRA_JWKS_URL": "https://issuer/keys"}
     actor = authenticate_bearer(f"Bearer {token}", environ=environ)
     authenticate_bearer(f"Bearer {token}", environ=environ)
     assert len(calls) == 1
@@ -100,7 +101,8 @@ def test_entra_jwt_claims_and_jwks_cache(monkeypatch):
 def test_execute_requires_auth_when_enabled(client, monkeypatch):
     monkeypatch.setenv("FLOWOPS_AUTH_REQUIRED", "true")
     monkeypatch.setenv("FLOWOPS_DEV_BEARER_TOKEN", "dev-secret")
-    payload = {"request_type": "onboarding", "employee_name": "Jane Doe", "employee_email": "jane@example.com", "department": "Sales", "requester_id": 3}
+    payload = {"request_type": "onboarding", "employee_name": "Jane Doe",
+               "employee_email": "jane@example.com", "department": "Sales", "requester_id": 3}
     request = client.post("/onboarding-requests", json=payload, headers={"Authorization": "Bearer dev-secret"}).json()
     item = request["checklist"][1]
     assert client.post(f"/onboarding-requests/{request['id']}/items/{item['id']}/execute").status_code == 401
@@ -109,7 +111,9 @@ def test_execute_requires_auth_when_enabled(client, monkeypatch):
             assert context["actor_subject"] == "configured-bearer"
             return ActionResult(action, "captured")
     monkeypatch.setattr(onboarding_routes, "ACTION_ADAPTER", CapturingAdapter())
-    assert client.post(f"/onboarding-requests/{request['id']}/items/{item['id']}/execute", headers={"Authorization": "Bearer dev-secret"}).status_code == 200
+    assert client.post(
+        f"/onboarding-requests/{request['id']}/items/{item['id']}/execute",
+        headers={"Authorization": "Bearer dev-secret"}).status_code == 200
 
 
 def test_mutating_ticket_route_requires_bearer_when_enabled(client, monkeypatch):
@@ -144,6 +148,7 @@ def test_webhook_api_key_is_optional_and_enforced(client, monkeypatch):
 
 def test_operator_dependency_rejects_viewer_role():
     from fastapi import HTTPException
+
     from src.api import _operator_actor
     from src.auth import Actor
 

@@ -17,8 +17,9 @@ from __future__ import annotations
 import base64
 import os
 import time
+from collections.abc import Callable, Iterator, Mapping
 from datetime import date, datetime, timezone
-from typing import Any, Callable, Iterator, Mapping, Optional
+from typing import Any
 
 import httpx
 from sqlalchemy import select
@@ -41,7 +42,7 @@ DEFAULT_BOARD = "Service Desk"
 
 
 class ConnectWiseError(RuntimeError):
-    def __init__(self, message: str, *, status_code: Optional[int] = None, code: Optional[str] = None) -> None:
+    def __init__(self, message: str, *, status_code: int | None = None, code: str | None = None) -> None:
         prefix = f"HTTP {status_code} " if status_code else ""
         super().__init__(f"{prefix}{code + ': ' if code else ''}{message}")
         self.status_code = status_code
@@ -99,7 +100,7 @@ class ConnectWiseClient:
         private_key: str,
         client_id: str,
         *,
-        http_client: Optional[httpx.Client] = None,
+        http_client: httpx.Client | None = None,
         timeout: float = 20.0,
         max_retries: int = 3,
         page_size: int = 100,
@@ -125,7 +126,7 @@ class ConnectWiseClient:
     def __repr__(self) -> str:
         return f"ConnectWiseClient(base_url={self.base_url!r})"
 
-    def request(self, method: str, path: str, *, params: Optional[dict[str, Any]] = None, json: Any = None) -> Any:
+    def request(self, method: str, path: str, *, params: dict[str, Any] | None = None, json: Any = None) -> Any:
         client = self.http_client or httpx.Client(timeout=self.timeout)
         url = f"{self.base_url}/{path.lstrip('/')}"
         try:
@@ -193,9 +194,9 @@ class ConnectWiseClient:
         summary: str,
         company_id: int,
         board: str = DEFAULT_BOARD,
-        priority: Optional[str] = None,
+        priority: str | None = None,
         description: str = "",
-        external_reference: Optional[str] = None,
+        external_reference: str | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "summary": summary[:100],
@@ -248,7 +249,7 @@ class ConnectWiseClient:
         )
 
 
-def client_from_environment(environ: Optional[Mapping[str, str]] = None, **kwargs: Any) -> ConnectWiseClient:
+def client_from_environment(environ: Mapping[str, str] | None = None, **kwargs: Any) -> ConnectWiseClient:
     values = environ if environ is not None else os.environ
     return ConnectWiseClient(
         values.get("FLOWOPS_CW_SITE", ""),
@@ -260,7 +261,7 @@ def client_from_environment(environ: Optional[Mapping[str, str]] = None, **kwarg
     )
 
 
-def _link(session: Session, ticket_id: str) -> Optional[db.ExternalLinkRecord]:
+def _link(session: Session, ticket_id: str) -> db.ExternalLinkRecord | None:
     return session.execute(
         select(db.ExternalLinkRecord).where(
             db.ExternalLinkRecord.system == SYSTEM,
@@ -275,7 +276,7 @@ def sync_ticket(
     ticket: db.TicketRecord,
     client: ConnectWiseClient,
     *,
-    company_id: Optional[int] = None,
+    company_id: int | None = None,
 ) -> dict[str, Any]:
     """Create or update the PSA ticket that mirrors a FlowOps ticket."""
     link = _link(session, ticket.ticket_id)

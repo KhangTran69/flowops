@@ -16,8 +16,9 @@ import json
 import os
 import secrets
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional
+from typing import Any
 
 DEFAULT_TTL_SECONDS = 24 * 60 * 60
 VALID_ACTIONS = ("approve", "reject")
@@ -38,10 +39,10 @@ class ChatOpsClaims:
     action: str
     jti: str
     expires_at: int
-    tenant_key: Optional[str] = None
+    tenant_key: str | None = None
 
 
-def _secret(environ: Optional[Mapping[str, str]] = None) -> str:
+def _secret(environ: Mapping[str, str] | None = None) -> str:
     values = environ if environ is not None else os.environ
     secret = values.get("FLOWOPS_CHATOPS_SECRET", "")
     if not secret:
@@ -70,9 +71,9 @@ def generate_token(
     action: str,
     *,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
-    now: Optional[int] = None,
-    tenant_key: Optional[str] = None,
-    environ: Optional[Mapping[str, str]] = None,
+    now: int | None = None,
+    tenant_key: str | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> str:
     if action not in VALID_ACTIONS:
         raise ChatOpsError(f"Unsupported ChatOps action: {action!r}.")
@@ -93,8 +94,8 @@ def generate_token(
 def verify_token(
     token: str,
     *,
-    now: Optional[int] = None,
-    environ: Optional[Mapping[str, str]] = None,
+    now: int | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> ChatOpsClaims:
     if not token or "." not in token:
         raise ChatOpsError("Malformed ChatOps token.")
@@ -127,8 +128,8 @@ def approval_urls(
     item_id: int,
     *,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
-    tenant_key: Optional[str] = None,
-    environ: Optional[Mapping[str, str]] = None,
+    tenant_key: str | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Return approve/reject token URLs for UI display (empty if unconfigured)."""
     try:

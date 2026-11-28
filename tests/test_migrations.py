@@ -1,9 +1,9 @@
 """Tests for the Alembic baseline migration."""
 
-from alembic import command
-from alembic.config import Config
 from datetime import datetime, timezone
 
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
 
 
@@ -51,7 +51,10 @@ def test_workforce_tenant_migration_preserves_legacy_rows_as_unassigned(tmp_path
     engine = create_engine(url)
     try:
         with engine.begin() as connection:
-            connection.execute(text("INSERT INTO employees (employee_number, full_name, work_email, department, job_title, start_date, manager_subject, status, created_at) VALUES (:number, :name, :email, :department, :title, :start_date, :manager, :status, :created_at)"), {
+            connection.execute(text(
+                "INSERT INTO employees (employee_number, full_name, work_email, department, job_title, start_date, "
+                "manager_subject, status, created_at) "
+                "VALUES (:number, :name, :email, :department, :title, :start_date, :manager, :status, :created_at)"), {
                 "number": "LEGACY-1", "name": "Legacy Person", "email": "legacy@example.test",
                 "department": "IT", "title": "Analyst", "start_date": "2027-01-01",
                 "manager": "manager-old", "status": "ACTIVE",

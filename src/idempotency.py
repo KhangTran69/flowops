@@ -23,9 +23,10 @@ import hashlib
 import json
 import os
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from functools import wraps
-from typing import Any, Callable, Optional
+from typing import Any
 
 from fastapi import Header, HTTPException, Response
 from fastapi import status as http_status
@@ -97,7 +98,7 @@ def request_fingerprint(request: BaseModel) -> str:
     ).hexdigest()
 
 
-def validate_idempotency_key(key: Optional[str]) -> None:
+def validate_idempotency_key(key: str | None) -> None:
     if key is not None and len(key) > 128:
         raise HTTPException(
             status_code=422, detail="Idempotency-Key must be at most 128 characters."
@@ -115,7 +116,7 @@ def claim_key(
     resource_id: str,
     request_hash: str,
     resource_type: str,
-) -> Optional[str]:
+) -> str | None:
     """Atomically claim a key or take over an expired processing reservation.
 
     Returns a fresh fencing token when this request owns the reservation, or
@@ -286,7 +287,7 @@ def replay_stored_response(
     resource_type: str,
     response: Response,
     session: Session,
-    actor_subject: Optional[str] = None,
+    actor_subject: str | None = None,
 ) -> dict[str, Any]:
     """Validate and replay a stored completed response, or return a 409."""
     if _stored_resource_type(payload) != resource_type:
@@ -321,12 +322,12 @@ def replay_stored_response(
 def reserve_key(
     session: Session,
     response: Response,
-    key: Optional[str],
+    key: str | None,
     request_hash: str,
     resource_type: str,
     resource_id: str,
-    actor_subject: Optional[str] = None,
-) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    actor_subject: str | None = None,
+) -> tuple[str | None, dict[str, Any] | None]:
     """Claim a reservation or return a completed stored response.
 
     Returns ``(owner_token, None)`` for a new claim and ``(None, payload)`` for
@@ -415,7 +416,7 @@ def idempotent_create(
         @wraps(handler)
         def wrapper(
             *args: Any,
-            idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+            idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
             **kwargs: Any,
         ) -> Any:
             body: BaseModel = kwargs[request_param]

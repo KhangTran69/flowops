@@ -1,11 +1,9 @@
 """Pydantic request/response models for the FlowOps API."""
 
 from datetime import date, datetime
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, field_validator
-
-
 
 
 class TicketIntakeRequest(BaseModel):
@@ -15,7 +13,7 @@ class TicketIntakeRequest(BaseModel):
     id: StrictInt = Field(ge=1, description="Upstream ticket ID.")
     title: StrictStr = Field(description="Short ticket description.")
     completed: StrictBool = Field(description="Whether the upstream item is done.")
-    tenant: Optional[StrictStr] = Field(
+    tenant: StrictStr | None = Field(
         default=None, max_length=64, description="Optional client tenant key (multi-tenant MSP)."
     )
 
@@ -35,8 +33,8 @@ class Ticket(BaseModel):
     title: str
     status: Literal["open", "closed"]
     priority: str
-    category: Optional[str] = None
-    queue: Optional[str] = None
+    category: str | None = None
+    queue: str | None = None
 
 
 class ManualTicketIn(BaseModel):
@@ -44,25 +42,25 @@ class ManualTicketIn(BaseModel):
     requester_id: StrictInt = Field(ge=1, le=2147483647)
     title: StrictStr = Field(min_length=3, max_length=500)
     description: StrictStr = Field(min_length=3, max_length=10000)
-    requester_email: Optional[StrictStr] = Field(default=None, max_length=254, pattern=r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+    requester_email: StrictStr | None = Field(default=None, max_length=254, pattern=r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 
 class TicketHistoryOut(BaseModel):
     id: int
     action: str
     status: str
-    actor_subject: Optional[str] = None
-    detail: Optional[str] = None
+    actor_subject: str | None = None
+    detail: str | None = None
     created_at: datetime
 
 
 class TicketDetailOut(Ticket):
-    description: Optional[str] = None
-    requester_email: Optional[str] = None
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
-    closed_at: Optional[datetime] = None
-    resolution_note: Optional[str] = None
+    description: str | None = None
+    requester_email: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    closed_at: datetime | None = None
+    resolution_note: str | None = None
     history: list[TicketHistoryOut] = Field(default_factory=list)
 
 
@@ -86,8 +84,8 @@ class AISummaryOut(BaseModel):
     title: str
     status: str
     priority: str
-    category: Optional[str] = None
-    queue: Optional[str] = None
+    category: str | None = None
+    queue: str | None = None
     urgency_signals: list[str]
     history_count: int
 
@@ -96,8 +94,8 @@ class AIRecommendationOut(BaseModel):
     id: str
     kind: str
     title: str
-    current: Optional[str] = None
-    suggested: Optional[str] = None
+    current: str | None = None
+    suggested: str | None = None
     rationale: str
     confidence: int
     applicable: bool
@@ -132,13 +130,13 @@ class WorkflowJobOut(BaseModel):
     attempts: int
     max_attempts: int
     available_at: datetime
-    last_error: Optional[str] = None
-    resource_type: Optional[str] = None
-    resource_id: Optional[str] = None
-    label: Optional[str] = None
+    last_error: str | None = None
+    resource_type: str | None = None
+    resource_id: str | None = None
+    label: str | None = None
     created_at: datetime
     updated_at: datetime
-    completed_at: Optional[datetime] = None
+    completed_at: datetime | None = None
 
 
 class ExecutionLogOut(BaseModel):
@@ -146,11 +144,11 @@ class ExecutionLogOut(BaseModel):
     run_id: str
     action: str
     status: str
-    ticket_id: Optional[str] = None
+    ticket_id: str | None = None
     duration_ms: int
-    detail: Optional[str] = None
-    actor_subject: Optional[str] = None
-    correlation_id: Optional[str] = None
+    detail: str | None = None
+    actor_subject: str | None = None
+    correlation_id: str | None = None
     created_at: datetime
 
 
@@ -159,17 +157,17 @@ class ActionExecutionOut(BaseModel):
     request_id: int
     checklist_item_id: int
     action: str
-    actor_subject: Optional[str] = None
+    actor_subject: str | None = None
     adapter: str
     correlation_id: str
     attempt: int
     status: str
-    error_category: Optional[str] = None
-    error_detail: Optional[str] = None
-    external_reference: Optional[str] = None
+    error_category: str | None = None
+    error_detail: str | None = None
+    external_reference: str | None = None
     started_at: datetime
-    completed_at: Optional[datetime] = None
-    duration_ms: Optional[int] = None
+    completed_at: datetime | None = None
+    duration_ms: int | None = None
 
 
 class ChecklistItemOut(BaseModel):
@@ -177,20 +175,20 @@ class ChecklistItemOut(BaseModel):
     step: str
     # v0.6.1: stable identifier for the step; None on rows created before
     # this change existed (they predate the offboarding completion ledger).
-    step_key: Optional[str] = None
+    step_key: str | None = None
     queue: str
     requires_approval: bool
     status: str
-    action: Optional[str] = None
-    result: Optional[dict | list | str | int | float | bool | None] = None
+    action: str | None = None
+    result: dict | list | str | int | float | bool | None = None
     depends_on: list[str] = []
-    output: Optional[dict] = None
+    output: dict | None = None
     join_mode: str = "all"
     when: list[str] = []
-    sla_minutes: Optional[int] = None
+    sla_minutes: int | None = None
     overdue: bool = False
-    sla_remaining_minutes: Optional[int] = None
-    sla_due_at: Optional[datetime] = None
+    sla_remaining_minutes: int | None = None
+    sla_due_at: datetime | None = None
 
 
 class DefinitionCreateIn(BaseModel):
@@ -217,9 +215,9 @@ class DefinitionVersionOut(BaseModel):
     version: int
     checksum: str
     steps: list[dict[str, Any]]
-    created_by: Optional[str] = None
+    created_by: str | None = None
     created_at: datetime
-    published_at: Optional[datetime] = None
+    published_at: datetime | None = None
 
 
 class WorkflowDefinitionOut(BaseModel):
@@ -227,7 +225,7 @@ class WorkflowDefinitionOut(BaseModel):
     name: str
     request_type: str
     status: str
-    current_version: Optional[int] = None
+    current_version: int | None = None
     versions: list[DefinitionVersionOut] = []
 
 
@@ -239,20 +237,20 @@ class OnboardingRequestIn(BaseModel):
     employee_email: StrictStr
     department: StrictStr
     requester_id: StrictInt = Field(ge=1)
-    start_date: Optional[StrictStr] = Field(
+    start_date: StrictStr | None = Field(
         default=None, description="ISO date (YYYY-MM-DD) the employee starts or leaves."
     )
-    definition_key: Optional[StrictStr] = Field(
+    definition_key: StrictStr | None = Field(
         default=None, description="Optional published workflow definition key."
     )
-    definition_version: Optional[StrictInt] = Field(
+    definition_version: StrictInt | None = Field(
         default=None, ge=1, description="Optional pinned definition version."
     )
-    template: Optional[StrictStr] = Field(
+    template: StrictStr | None = Field(
         default=None,
         description="Optional named workflow template (e.g. onboarding-dag).",
     )
-    tenant_key: Optional[StrictStr] = Field(
+    tenant_key: StrictStr | None = Field(
         default=None, max_length=64, description="Client tenant this request runs in."
     )
 
@@ -272,7 +270,7 @@ class OnboardingRequestIn(BaseModel):
 
     @field_validator("start_date")
     @classmethod
-    def iso_date(cls, value: Optional[str]) -> Optional[str]:
+    def iso_date(cls, value: str | None) -> str | None:
         import re
 
         if value is not None:
@@ -292,11 +290,11 @@ class OnboardingRequestOut(BaseModel):
     employee_email: str
     department: str
     requester_id: int
-    start_date: Optional[str] = None
+    start_date: str | None = None
     status: str
-    definition_key: Optional[str] = None
-    definition_version: Optional[int] = None
-    tenant_key: Optional[str] = None
+    definition_key: str | None = None
+    definition_version: int | None = None
+    tenant_key: str | None = None
     checklist: list[ChecklistItemOut]
 
 
@@ -305,19 +303,19 @@ class WorkflowStepRunOut(BaseModel):
     checklist_item_id: int
     attempt: int
     status: str
-    job_id: Optional[int] = None
+    job_id: int | None = None
     scheduled_at: datetime
-    started_at: Optional[datetime] = None
-    completed_at: Optional[datetime] = None
-    output: Optional[dict] = None
-    error: Optional[str] = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    output: dict | None = None
+    error: str | None = None
 
 
 class WorkflowEventOut(BaseModel):
     id: int
     event_type: str
-    step_run_id: Optional[int] = None
-    payload: Optional[dict] = None
+    step_run_id: int | None = None
+    payload: dict | None = None
     created_at: datetime
 
 
@@ -326,14 +324,14 @@ class WorkflowRunOut(BaseModel):
     request_id: int
     status: str
     max_parallel: int
-    error: Optional[str] = None
+    error: str | None = None
     created_at: datetime
-    started_at: Optional[datetime] = None
-    completed_at: Optional[datetime] = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
     steps: list[WorkflowStepRunOut] = []
     checklist: list[ChecklistItemOut] = Field(default_factory=list)
-    definition_key: Optional[str] = None
-    employee_name: Optional[str] = None
+    definition_key: str | None = None
+    employee_name: str | None = None
     events: list[WorkflowEventOut] = []
 
 
@@ -379,8 +377,8 @@ class NotificationOutboxOut(BaseModel):
 
     id: int
     url: str
-    ticket_id: Optional[str] = None
+    ticket_id: str | None = None
     status: str
     attempts: int
-    last_error: Optional[str] = None
+    last_error: str | None = None
     created_at: datetime

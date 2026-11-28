@@ -203,7 +203,7 @@ def test_workflow_runs_and_jobs_are_fenced_by_request_tenant(fencing_client):
         )
         session.add_all([job_a, job_b])
         session.commit()
-        run_a_id, run_b_id, job_a_id, job_b_id = run_a.id, run_b.id, job_a.id, job_b.id
+        run_a_id, _, job_a_id, _ = run_a.id, run_b.id, job_a.id, job_b.id
     finally:
         session.close()
 
@@ -411,7 +411,10 @@ def test_chatops_token_without_tenant_still_actions(fencing_client, monkeypatch)
 
 def test_trigger_rules_are_tenant_fenced(fencing_client):
     client, set_actor = fencing_client
-    admin_tenant = lambda key: Actor(f"admin-{key}", ("automation.operator", "automation.admin"), source="bearer", tenant_key=key)
+
+    def admin_tenant(key):
+        return Actor(f"admin-{key}", ("automation.operator", "automation.admin"), source="bearer", tenant_key=key)
+
     set_actor(admin_tenant("tenant-a"))
     rule_payload = {
         "name": "auto-escalate",
@@ -515,12 +518,15 @@ def test_connectors_are_authenticated_tenant_scoped_and_stamp_webhook_events(
     fencing_client, monkeypatch,
 ):
     client, set_actor = fencing_client
-    admin = lambda key: Actor(
-        f"admin-{key}",
-        ("automation.operator", "automation.admin"),
-        source="bearer",
-        tenant_key=key,
-    )
+
+    def admin(key):
+        return Actor(
+            f"admin-{key}",
+            ("automation.operator", "automation.admin"),
+            source="bearer",
+            tenant_key=key,
+        )
+
     set_actor(_tenant_actor("tenant-a"))
     assert client.get("/connectors").status_code == 403
 
@@ -770,7 +776,8 @@ def test_definition_comparison_respects_global_admin(fencing_client):
     set_actor(_local_actor())
     base = {"key": "first", "step": "First step", "queue": "it-hardware", "requires_approval": False, "action": "none"}
     second = {"key": "second", "step": "Second step", "queue": "it-software", "requires_approval": False, "action": "none"}
-    created = client.post("/workflow-definitions", json={"key": "compare-test", "name": "Compare", "request_type": "onboarding", "steps": [base]})
+    created = client.post("/workflow-definitions",
+                          json={"key": "compare-test", "name": "Compare", "request_type": "onboarding", "steps": [base]})
     assert created.status_code == 200, created.text
     version = client.put("/workflow-definitions/compare-test", json={"steps": [{**base, "queue": "it-software"}, second]})
     assert version.status_code == 200, version.text

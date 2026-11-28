@@ -51,6 +51,18 @@ jobs:
       - name: Coverage floor (83%)
         run: ./scripts/coverage.sh
 
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Ruff (E,F,I,B,UP @140, py310 target)
+        run: ruff check src tests scripts
+
   docker-postgres:
 
     runs-on: ubuntu-latest

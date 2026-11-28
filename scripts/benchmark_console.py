@@ -4,8 +4,8 @@ import math
 import os
 import statistics
 import time
-
 from concurrent.futures import ThreadPoolExecutor
+
 from fastapi.testclient import TestClient
 
 from src import api, db
@@ -45,7 +45,10 @@ def main():
             ("/command-center/summary", {}),
         ]:
             assert client.get(path, params=params).status_code == 200
-            def sample(_):
+            # Bind loop variables as defaults: sample only runs within this
+            # iteration (executor.map joins before the loop advances), but
+            # binding keeps the closure from capturing a rebound variable.
+            def sample(_, path=path, params=params):
                 started = time.perf_counter()
                 response = client.get(path, params=params)
                 assert response.status_code == 200, response.text

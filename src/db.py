@@ -11,10 +11,8 @@ import os
 import re
 import threading
 from datetime import datetime, timezone
-from typing import Optional
 
 from sqlalchemy import (
-    event,
     Boolean,
     DateTime,
     ForeignKey,
@@ -59,15 +57,15 @@ class TicketRecord(Base):
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     priority: Mapped[str] = mapped_column(String(16), nullable=False)
-    category: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
-    queue: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    category: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    queue: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    tenant_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     # Ticket closing (v1.0 preview): both columns are nullable, so rows
     # written before this change stay valid (NULL = never closed).
-    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    requester_email: Mapped[Optional[str]] = mapped_column(String(254), nullable=True)
-    resolution_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    closed_at: Mapped[Optional[datetime]] = mapped_column(
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    requester_email: Mapped[str | None] = mapped_column(String(254), nullable=True)
+    resolution_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    closed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
@@ -90,11 +88,11 @@ class ExecutionLogRecord(Base):
     run_id: Mapped[str] = mapped_column(String(32), nullable=False)
     action: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False)  # success|failure
-    ticket_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    ticket_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    actor_subject: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
-    correlation_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    actor_subject: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    correlation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
@@ -108,8 +106,8 @@ class IdempotencyRecord(Base):
     key: Mapped[str] = mapped_column(String(128), primary_key=True)
     ticket_id: Mapped[str] = mapped_column(String(64), nullable=False)
     response_json: Mapped[str] = mapped_column(Text, nullable=False)
-    owner_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    resource_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    owner_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    resource_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -122,17 +120,17 @@ class ActionExecutionRecord(Base):
     request_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     checklist_item_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     action: Mapped[str] = mapped_column(String(64), nullable=False)
-    actor_subject: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    actor_subject: Mapped[str | None] = mapped_column(String(256), nullable=True)
     adapter: Mapped[str] = mapped_column(String(64), nullable=False)
     correlation_id: Mapped[str] = mapped_column(String(32), nullable=False)
     attempt: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(24), nullable=False)
-    error_category: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
-    error_detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    external_reference: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    error_category: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    external_reference: Mapped[str | None] = mapped_column(String(256), nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    duration_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class WorkflowJobRecord(Base):
@@ -150,7 +148,7 @@ class WorkflowJobRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     job_type: Mapped[str] = mapped_column(String(64), nullable=False)
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
-    idempotency_key: Mapped[Optional[str]] = mapped_column(
+    idempotency_key: Mapped[str | None] = mapped_column(
         String(200), nullable=True, unique=True
     )
     status: Mapped[str] = mapped_column(
@@ -161,24 +159,24 @@ class WorkflowJobRecord(Base):
     available_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
     )
-    lease_owner_token: Mapped[Optional[str]] = mapped_column(
+    lease_owner_token: Mapped[str | None] = mapped_column(
         String(64), nullable=True
     )
-    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    result_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    resource_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
-    resource_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    label: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resource_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    resource_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    label: Mapped[str | None] = mapped_column(String(200), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
-    completed_at: Mapped[Optional[datetime]] = mapped_column(
+    completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
 
@@ -199,17 +197,17 @@ class NotificationOutboxRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     url: Mapped[str] = mapped_column(String(500), nullable=False)
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
-    ticket_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    ticket_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="pending"
     )  # pending | delivered | failed
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    lease_owner_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    lease_owner_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    next_attempt_at: Mapped[Optional[datetime]] = mapped_column(
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, default=utcnow
     )
     created_at: Mapped[datetime] = mapped_column(
@@ -231,14 +229,14 @@ class OnboardingRequestRecord(Base):
     employee_email: Mapped[str] = mapped_column(String(320), nullable=False)
     department: Mapped[str] = mapped_column(String(120), nullable=False)
     requester_id: Mapped[int] = mapped_column(Integer, nullable=False)
-    start_date: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    start_date: Mapped[str | None] = mapped_column(String(10), nullable=True)
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="in_progress", index=True
     )
     # v1.3: request is pinned to an immutable definition version.
-    definition_key: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
-    definition_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    definition_key: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    definition_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tenant_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
@@ -255,13 +253,13 @@ class TenantRecord(Base):
 
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
-    entra_tenant_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    default_domain: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    licence_sku: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
-    usage_location: Mapped[Optional[str]] = mapped_column(String(2), nullable=True)
-    psa_company_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    credential_ref: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    baseline_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    entra_tenant_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    default_domain: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    licence_sku: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    usage_location: Mapped[str | None] = mapped_column(String(2), nullable=True)
+    psa_company_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    credential_ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    baseline_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -283,7 +281,7 @@ class ExternalLinkRecord(Base):
     local_type: Mapped[str] = mapped_column(String(32), nullable=False)
     local_id: Mapped[str] = mapped_column(String(64), nullable=False)
     external_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    tenant_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -302,7 +300,7 @@ class ChecklistItemRecord(Base):
     # Nullable so rows written before this change stay valid; the API fills
     # it in for every new checklist, and _add_missing_columns() migrates
     # pre-existing SQLite files additively (no data is touched).
-    step_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    step_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     queue: Mapped[str] = mapped_column(String(64), nullable=False)
     requires_approval: Mapped[bool] = mapped_column(Boolean, nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
@@ -310,16 +308,16 @@ class ChecklistItemRecord(Base):
     # ("none" for manual steps, "m365_provision" for the simulated one).
     # Both new columns are nullable so older rows stay valid; the API fills
     # them in, and _add_missing_columns() migrates pre-existing SQLite files.
-    action: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
-    result: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON from the action
+    action: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    result: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON from the action
     # v1.1 DAG: prerequisite step keys and structured action output.
     # Both nullable so pre-v1.1 rows stay valid and SQLite can add them.
-    depends_on_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    output_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    join_mode: Mapped[Optional[str]] = mapped_column(String(8), nullable=True, default="all")
-    when_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    sla_minutes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    escalation_queue: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    depends_on_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    output_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    join_mode: Mapped[str | None] = mapped_column(String(8), nullable=True, default="all")
+    when_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sla_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    escalation_queue: Mapped[str | None] = mapped_column(String(64), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
@@ -347,9 +345,9 @@ class OffboardingCompletionRecord(Base):
     checklist_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     step_key: Mapped[str] = mapped_column(String(64), nullable=False)
     # NULL means a legacy completed row (the table predates status tracking).
-    status: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
-    owner_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    claimed_at: Mapped[Optional[datetime]] = mapped_column(
+    status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    owner_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     completed_at: Mapped[datetime] = mapped_column(
@@ -722,11 +720,11 @@ def log_execution(
     run_id: str,
     action: str,
     status: str,
-    ticket_id: Optional[str] = None,
+    ticket_id: str | None = None,
     duration_ms: int = 0,
-    detail: Optional[str] = None,
-    actor_subject: Optional[str] = None,
-    correlation_id: Optional[str] = None,
+    detail: str | None = None,
+    actor_subject: str | None = None,
+    correlation_id: str | None = None,
 ) -> None:
     """Append an execution-log row for the current run."""
     session.add(
@@ -778,19 +776,19 @@ class WorkflowRunRecord(Base):
     request_id: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
     max_parallel: Mapped[int] = mapped_column(Integer, nullable=False, default=4)
-    lease_owner_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+    lease_owner_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    last_tick_at: Mapped[Optional[datetime]] = mapped_column(
+    last_tick_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    started_at: Mapped[Optional[datetime]] = mapped_column(
+    started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    completed_at: Mapped[Optional[datetime]] = mapped_column(
+    completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
 
@@ -811,16 +809,16 @@ class WorkflowStepRunRecord(Base):
     checklist_item_id: Mapped[int] = mapped_column(Integer, nullable=False)
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="scheduled")
-    job_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    job_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    started_at: Mapped[Optional[datetime]] = mapped_column(
+    started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    completed_at: Mapped[Optional[datetime]] = mapped_column(
+    completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    output_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    output_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class WorkflowEventRecord(Base):
@@ -831,7 +829,7 @@ class WorkflowEventRecord(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     run_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
-    step_run_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    step_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
     payload_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -846,7 +844,7 @@ class WorkflowDefinitionRecord(Base):
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     request_type: Mapped[str] = mapped_column(String(16), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="draft")
-    current_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    current_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
@@ -868,9 +866,9 @@ class WorkflowDefinitionVersionRecord(Base):
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     steps_json: Mapped[str] = mapped_column(Text, nullable=False)
     checksum: Mapped[str] = mapped_column(String(64), nullable=False)
-    created_by: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(120), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    published_at: Mapped[Optional[datetime]] = mapped_column(
+    published_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
 
@@ -893,11 +891,11 @@ class ConnectorRecord(Base):
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     connector_type: Mapped[str] = mapped_column(String(40), nullable=False)
     kind: Mapped[str] = mapped_column(String(16), nullable=False, default="polling")
-    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    tenant_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     config_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    cursor_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    last_polled_at: Mapped[Optional[datetime]] = mapped_column(
+    cursor_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_polled_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -922,10 +920,10 @@ class EventRecord(Base):
     external_id: Mapped[str] = mapped_column(String(255), nullable=False)
     fingerprint: Mapped[str] = mapped_column(String(400), nullable=False)
     payload_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
-    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
-    connector_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    tenant_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    connector_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    processed_at: Mapped[Optional[datetime]] = mapped_column(
+    processed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
 
@@ -948,14 +946,14 @@ class TriggerRuleRecord(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
-    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    source: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    tenant_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source: Mapped[str | None] = mapped_column(String(40), nullable=True)
     event_type: Mapped[str] = mapped_column(String(80), nullable=False, default="*")
     predicate: Mapped[str] = mapped_column(String(2000), nullable=False, default="true")
     action_type: Mapped[str] = mapped_column(String(24), nullable=False)
-    request_type: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
-    static_inputs_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    notify_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    request_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    static_inputs_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    notify_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     fired_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -978,11 +976,11 @@ class WorkflowTimerRecord(Base):
     kind: Mapped[str] = mapped_column(String(16), nullable=False, default="step_sla")
     due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
-    lease_owner_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+    lease_owner_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    fired_at: Mapped[Optional[datetime]] = mapped_column(
+    fired_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -996,7 +994,7 @@ class EventSourceRecord(Base):
     key: Mapped[str] = mapped_column(String(80), primary_key=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     secret: Mapped[str] = mapped_column(String(128), nullable=False)
-    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    tenant_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     global_scope: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
@@ -1021,15 +1019,15 @@ class TriggerRecord(Base):
     source_key: Mapped[str] = mapped_column(String(80), nullable=False)
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
     target_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    definition_key: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    definition_key: Mapped[str | None] = mapped_column(String(80), nullable=True)
     mapping_json: Mapped[str] = mapped_column(Text, nullable=False)
     schedule_kind: Mapped[str] = mapped_column(
         String(16), nullable=False, default="webhook"
     )
-    interval_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    daily_at_utc: Mapped[Optional[str]] = mapped_column(String(5), nullable=True)
+    interval_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    daily_at_utc: Mapped[str | None] = mapped_column(String(5), nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    last_fired_at: Mapped[Optional[datetime]] = mapped_column(
+    last_fired_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -1055,10 +1053,10 @@ class TriggerDeliveryRecord(Base):
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="received"
     )
-    request_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    request_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    processed_at: Mapped[Optional[datetime]] = mapped_column(
+    processed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
 
@@ -1081,7 +1079,7 @@ class EmployeeRecord(Base):
     job_title: Mapped[str] = mapped_column(String(160), nullable=False)
     start_date: Mapped[str] = mapped_column(String(10), nullable=False)
     manager_subject: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
-    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    tenant_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="ACTIVE")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -1100,12 +1098,12 @@ class StaffOnboardingRecord(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id"), nullable=False, index=True)
-    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    tenant_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="DRAFT")
     created_by: Mapped[str] = mapped_column(String(256), nullable=False)
-    submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -1116,10 +1114,10 @@ class WorkforceApprovalRecord(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     request_id: Mapped[int] = mapped_column(ForeignKey("staff_onboarding_requests.id"), nullable=False, index=True)
-    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    tenant_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     actor_subject: Mapped[str] = mapped_column(String(256), nullable=False)
     decision: Mapped[str] = mapped_column(String(16), nullable=False)
-    comment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
     decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -1132,17 +1130,17 @@ class ITTaskRecord(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     request_id: Mapped[int] = mapped_column(ForeignKey("staff_onboarding_requests.id"), nullable=False, index=True)
-    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    tenant_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     task_key: Mapped[str] = mapped_column(String(64), nullable=False)
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
-    assignee_subject: Mapped[Optional[str]] = mapped_column(String(256), nullable=True, index=True)
-    due_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    assignee_subject: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
+    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="TODO")
-    completion_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    completion_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ITAssetRecord(Base):
@@ -1152,13 +1150,13 @@ class ITAssetRecord(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     asset_tag: Mapped[str] = mapped_column(String(64), nullable=False)
-    serial_number: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    serial_number: Mapped[str | None] = mapped_column(String(120), nullable=True)
     category: Mapped[str] = mapped_column(String(80), nullable=False)
     brand_model: Mapped[str] = mapped_column(String(200), nullable=False)
     condition: Mapped[str] = mapped_column(String(24), nullable=False, default="GOOD")
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="AVAILABLE", index=True)
-    employee_id: Mapped[Optional[int]] = mapped_column(ForeignKey("employees.id"), nullable=True, index=True)
-    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    employee_id: Mapped[int | None] = mapped_column(ForeignKey("employees.id"), nullable=True, index=True)
+    tenant_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -1169,11 +1167,11 @@ class AssetAssignmentRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     asset_id: Mapped[int] = mapped_column(ForeignKey("it_assets.id"), nullable=False, index=True)
     employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id"), nullable=False, index=True)
-    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    tenant_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     assigned_by: Mapped[str] = mapped_column(String(256), nullable=False)
     assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    returned_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    return_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    returned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    return_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class WorkforceAuditRecord(Base):
@@ -1190,11 +1188,11 @@ class WorkforceAuditRecord(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     actor_subject: Mapped[str] = mapped_column(String(256), nullable=False)
-    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    tenant_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     action: Mapped[str] = mapped_column(String(80), nullable=False)
     entity_type: Mapped[str] = mapped_column(String(48), nullable=False)
     entity_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -1209,17 +1207,17 @@ class WorkforceAutomationEventRecord(Base):
     event_id: Mapped[str] = mapped_column(String(64), nullable=False)
     event_type: Mapped[str] = mapped_column(String(80), nullable=False)
     request_id: Mapped[int] = mapped_column(ForeignKey("staff_onboarding_requests.id"), nullable=False, index=True)
-    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    tenant_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
     delivery_status: Mapped[str] = mapped_column(String(24), nullable=False, default="PENDING")
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    lease_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    lease_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     workflow_status: Mapped[str] = mapped_column(String(24), nullable=False, default="WAITING")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class WorkforceReminderRecord(Base):
@@ -1229,9 +1227,9 @@ class WorkforceReminderRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     event_id: Mapped[str] = mapped_column(String(128), nullable=False)
     task_id: Mapped[int] = mapped_column(ForeignKey("it_setup_tasks.id"), nullable=False, index=True)
-    tenant_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    tenant_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     outcome: Mapped[str] = mapped_column(String(24), nullable=False)
-    detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 @event.listens_for(Base.metadata, "before_drop")

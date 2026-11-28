@@ -5,7 +5,7 @@ from urllib.parse import parse_qs
 import httpx
 import pytest
 
-from src.actions import MicrosoftGraphAdapter, ActionResult
+from src.actions import ActionResult, MicrosoftGraphAdapter
 from src.graph import GraphError
 from src.tenants import (
     GraphClientFactory,

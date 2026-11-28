@@ -16,8 +16,8 @@ import signal
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Optional
+from datetime import datetime
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -47,9 +47,9 @@ def _add_audit(
     status: str,
     started: datetime,
     duration_ms: int,
-    error: Optional[str] = None,
-    request_id: Optional[int] = None,
-    item_id: Optional[int] = None,
+    error: str | None = None,
+    request_id: int | None = None,
+    item_id: int | None = None,
 ) -> None:
     session.add(
         db.ActionExecutionRecord(
@@ -76,16 +76,16 @@ class _LeaseHeartbeat:
     def __init__(
         self,
         job_id: int,
-        owner_token: Optional[str],
+        owner_token: str | None,
         lease_seconds: int,
-        interval: Optional[float],
+        interval: float | None,
     ) -> None:
         self.job_id = job_id
         self.owner_token = owner_token
         self.lease_seconds = lease_seconds
         self.interval = interval
         self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
 
     def __enter__(self) -> "_LeaseHeartbeat":
         if not self.owner_token or not self.interval or self.interval <= 0:
@@ -126,7 +126,7 @@ def _complete_onboarding_job(
     payload: dict[str, Any],
     *,
     lease_seconds: int = jobs.DEFAULT_LEASE_SECONDS,
-    heartbeat_interval: Optional[float] = None,
+    heartbeat_interval: float | None = None,
 ) -> dict[str, Any]:
     """Execute one onboarding item and finish the job in the same transaction."""
     started = db.utcnow()
@@ -340,12 +340,11 @@ def _complete_trigger_job(
         raise _PermanentJobError(f"Mapping failed: {error}") from error
 
     request_id = None
-    error = None
 
     if trigger.target_type == "ticket":
         # Create ticket using existing intake path
-        from src.ticket_processor import normalize_ticket
         from src.routing import route_ticket
+        from src.ticket_processor import normalize_ticket
 
         ticket_id = f"trig-{trigger.key}-{delivery.event_id[:8]}"
         normalized = normalize_ticket(
@@ -447,7 +446,7 @@ def _execute_job(
     job: db.WorkflowJobRecord,
     *,
     lease_seconds: int = jobs.DEFAULT_LEASE_SECONDS,
-    heartbeat_interval: Optional[float] = None,
+    heartbeat_interval: float | None = None,
 ) -> str:
     if job.job_type == JOB_TRIGGER_EXECUTE:
         payload = json.loads(job.payload_json)
@@ -548,10 +547,10 @@ def _execute_job(
 
 def run_once(
     *,
-    worker_id: Optional[str] = None,
+    worker_id: str | None = None,
     lease_seconds: int = jobs.DEFAULT_LEASE_SECONDS,
-    heartbeat_interval: Optional[float] = None,
-) -> Optional[db.WorkflowJobRecord]:
+    heartbeat_interval: float | None = None,
+) -> db.WorkflowJobRecord | None:
     """Claim and execute at most one due job."""
     db._ensure_tables()
     session = db.SessionLocal()
@@ -576,7 +575,7 @@ def run_once(
         session.close()
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="FlowOps durable workflow worker")
     parser.add_argument("--once", action="store_true", help="process at most one job")
     parser.add_argument(

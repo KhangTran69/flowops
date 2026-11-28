@@ -45,7 +45,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urlsplit
 
 import requests
@@ -56,7 +56,6 @@ from sqlalchemy.orm import Session
 from src import db, expressions, scheduler
 from src.deps import _new_run_id
 from src.schemas import OnboardingRequestIn
-
 
 # ---------------------------------------------------------------------------
 # Canonical event model
@@ -73,10 +72,10 @@ class NormalizedEvent:
     event_type: str
     external_id: str
     payload: dict[str, Any]
-    tenant_key: Optional[str] = None
+    tenant_key: str | None = None
     title: str = ""
     description: str = ""
-    connector_id: Optional[int] = None
+    connector_id: int | None = None
 
     def fingerprint(self) -> str:
         identity = json.dumps(
@@ -505,9 +504,9 @@ class FiredAction:
 def validate_rule_shape(
     predicate: str,
     action_type: str,
-    request_type: Optional[str],
-    notify_url: Optional[str],
-    static_inputs_json: Optional[str],
+    request_type: str | None,
+    notify_url: str | None,
+    static_inputs_json: str | None,
     *,
     tenant_key: str | None = None,
     session: Session | None = None,
@@ -1049,7 +1048,7 @@ def connector_due(record: "db.ConnectorRecord", now: datetime) -> bool:
 
 
 def poll_all_connectors(
-    now: Optional[datetime] = None,
+    now: datetime | None = None,
     *,
     only_due: bool = True,
     tenant_key: str | None = None,
@@ -1151,7 +1150,7 @@ def run_forever(stop_event=None) -> None:
             time.sleep(POLL_INTERVAL_SECONDS)
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(description="FlowOps connector poller")

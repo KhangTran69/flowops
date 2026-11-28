@@ -14,7 +14,6 @@ import json
 import signal
 import time
 import uuid
-from typing import Optional
 
 from src import db, idempotency, outbox
 from src.connectors import deliver_outbox_notification
@@ -47,9 +46,9 @@ def sweep_idempotency_keys() -> int:
 
 def run_once(
     *,
-    worker_id: Optional[str] = None,
+    worker_id: str | None = None,
     lease_seconds: int = outbox.DEFAULT_LEASE_SECONDS,
-) -> Optional[db.NotificationOutboxRecord]:
+) -> db.NotificationOutboxRecord | None:
     """Claim and deliver at most one pending outbox row."""
     db._ensure_tables()
     session = db.SessionLocal()
@@ -109,7 +108,7 @@ def run_once(
         session.close()
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="FlowOps outbox dispatcher")
     parser.add_argument("--once", action="store_true", help="deliver at most one row")
     parser.add_argument("--poll-interval", type=float, default=2.0)

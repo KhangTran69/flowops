@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi import status as http_status
@@ -34,16 +34,16 @@ class EventSourceCreateIn(BaseModel):
 
     key: StrictStr = Field(description="Unique identifier for the source.")
     name: StrictStr = Field(description="Human-readable name.")
-    tenant_key: Optional[StrictStr] = Field(default=None, max_length=64)
+    tenant_key: StrictStr | None = Field(default=None, max_length=64)
     global_scope: StrictBool = False
 
 
 class EventSourceUpdateIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    tenant_key: Optional[StrictStr] = Field(default=None, max_length=64)
+    tenant_key: StrictStr | None = Field(default=None, max_length=64)
     global_scope: StrictBool = False
-    active: Optional[StrictBool] = None
+    active: StrictBool | None = None
 
 
 class EventSourceOut(BaseModel):
@@ -51,7 +51,7 @@ class EventSourceOut(BaseModel):
     name: str
     active: bool
     created_at: datetime
-    tenant_key: Optional[str] = None
+    tenant_key: str | None = None
     global_scope: bool
     secret_generated: bool
 
@@ -60,7 +60,7 @@ class EventSourceSecretOut(EventSourceOut):
     secret: str
 
 
-def _validate_source_tenant(session: Session, tenant_key: Optional[str]) -> None:
+def _validate_source_tenant(session: Session, tenant_key: str | None) -> None:
     if tenant_key is None:
         return
     tenant = session.get(db.TenantRecord, tenant_key)
@@ -273,11 +273,11 @@ class TriggerCreateIn(BaseModel):
     source_key: StrictStr = Field(description="Event source key.")
     event_type: StrictStr = Field(description="Event type to match.")
     target_type: StrictStr = Field(description="Target: onboarding_request, offboarding_request, or ticket.")
-    definition_key: Optional[StrictStr] = Field(default=None, description="Definition key for onboarding/offboarding.")
+    definition_key: StrictStr | None = Field(default=None, description="Definition key for onboarding/offboarding.")
     mapping_json: dict[str, Any] = Field(description="Mapping from event to request fields.")
     schedule_kind: StrictStr = Field(default="webhook", description="webhook, interval, or daily.")
-    interval_seconds: Optional[StrictInt] = Field(default=None, description="Interval in seconds for interval schedules.")
-    daily_at_utc: Optional[StrictStr] = Field(default=None, description="HH:MM UTC for daily schedules.")
+    interval_seconds: StrictInt | None = Field(default=None, description="Interval in seconds for interval schedules.")
+    daily_at_utc: StrictStr | None = Field(default=None, description="HH:MM UTC for daily schedules.")
 
     @field_validator("target_type")
     @classmethod
@@ -295,9 +295,9 @@ class TriggerCreateIn(BaseModel):
 
 
 class TriggerUpdateIn(BaseModel):
-    name: Optional[StrictStr] = None
-    active: Optional[StrictBool] = None
-    mapping_json: Optional[dict[str, Any]] = None
+    name: StrictStr | None = None
+    active: StrictBool | None = None
+    mapping_json: dict[str, Any] | None = None
 
 
 class TriggerOut(BaseModel):
@@ -306,13 +306,13 @@ class TriggerOut(BaseModel):
     source_key: str
     event_type: str
     target_type: str
-    definition_key: Optional[str] = None
+    definition_key: str | None = None
     mapping_json: dict[str, Any]
     schedule_kind: str
-    interval_seconds: Optional[int] = None
-    daily_at_utc: Optional[str] = None
+    interval_seconds: int | None = None
+    daily_at_utc: str | None = None
     active: bool
-    last_fired_at: Optional[datetime] = None
+    last_fired_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -323,10 +323,10 @@ class TriggerDeliveryOut(BaseModel):
     event_id: str
     payload: dict[str, Any]
     status: str
-    request_id: Optional[str] = None
-    error: Optional[str] = None
+    request_id: str | None = None
+    error: str | None = None
     received_at: datetime
-    processed_at: Optional[datetime] = None
+    processed_at: datetime | None = None
 
 
 async def _read_raw_body(request: Request) -> bytes:
@@ -354,9 +354,9 @@ async def _read_raw_body(request: Request) -> bytes:
 def trigger_webhook(
     trigger_key: str,
     request: Request,
-    x_flowops_timestamp: Optional[str] = Header(default=None, alias="X-FlowOps-Timestamp"),
-    x_flowops_signature: Optional[str] = Header(default=None, alias="X-FlowOps-Signature"),
-    x_flowops_event_id: Optional[str] = Header(default=None, alias="X-FlowOps-Event-ID"),
+    x_flowops_timestamp: str | None = Header(default=None, alias="X-FlowOps-Timestamp"),
+    x_flowops_signature: str | None = Header(default=None, alias="X-FlowOps-Signature"),
+    x_flowops_event_id: str | None = Header(default=None, alias="X-FlowOps-Event-ID"),
     body_bytes: bytes = Depends(_read_raw_body),
     session: Session = Depends(db.get_session),
 ) -> dict[str, Any]:
@@ -396,8 +396,8 @@ def trigger_webhook(
     # Parse timestamp
     try:
         timestamp = int(x_flowops_timestamp) if x_flowops_timestamp else 0
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=401, detail="Invalid timestamp.")
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=401, detail="Invalid timestamp.") from exc
 
     # Verify signature
     if not triggers.verify_signature(body_bytes, x_flowops_signature or "", source.secret, timestamp):
@@ -406,8 +406,8 @@ def trigger_webhook(
     # Parse payload
     try:
         payload = json.loads(body_bytes.decode())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        raise HTTPException(status_code=422, detail="Malformed JSON payload.")
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=422, detail="Malformed JSON payload.") from exc
     if not isinstance(payload, dict):
         raise HTTPException(status_code=422, detail="Webhook payload must be a JSON object.")
 
