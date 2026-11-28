@@ -277,6 +277,12 @@ screenshots". This phase is that item, made concrete:
 - [ ] **Deploy a public demo**: small VPS/Fly/Render instance, Postgres,
       `FLOWOPS_AUTH_REQUIRED=true`, seeded demo tenant, read-only demo
       credentials, simulated adapters. HTTPS + the gateway pattern from 2a.
+      *Decision recorded 2026-11-28: Fly.io is the primary target (one app
+      with `[processes]` groups fits the worker/scheduler/timers/outbox
+      topology; `deploy/fly.toml` + `deploy/README.md`), Render is the
+      fallback. Follow-up decision: Fly runs with container-start migrations
+      disabled (six machines would race alembic) — moving "migrations as
+      release step" into the release pipeline properly is still open.*
 - [ ] **Screenshot pack** for the README/portfolio: landing, dashboard,
       command center (runs/definitions/analytics), an approval journey, and
       the analytics page — generated from the deployed demo, stored in-tree

@@ -81,6 +81,42 @@ services:
       retries: 12
       start_period: 8s
 
+  # Hardened single-host deployment (docker compose --profile prod up -d
+  # prod-app). Defaults to production mode, which fails fast at startup until
+  # an Entra identity provider is configured (release gate 2a); see
+  # deploy/README.md for the demo path and the Fly deployment.
+  prod-app:
+    profiles: ["prod"]
+    build: .
+    restart: unless-stopped
+    stop_grace_period: 15s
+    ports:
+      - "${FLOWOPS_BIND_ADDRESS:-127.0.0.1}:${FLOWOPS_APP_PORT:-8000}:8000"
+    environment:
+      <<: *flowops-env
+      FLOWOPS_ENVIRONMENT: ${FLOWOPS_ENVIRONMENT:-production}
+      FLOWOPS_AUTH_REQUIRED: ${FLOWOPS_AUTH_REQUIRED:-true}
+      FLOWOPS_UI_AUTH_REQUIRED: ${FLOWOPS_UI_AUTH_REQUIRED:-true}
+      FLOWOPS_SESSION_COOKIE_SECURE: ${FLOWOPS_SESSION_COOKIE_SECURE:-true}
+      FLOWOPS_RATE_LIMIT_PER_MINUTE: ${FLOWOPS_RATE_LIMIT_PER_MINUTE:-120}
+      FLOWOPS_ACTION_ADAPTER: simulated
+      FLOWOPS_AUTOMATION_ADAPTER: simulated
+      FLOWOPS_AI_ADAPTER: simulated
+      FLOWOPS_RUN_MIGRATIONS: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/ready', timeout=2)"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 8s
+
   worker:
     build: .
     restart: unless-stopped

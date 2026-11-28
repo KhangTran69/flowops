@@ -1,0 +1,53 @@
+# FlowOps public demo on Fly.io.
+#
+# One Fly app runs the whole topology as process groups; every group is
+# scaled to exactly one machine (see deploy/README.md). Secrets are set with
+# `fly secrets set` — they are referenced here by env name only and never
+# committed. All adapters stay simulated; the demo contacts no external
+# system.
+#
+# Migrations are a release step, not a container-start side effect: with
+# several process groups booting concurrently, FLOWOPS_RUN_MIGRATIONS=true
+# would race alembic against itself. Run `alembic upgrade head` once per
+# release (deploy/README.md); a recorded follow-up moves this into the
+# release pipeline properly (ROADMAP Phase 4).
+
+app = "flowops-demo"
+primary_region = "ams"
+
+[build]
+  dockerfile = "../Dockerfile"
+
+[env]
+  FLOWOPS_ENVIRONMENT = "development"
+  FLOWOPS_AUTH_REQUIRED = "true"
+  FLOWOPS_UI_AUTH_REQUIRED = "true"
+  FLOWOPS_SESSION_COOKIE_SECURE = "true"
+  FLOWOPS_RATE_LIMIT_PER_MINUTE = "120"
+  FLOWOPS_ACTION_ADAPTER = "simulated"
+  FLOWOPS_AUTOMATION_ADAPTER = "simulated"
+  FLOWOPS_AI_ADAPTER = "simulated"
+  FLOWOPS_RUN_MIGRATIONS = "false"
+
+[processes]
+  app = "uvicorn src.api:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=*"
+  worker = "python -m src.worker --poll-interval 2"
+  scheduler = "python -m src.scheduler --poll --interval 2"
+  timers = "python -m src.timers --poll --interval 2"
+  outbox = "python -m src.outbox_worker --poll-interval 2"
+  workforce-outbox = "python -m src.workforce_worker"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "15s"
+    method = "GET"
+    path = "/ready"
