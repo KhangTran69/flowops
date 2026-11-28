@@ -401,7 +401,7 @@ def test_worker_recovers_exhausted_lease_without_calling_adapter(client, monkeyp
     adapter = FakeAdapter()
     monkeypatch.setattr(worker, "ACTION_ADAPTER", adapter)
     with db.SessionLocal() as session:
-        row = jobs.enqueue_job(session, job_type=jobs.JOB_ONBOARDING_ITEM,
+        jobs.enqueue_job(session, job_type=jobs.JOB_ONBOARDING_ITEM,
             payload={"request_id": request_id, "item_id": item_id}, max_attempts=1)
         session.commit()
         claimed = jobs.claim_job(session, "abandoned", lease_seconds=1)
