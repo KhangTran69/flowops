@@ -9,6 +9,7 @@ keeps only the blocking poll loop and argument handling.
 from __future__ import annotations
 
 import json
+import logging
 import time
 
 from src.services.connectors import poll_all_connectors
@@ -21,8 +22,8 @@ def run_forever(stop_event=None) -> None:
     while True:
         try:
             poll_all_connectors()
-        except Exception:  # pragma: no cover - defensive daemon guard
-            pass
+        except Exception as error:  # pragma: no cover - defensive daemon guard
+            logging.getLogger(__name__).warning("Connector polling cycle failed: %s", type(error).__name__)
         if stop_event is not None:
             if stop_event.wait(service.POLL_INTERVAL_SECONDS):
                 return

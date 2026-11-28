@@ -173,3 +173,40 @@ def test_deliver_outbox_notification_revalidates_trigger_destinations(fresh_db, 
         assert delivered["url"] == "https://hooks.example/x"
     finally:
         session.close()
+
+
+class _PollResponse:
+    def __init__(self, chunks, status=200):
+        self.chunks = chunks
+        self.status_code = status
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.closed = True
+
+    def raise_for_status(self):
+        pass
+
+    def iter_content(self, **_):
+        yield from self.chunks
+
+
+@pytest.mark.parametrize("response, message", [
+    (_PollResponse([b'{"issues":[]}'], 302), "not successful"),
+    (_PollResponse([b"x" * (connectors.MAX_POLL_RESPONSE_BYTES + 1)]), "size limit"),
+    (_PollResponse([b'{"issues":{}}']), "page shape"),
+    (_PollResponse([b'{"issues":[null]}']), "invalid or excessive"),
+])
+def test_poll_response_is_bounded_and_closed(response, message):
+    with pytest.raises(ValueError, match=message):
+        connectors._read_poll_records(response, "issues")
+    assert response.closed
+
+
+def test_poll_response_success_is_closed():
+    response = _PollResponse([b'{"issues":[{"id":"42"}]}'])
+    assert connectors._read_poll_records(response, "issues") == [{"id": "42"}]
+    assert response.closed

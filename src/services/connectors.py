@@ -56,6 +56,7 @@ from urllib.parse import urlsplit
 import requests
 from fastapi import HTTPException
 from sqlalchemy import or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src import db, expressions, scheduler
@@ -67,6 +68,28 @@ from src.schemas import OnboardingRequestIn
 # ---------------------------------------------------------------------------
 
 MAX_EVENT_PAYLOAD_BYTES = 64 * 1024
+MAX_POLL_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_POLL_RECORDS = 50
+
+
+def _read_poll_records(response: requests.Response, field: str) -> list[dict[str, Any]]:
+    """Accept only bounded successful JSON provider pages, not redirects."""
+    with response:
+        response.raise_for_status()
+        if not 200 <= response.status_code < 300:
+            raise ValueError("Connector response was not successful.")
+        data = bytearray()
+        for chunk in response.iter_content(chunk_size=65536):
+            if len(data) + len(chunk) > MAX_POLL_RESPONSE_BYTES:
+                raise ValueError("Connector response exceeds the configured size limit.")
+            data.extend(chunk)
+        page = json.loads(data)
+        if not isinstance(page, dict) or not isinstance(page.get(field), list):
+            raise ValueError("Connector response has an invalid page shape.")
+        records = page[field]
+        if len(records) > MAX_POLL_RECORDS or not all(isinstance(row, dict) for row in records):
+            raise ValueError("Connector response has invalid or excessive records.")
+        return records
 
 
 @dataclass(frozen=True)
@@ -160,11 +183,13 @@ class JiraConnector(SourceConnector):
             auth=(self.email, self.api_token),
             params={"jql": self.jql, "maxResults": 50},
             timeout=15,
+            stream=True,
             allow_redirects=False,
         )
-        response.raise_for_status()
         events = []
-        for issue in response.json().get("issues", []):
+        for issue in _read_poll_records(response, "issues"):
+            if not issue.get("id"):
+                raise ValueError("Jira record has no stable identity.")
             fields = issue.get("fields", {})
             events.append(
                 NormalizedEvent(
@@ -201,11 +226,13 @@ class ServiceNowConnector(SourceConnector):
             headers={"Accept": "application/json"},
             params={"sysparm_limit": 50, "sysparm_orderby": "sys_updated_on:DESC"},
             timeout=15,
+            stream=True,
             allow_redirects=False,
         )
-        response.raise_for_status()
         events = []
-        for rec in response.json().get("result", []):
+        for rec in _read_poll_records(response, "result"):
+            if not (rec.get("number") or rec.get("sys_id")):
+                raise ValueError("ServiceNow record has no stable identity.")
             events.append(
                 NormalizedEvent(
                     source=self.name,
@@ -928,8 +955,21 @@ def ingest_event(session: Session, event: NormalizedEvent) -> dict[str, Any]:
         tenant_key=event.tenant_key,
         connector_id=event.connector_id,
     )
-    session.add(row)
-    session.flush()
+    # A simultaneous poll/webhook may insert the same fingerprint between
+    # our initial read and flush. Resolve that conflict in a savepoint, not
+    # by rolling back unrelated work in the caller's transaction.
+    try:
+        with session.begin_nested():
+            session.add(row)
+            session.flush()
+    except IntegrityError:
+        existing = session.execute(
+            select(db.EventRecord).where(db.EventRecord.fingerprint == fingerprint)
+        ).scalar_one_or_none()
+        if existing is None:
+            raise
+        return {"fingerprint": fingerprint, "event_id": existing.id,
+                "duplicate": True, "triggers_fired": []}
 
     fired = evaluate_triggers(session, event, row)
 
@@ -965,14 +1005,14 @@ def ingest_events(session: Session, events: list[NormalizedEvent]) -> list[dict[
                 run_id=_new_run_id(),
                 action="connector.event_failed",
                 status="failure",
-                detail=f"{event.fingerprint()}: {type(error).__name__}: {error}",
+                detail=f"{event.fingerprint()}: {type(error).__name__}",
             )
             results.append(
                 {
                     "fingerprint": event.fingerprint(),
                     "event_id": None,
                     "duplicate": False,
-                    "error": f"{type(error).__name__}: {error}",
+                    "error": f"{type(error).__name__}: event processing failed.",
                     "triggers_fired": [],
                 }
             )
@@ -1083,59 +1123,67 @@ def poll_all_connectors(
     finally:
         session.close()
 
-    for record in records:
+    for candidate in records:
         session = db.SessionLocal()
         try:
-            # Re-attach inside this connector's own session: `records` came
-            # from a session that is already closed, and mutating a detached
-            # instance would silently never reach the database.
-            record = session.get(db.ConnectorRecord, record.id)
-            if record is None or not record.enabled:
+            # PostgreSQL locks one connector at a time; recheck due state
+            # after claiming it so competing pollers do not fetch twice.
+            query = select(db.ConnectorRecord).where(
+                db.ConnectorRecord.id == candidate.id,
+                db.ConnectorRecord.enabled.is_(True),
+                db.ConnectorRecord.kind == "polling",
+            )
+            if tenant_key is not None:
+                query = query.where(db.ConnectorRecord.tenant_key == tenant_key)
+            if session.get_bind().dialect.name == "postgresql":
+                query = query.with_for_update(skip_locked=True)
+            record = session.execute(query).scalar_one_or_none()
+            if record is None or (only_due and not connector_due(record, at)):
                 continue
-            connector = build_connector(
-                record.connector_type,
-                json.loads(record.config_json or "{}"),
-                tenant_key=record.tenant_key,
-            )
-            events = connector.fetch_events(session)
-            events = [
-                NormalizedEvent(
-                    source=event.source,
-                    event_type=event.event_type,
-                    external_id=event.external_id,
-                    payload=event.payload,
-                    tenant_key=record.tenant_key or event.tenant_key,
-                    connector_id=record.id,
-                    title=event.title,
-                    description=event.description,
+            try:
+                with session.begin_nested():
+                    if record.tenant_key:
+                        tenant = session.get(db.TenantRecord, record.tenant_key)
+                        if tenant is None or not tenant.active:
+                            raise ValueError("Connector tenant is missing or inactive.")
+                    connector = build_connector(
+                        record.connector_type,
+                        json.loads(record.config_json or "{}"),
+                        tenant_key=record.tenant_key,
+                    )
+                    events = connector.fetch_events(session)
+                    events = [
+                        NormalizedEvent(
+                            source=event.source, event_type=event.event_type,
+                            external_id=event.external_id, payload=event.payload,
+                            tenant_key=record.tenant_key, connector_id=record.id,
+                            title=event.title, description=event.description,
+                        )
+                        for event in events
+                    ]
+                    summaries = ingest_events(session, events)
+                    ingested = sum(1 for s in summaries if not s["duplicate"] and "error" not in s)
+                    failed = sum(1 for s in summaries if "error" in s)
+                    state = _poll_state(record)
+                    state["failures"] = min(32, state["failures"] + 1) if failed else 0
+                    state["last_batch"] = len(events)
+                    record.cursor_json = json.dumps(state)
+                    record.last_polled_at = at
+                session.commit()
+                count += ingested
+            except Exception as error:
+                # Roll back only the savepoint; keep the claim until the
+                # failure/backoff state has been persisted.
+                state = _poll_state(record)
+                state["failures"] = min(32, state["failures"] + 1)
+                record.last_polled_at = at
+                record.cursor_json = json.dumps(state)
+                db.log_execution(
+                    session, run_id=_new_run_id(), action="connector.poll_failed",
+                    status="failure",
+                    detail=f"connector={record.id} ({record.connector_type}): {type(error).__name__}",
                 )
-                for event in events
-            ]
-            summaries = ingest_events(session, events)
-            ingested = sum(
-                1 for s in summaries if not s["duplicate"] and "error" not in s
-            )
-            record.last_polled_at = at
-            record.cursor_json = json.dumps(
-                {"failures": 0, "last_batch": len(events)}
-            )
-            session.commit()
-            count += ingested
-        except Exception as error:
-            session.rollback()
-            state = _poll_state(record)
-            state["failures"] += 1
-            record.last_polled_at = at
-            record.cursor_json = json.dumps(state)
-            db.log_execution(
-                session,
-                run_id=_new_run_id(),
-                action="connector.poll_failed",
-                status="failure",
-                detail=f"connector={record.id} ({record.connector_type}): "
-                f"{type(error).__name__}: {error}",
-            )
-            session.commit()
+                session.commit()
         finally:
             session.close()
     return count
