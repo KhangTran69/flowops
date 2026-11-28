@@ -72,3 +72,48 @@ def test_postgres_concurrent_poll_claims_fetch_once(database, monkeypatch):
         assert first.result(timeout=10) == 1
     assert calls == [1]
     assert connectors.poll_all_connectors(at) == 0
+
+
+def test_page_checkpoint_replays_after_partial_failure(database, monkeypatch):
+    import json
+    from datetime import datetime, timezone
+
+    with db.SessionLocal() as session:
+        record = db.ConnectorRecord(name="Paged", connector_type="jira", kind="polling",
+            enabled=True, config_json="{}")
+        session.add(record)
+        session.commit()
+        record_id = record.id
+    calls = []
+
+    class Paged:
+        def fetch_page(self, session, cursor):
+            calls.append(cursor)
+            if cursor is None:
+                return [connectors.NormalizedEvent("jira", "issue_updated", key, {}) for key in ("a", "b")], "next"
+            return [connectors.NormalizedEvent("jira", "issue_updated", "c", {})], None
+
+    real_ingest = connectors.ingest_event
+    failed = False
+
+    def flaky(session, event):
+        nonlocal failed
+        if event.external_id == "b" and not failed:
+            failed = True
+            raise RuntimeError("synthetic page failure")
+        return real_ingest(session, event)
+
+    monkeypatch.setattr(connectors, "build_connector", lambda *a, **kw: Paged())
+    monkeypatch.setattr(connectors, "ingest_event", flaky)
+    at = datetime.now(timezone.utc)
+    assert connectors.poll_all_connectors(at, only_due=False) == 1
+    with db.SessionLocal() as session:
+        assert json.loads(session.get(db.ConnectorRecord, record_id).cursor_json)["cursor"] is None
+    assert connectors.poll_all_connectors(at, only_due=False) == 1
+    with db.SessionLocal() as session:
+        assert json.loads(session.get(db.ConnectorRecord, record_id).cursor_json)["cursor"] == "next"
+    assert connectors.poll_all_connectors(at, only_due=False) == 1
+    assert calls == [None, None, "next"]
+    with db.SessionLocal() as session:
+        assert json.loads(session.get(db.ConnectorRecord, record_id).cursor_json)["cursor"] is None
+        assert len(session.execute(select(db.EventRecord)).scalars().all()) == 3

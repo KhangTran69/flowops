@@ -72,7 +72,7 @@ MAX_POLL_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_POLL_RECORDS = 50
 
 
-def _read_poll_records(response: requests.Response, field: str) -> list[dict[str, Any]]:
+def _read_poll_page(response: requests.Response, field: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Accept only bounded successful JSON provider pages, not redirects."""
     with response:
         response.raise_for_status()
@@ -89,7 +89,11 @@ def _read_poll_records(response: requests.Response, field: str) -> list[dict[str
         records = page[field]
         if len(records) > MAX_POLL_RECORDS or not all(isinstance(row, dict) for row in records):
             raise ValueError("Connector response has invalid or excessive records.")
-        return records
+        return records, page
+
+
+def _read_poll_records(response: requests.Response, field: str) -> list[dict[str, Any]]:
+    return _read_poll_page(response, field)[0]
 
 
 @dataclass(frozen=True)
@@ -157,6 +161,10 @@ class SourceConnector:
         """Return new events since the last poll. Webhook sources: []."""
         raise NotImplementedError
 
+    def fetch_page(self, session: Session, cursor: str | None) -> tuple[list[NormalizedEvent], str | None]:
+        """One resumable page; older adapters retain their single-page contract."""
+        return self.fetch_events(session), None
+
     def verify_webhook(self, request, body: bytes) -> bool:
         """Authenticate a webhook delivery at the transport level."""
         return True  # route-level API-key auth is the baseline guarantee
@@ -178,16 +186,31 @@ class JiraConnector(SourceConnector):
         self.jql = jql
 
     def fetch_events(self, session: Session) -> list[NormalizedEvent]:
+        return self.fetch_page(session, None)[0]
+
+    def fetch_page(self, session: Session, cursor: str | None) -> tuple[list[NormalizedEvent], str | None]:
+        params: dict[str, str | int] = {
+            "jql": self.jql, "maxResults": MAX_POLL_RECORDS,
+            "fields": "summary,status,priority,assignee,description",
+        }
+        if cursor:
+            params["nextPageToken"] = cursor
         response = requests.get(
-            f"{self.base_url}/rest/api/3/search",
+            f"{self.base_url}/rest/api/3/search/jql",
             auth=(self.email, self.api_token),
-            params={"jql": self.jql, "maxResults": 50},
+            params=params,
             timeout=15,
             stream=True,
             allow_redirects=False,
         )
         events = []
-        for issue in _read_poll_records(response, "issues"):
+        records, page = _read_poll_page(response, "issues")
+        next_cursor = page.get("nextPageToken")
+        if page.get("isLast") is True:
+            next_cursor = None
+        elif not isinstance(next_cursor, str) or not next_cursor or len(next_cursor) > 8192 or next_cursor == cursor:
+            raise ValueError("Jira returned an invalid continuation token.")
+        for issue in records:
             if not issue.get("id"):
                 raise ValueError("Jira record has no stable identity.")
             fields = issue.get("fields", {})
@@ -203,10 +226,10 @@ class JiraConnector(SourceConnector):
                         "assignee": (fields.get("assignee") or {}).get("emailAddress"),
                     },
                     title=f"Jira {issue.get('key')}: {fields.get('summary', '')}".strip(),
-                    description=fields.get("description") or "",
+                    description=(fields.get("description") if isinstance(fields.get("description"), str) else "") or "",
                 )
             )
-        return events
+        return events, next_cursor
 
 
 class ServiceNowConnector(SourceConnector):
@@ -220,17 +243,32 @@ class ServiceNowConnector(SourceConnector):
         self.password = password
 
     def fetch_events(self, session: Session) -> list[NormalizedEvent]:
+        return self.fetch_page(session, None)[0]
+
+    def fetch_page(self, session: Session, cursor: str | None) -> tuple[list[NormalizedEvent], str | None]:
+        # Keyset scan, not offset pagination: inserts/deletions cannot shift
+        # the next page. Existing event identity remains the incident number.
+        if cursor is not None and not re.fullmatch(r"[0-9a-f]{32}", cursor):
+            raise ValueError("Invalid ServiceNow continuation key.")
+        query = "ORDERBYsys_id" if cursor is None else f"sys_id>{cursor}^ORDERBYsys_id"
         response = requests.get(
             f"{self.instance_url}/api/now/table/incident",
             auth=(self.username, self.password),
             headers={"Accept": "application/json"},
-            params={"sysparm_limit": 50, "sysparm_orderby": "sys_updated_on:DESC"},
+            params={"sysparm_limit": MAX_POLL_RECORDS, "sysparm_query": query,
+                    "sysparm_fields": "sys_id,number,state,severity,assigned_to,short_description,description"},
             timeout=15,
             stream=True,
             allow_redirects=False,
         )
         events = []
-        for rec in _read_poll_records(response, "result"):
+        records = _read_poll_records(response, "result")
+        previous = cursor or ""
+        for rec in records:
+            key = rec.get("sys_id")
+            if not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{32}", key) or key <= previous:
+                raise ValueError("ServiceNow returned an invalid or unordered continuation key.")
+            previous = key
             if not (rec.get("number") or rec.get("sys_id")):
                 raise ValueError("ServiceNow record has no stable identity.")
             events.append(
@@ -248,7 +286,7 @@ class ServiceNowConnector(SourceConnector):
                     description=rec.get("description") or "",
                 )
             )
-        return events
+        return events, previous if len(records) == MAX_POLL_RECORDS else None
 
 
 class SlackConnector(SourceConnector):
@@ -1061,7 +1099,7 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def _poll_state(record: "db.ConnectorRecord") -> dict[str, int]:
+def _poll_state(record: "db.ConnectorRecord") -> dict[str, Any]:
     try:
         state = json.loads(record.cursor_json or "{}")
     except (TypeError, ValueError):
@@ -1071,6 +1109,8 @@ def _poll_state(record: "db.ConnectorRecord") -> dict[str, int]:
     return {
         "failures": max(0, _safe_int(state.get("failures"))),
         "last_batch": max(0, _safe_int(state.get("last_batch"))),
+        "cursor": state.get("cursor") if isinstance(state.get("cursor"), str) else None,
+        "config_digest": state.get("config_digest"),
     }
 
 
@@ -1166,7 +1206,14 @@ def poll_all_connectors(
                         json.loads(record.config_json or "{}"),
                         tenant_key=record.tenant_key,
                     )
-                    events = connector.fetch_events(session)
+                    state = _poll_state(record)
+                    config_digest = hashlib.sha256((record.config_json or "{}").encode()).hexdigest()
+                    cursor = state["cursor"] if state["config_digest"] == config_digest else None
+                    fetch_page = getattr(connector, "fetch_page", None)
+                    if fetch_page is None:
+                        events, next_cursor = connector.fetch_events(session), None
+                    else:
+                        events, next_cursor = fetch_page(session, cursor)
                     events = [
                         NormalizedEvent(
                             source=event.source, event_type=event.event_type,
@@ -1179,7 +1226,10 @@ def poll_all_connectors(
                     summaries = ingest_events(session, events)
                     ingested = sum(1 for s in summaries if not s["duplicate"] and "error" not in s)
                     failed = sum(1 for s in summaries if "error" in s)
-                    state = _poll_state(record)
+                    # Successful rows commit even if a peer fails. In that case
+                    # replay the same page and let event fingerprints dedupe.
+                    state["cursor"] = cursor if failed else next_cursor
+                    state["config_digest"] = config_digest
                     state["failures"] = min(32, state["failures"] + 1) if failed else 0
                     state["last_batch"] = len(events)
                     record.cursor_json = json.dumps(state)

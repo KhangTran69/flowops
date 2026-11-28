@@ -210,3 +210,46 @@ def test_poll_response_success_is_closed():
     response = _PollResponse([b'{"issues":[{"id":"42"}]}'])
     assert connectors._read_poll_records(response, "issues") == [{"id": "42"}]
     assert response.closed
+
+
+def test_jira_continuation_token_and_existing_identity(monkeypatch):
+    import json
+
+    calls = []
+    pages = [
+        {"issues": [{"id": "42", "fields": {}}], "isLast": False, "nextPageToken": "page-two"},
+        {"issues": [{"id": "43", "fields": {}}], "isLast": True},
+    ]
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs))
+        return _PollResponse([json.dumps(pages.pop(0)).encode()])
+
+    monkeypatch.setattr(connectors.requests, "get", get)
+    connector = connectors.JiraConnector("https://jira.example", "test", "test", "project = OPS")
+    first, cursor = connector.fetch_page(None, None)
+    second, end = connector.fetch_page(None, cursor)
+    assert [first[0].external_id, second[0].external_id] == ["42", "43"]
+    assert cursor == "page-two" and end is None
+    assert calls[0][0].endswith("/rest/api/3/search/jql")
+    assert calls[1][1]["params"]["nextPageToken"] == cursor
+    assert calls[1][1]["allow_redirects"] is False
+
+
+def test_servicenow_keyset_page(monkeypatch):
+    import json
+
+    calls = []
+    rows = [{"sys_id": f"{i:032x}", "number": f"INC{i}"} for i in range(1, 51)]
+
+    def get(url, **kwargs):
+        calls.append(kwargs["params"])
+        return _PollResponse([json.dumps({"result": rows if len(calls) == 1 else []}).encode()])
+
+    monkeypatch.setattr(connectors.requests, "get", get)
+    connector = connectors.ServiceNowConnector("https://snow.example", "test", "test")
+    first, cursor = connector.fetch_page(None, None)
+    assert len(first) == 50 and first[0].external_id == "INC1"
+    assert cursor == f"{50:032x}"
+    assert connector.fetch_page(None, cursor) == ([], None)
+    assert calls[1]["sysparm_query"] == f"sys_id>{cursor}^ORDERBYsys_id"
