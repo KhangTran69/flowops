@@ -147,3 +147,10 @@ timeout); overlapping preflight releases fail before migrating. This is not
 a substitute for an approved maintenance window: manual Alembic invocations
 do not participate in this lock. Public rollout remains blocked until the
 real identity, staging and accessibility gates have been satisfied.
+
+Protected preflight requires a positive integer admission limit (1–100000)
+before any schema migration. Pair the protected release with the shared
+PostgreSQL limiter from #92; ensure all replicas use the same value and
+migrate the counter table before serving traffic. Retain a separate ingress
+abuse limit and readiness monitor; API admission failures can also make the
+authenticated metrics scrape unavailable. No public release is approved.

@@ -11,7 +11,7 @@ review or authorization to merge or deploy.
 | 87 | 1ac04ca08b80a68a005409e37ea415762582dbeb |
 | 91 | dbb515815b0b6db02da4210715444a4a45f3034f |
 | 84 | 139924691fbde1f2fe0016c9e02e81b4dc554cb6 |
-| 89 | 0e34aab89c808762b3c6c05b07b9f8ecb67aed2c |
+| 89 | a0a1fad6f20557b475dd2f1f7fb69d747275bb0c |
 | 90 | 9e411c961000831f179270f4011be11e72cb33e4 |
 
 Shared recovery #86 is included in #89's selected script. CI retains the
@@ -46,3 +46,7 @@ new admission alert and includes both PostgreSQL test modules. Review #92
 before final release; old workers must be drained before any migration
 rollback. Production browser identity remains disabled. The previously
 validated combined head 70f28c7 passed 12/12 with 37 PostgreSQL tests.
+
+Protected release preflight now rejects absent, disabled or invalid rate
+limits before invoking migrations. Shared admission remains a prerequisite
+for protected deployment, not approval to expose the service publicly.
