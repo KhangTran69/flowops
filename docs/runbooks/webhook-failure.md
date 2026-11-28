@@ -33,3 +33,12 @@ five minutes of sustained expired ownership. The threshold is provisional.
 Check dispatcher health, database reachability and receiver-side delivery
 evidence before retrying. A zero gauge does not prove all external deliveries
 succeeded.
+
+Each claim now durably counts one delivery attempt before the network call.
+Abandoned leases consume that budget; once exhausted, a due abandoned row
+is dead-lettered without another send. A new explicit requeue grants one
+additional attempt, not an erased history. Before upgrading workers, drain
+or reconcile all old in-flight leases: pre-upgrade workers counted at
+finalization, so mixed versions cannot guarantee exact attempt accounting.
+Malformed persisted notification envelopes are dead-lettered with a static
+diagnostic, not sent or allowed to crash the dispatcher.
