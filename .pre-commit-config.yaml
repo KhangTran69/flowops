@@ -1,0 +1,26 @@
+# Local mirror of what CI already checks (see the lint job in
+# .github/workflows/ci.yml).
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # Tracks the ruff pin in requirements-dev.txt (currently 0.17.6).
+    rev: v0.17.6
+    hooks:
+      - id: ruff
+        # Same scope as CI's `ruff check src tests scripts`.
+        files: ^(src|tests|scripts)/
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    # Latest stable tag.
+    rev: v6.0.0
+    hooks:
+      # CI byte-diffs tests/openapi_snapshot.json; a whitespace "fix" would fail that diff.
+      - id: trailing-whitespace
+        exclude: ^tests/openapi_snapshot\.json$
+      # CI byte-diffs tests/openapi_snapshot.json against a fresh re-dump
+      # (scripts/dump_openapi.py); an EOF newline "fix" would fail that diff.
+      - id: end-of-file-fixer
+        exclude: ^tests/openapi_snapshot\.json$
+      - id: check-yaml
+      # Same byte-diff concern: the generated snapshot must stay untouched.
+      - id: check-json
+        exclude: ^tests/openapi_snapshot\.json$
+      - id: check-merge-conflict

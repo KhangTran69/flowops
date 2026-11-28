@@ -66,7 +66,14 @@ Configuration lives in `pyproject.toml` (`[tool.ruff]`). The rules are
 `E,F,I,B,UP` with `line-length = 140` and `target-version = "py310"` — py310
 matches the repo's Python floor, and 140 keeps the existing dense line style
 instead of reformatting the codebase. CI runs this in a blocking `lint` job;
-a failing `ruff check` fails the PR.
+a failing `ruff check` fails the PR. The same checks run locally via
+pre-commit (`.pre-commit-config.yaml`): `pip install pre-commit && pre-commit install`.
+
+Type checks: `mypy src/definitions.py src/expressions.py src/graph.py
+src/jobs.py src/outbox.py src/ticket_processor.py` — configuration lives in
+`pyproject.toml` (`[tool.mypy]`, py310 floor). CI runs this in a blocking
+`typecheck` job; the allowlist is a ratchet: a new module joins only when it
+already passes mypy clean.
 
 ## Conventions for changes
 - Schema changes go through a new Alembic revision; never edit existing migrations or the baseline. SQLite also gets the additive column via `_add_missing_columns()` in `src/db.py`.
