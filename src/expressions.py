@@ -272,7 +272,8 @@ class _Parser:
     def parse_list(self) -> list[Evaluator]:
         self.expect("lbracket")
         items: list[Evaluator] = []
-        if self.peek() is not None and self.peek().kind == "rbracket":
+        peeked = self.peek()
+        if peeked is not None and peeked.kind == "rbracket":
             self.index += 1
             return items
         while True:
@@ -302,7 +303,7 @@ class _Parser:
         if token.kind == "literal":
             self.index += 1
             value = token.value
-            return lambda scope, value=value: value
+            return lambda scope, value=value: value  # type: ignore[misc]  # mypy can't infer default-arg lambdas
         if token.kind == "ident":
             self.index += 1
             path = token.value
@@ -311,7 +312,7 @@ class _Parser:
             return _path_lookup(path)
         if token.kind == "keyword" and token.value in {"true", "false", "null"}:
             self.index += 1
-            return lambda scope, value=token.value: _keyword_value(token.value)
+            return lambda scope, value=token.value: _keyword_value(token.value)  # type: ignore[misc]  # mypy can't infer default-arg lambdas
         raise ExpressionError(
             f"Unexpected token {token.value!r} at position {token.position}."
         )

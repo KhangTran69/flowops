@@ -11,6 +11,7 @@ import os
 import re
 import threading
 from datetime import datetime, timezone
+from typing import cast
 
 from sqlalchemy import (
     Boolean,
@@ -19,6 +20,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Table,
     Text,
     UniqueConstraint,
     create_engine,
@@ -696,7 +698,7 @@ def _ensure_workforce_indexes() -> None:
         WorkforceAutomationEventRecord,
         WorkforceReminderRecord,
     ):
-        for index in model.__table__.indexes:
+        for index in cast(Table, model.__table__).indexes:
             index.create(engine, checkfirst=True)
 
 

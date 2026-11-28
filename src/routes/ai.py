@@ -289,5 +289,3 @@ def _chatops_action(
         "status": item.status,
         "actor": actor,
     }
-
-
