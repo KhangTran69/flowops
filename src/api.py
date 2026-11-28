@@ -108,6 +108,9 @@ async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
     ui_session.validate_ui_auth_configuration()
     validate_webhook_configuration()
     validate_workforce_integration_configuration()
+    from src import rate_limit
+
+    rate_limit.validate_configuration()
     yield
 
 app = FastAPI(
@@ -278,6 +281,9 @@ def metrics_endpoint(
         lines.append(f'flowops_http_request_duration_seconds_count{{{labels}}} {total}')
         lines.append(f'flowops_http_request_duration_seconds_sum{{{labels}}} {seconds}')
 
+    from src import rate_limit
+
+    lines.extend(rate_limit.metric_lines())
     job_rows = session.execute(
         select(db.WorkflowJobRecord.status, func.count(), func.coalesce(func.sum(db.WorkflowJobRecord.attempts), 0))
         .group_by(db.WorkflowJobRecord.status)

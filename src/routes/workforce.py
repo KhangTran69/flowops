@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from src import db, ui_session, web
 from src.auth import Actor
-from src.deps import _actor_from_header, _enforce_csrf
+from src.deps import _actor_from_header, _enforce_actor_rate_limit, _enforce_csrf, _enforce_rate_limit
 
 router = APIRouter(prefix="/workforce", tags=["employee onboarding and IT assets"])
 
@@ -58,6 +58,7 @@ def role_actor(*required: str):
                     raise HTTPException(403, "The authenticated tenant is missing or inactive.")
             elif actor.source != "local" and "AUTOMATION.ADMIN" not in roles:
                 raise HTTPException(403, "A tenant context is required for workforce access.")
+            _enforce_actor_rate_limit(actor)
             return actor
         raise HTTPException(403, "One of these roles is required: " + ", ".join(sorted(allowed)))
 
@@ -834,8 +835,9 @@ def provisioning_callback(payload: CallbackIn,
     x_flowops_automation_key: str | None = Header(None, alias="X-FlowOps-Automation-Key"),
     session: Session = Depends(db.get_session)):
     secret = os.environ.get("FLOWOPS_AUTOMATION_CALLBACK_SECRET", "")
-    if not secret or not hmac.compare_digest(x_flowops_automation_key or "", secret):
+    if not secret or not hmac.compare_digest((x_flowops_automation_key or "").encode(), secret.encode()):
         raise HTTPException(401, "Invalid automation callback credential.")
+    _enforce_rate_limit("webhook:workforce-callback")
     event = _locked_automation_event(session, payload.eventId)
     if event is None:
         raise HTTPException(404, "Automation event not found.")
@@ -992,8 +994,9 @@ def workforce_dashboard(actor: Actor = Depends(role_actor("HR", "MANAGER", "IT_A
 
 def _integration_key(supplied: str | None) -> None:
     expected = os.environ.get("FLOWOPS_N8N_API_KEY", "")
-    if not expected or not hmac.compare_digest(supplied or "", expected):
+    if not expected or not hmac.compare_digest((supplied or "").encode(), expected.encode()):
         raise HTTPException(401, "Invalid automation API credential.")
+    _enforce_rate_limit("webhook:workforce-integration")
 
 
 @router.get("/integration/overdue-tasks")

@@ -759,6 +759,15 @@ def log_execution(
     )
 
 
+class RateLimitBucketRecord(Base):
+    """Shared fixed-window admission counter (no raw actor identities)."""
+
+    __tablename__ = "rate_limit_buckets"
+    digest: Mapped[str] = mapped_column(String(64), primary_key=True)
+    window_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    count: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
 class RevokedUISessionRecord(Base):
     """A revoked signed session, retained until its maximum validity ends."""
 
