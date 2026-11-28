@@ -174,16 +174,33 @@ class SourceConnector:
         raise NotImplementedError
 
 
+def _revision_identity(object_id: str, revision: str) -> str:
+    """Separate namespace for opt-in observed object revisions."""
+    return "revision:" + hashlib.sha256(json.dumps(
+        [object_id, revision], separators=(",", ":")
+    ).encode()).hexdigest()
+
+
+def _jira_revision(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("Jira revision timestamp missing.")
+    updated = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if updated.tzinfo is None:
+        raise ValueError("Jira revision timestamp requires timezone.")
+    return updated.astimezone(timezone.utc).isoformat()
+
+
 class JiraConnector(SourceConnector):
     """Polls the Jira REST search API using a saved JQL query."""
 
     name = "jira"
 
-    def __init__(self, base_url: str, email: str, api_token: str, jql: str) -> None:
+    def __init__(self, base_url: str, email: str, api_token: str, jql: str, track_updates: bool = False) -> None:
         self.base_url = base_url.rstrip("/")
         self.email = email
         self.api_token = api_token
         self.jql = jql
+        self.track_updates = track_updates
 
     def fetch_events(self, session: Session) -> list[NormalizedEvent]:
         return self.fetch_page(session, None)[0]
@@ -191,7 +208,7 @@ class JiraConnector(SourceConnector):
     def fetch_page(self, session: Session, cursor: str | None) -> tuple[list[NormalizedEvent], str | None]:
         params: dict[str, str | int] = {
             "jql": self.jql, "maxResults": MAX_POLL_RECORDS,
-            "fields": "summary,status,priority,assignee,description",
+            "fields": "summary,status,priority,assignee,description,updated",
         }
         if cursor:
             params["nextPageToken"] = cursor
@@ -214,12 +231,15 @@ class JiraConnector(SourceConnector):
             if not issue.get("id"):
                 raise ValueError("Jira record has no stable identity.")
             fields = issue.get("fields", {})
+            object_id = str(issue["id"])
+            revision = _jira_revision(fields.get("updated")) if self.track_updates else None
             events.append(
                 NormalizedEvent(
                     source=self.name,
-                    event_type="issue_updated",
-                    external_id=str(issue["id"]),
+                    event_type="issue_revision_observed" if revision else "issue_updated",
+                    external_id=_revision_identity(object_id, revision) if revision else object_id,
                     payload={
+                        **({"object_id": object_id, "revision": revision} if revision else {}),
                         "key": issue.get("key"),
                         "status": (fields.get("status") or {}).get("name"),
                         "priority": (fields.get("priority") or {}).get("name"),
@@ -237,10 +257,11 @@ class ServiceNowConnector(SourceConnector):
 
     name = "servicenow"
 
-    def __init__(self, instance_url: str, username: str, password: str) -> None:
+    def __init__(self, instance_url: str, username: str, password: str, track_updates: bool = False) -> None:
         self.instance_url = instance_url.rstrip("/")
         self.username = username
         self.password = password
+        self.track_updates = track_updates
 
     def fetch_events(self, session: Session) -> list[NormalizedEvent]:
         return self.fetch_page(session, None)[0]
@@ -256,7 +277,7 @@ class ServiceNowConnector(SourceConnector):
             auth=(self.username, self.password),
             headers={"Accept": "application/json"},
             params={"sysparm_limit": MAX_POLL_RECORDS, "sysparm_query": query,
-                    "sysparm_fields": "sys_id,number,state,severity,assigned_to,short_description,description"},
+                    "sysparm_fields": "sys_id,number,state,severity,assigned_to,short_description,description,sys_mod_count,sys_updated_on"},
             timeout=15,
             stream=True,
             allow_redirects=False,
@@ -271,12 +292,21 @@ class ServiceNowConnector(SourceConnector):
             previous = key
             if not (rec.get("number") or rec.get("sys_id")):
                 raise ValueError("ServiceNow record has no stable identity.")
+            revision = None
+            if self.track_updates:
+                count = str(rec.get("sys_mod_count", ""))
+                updated = rec.get("sys_updated_on")
+                if not re.fullmatch(r"[0-9]{1,20}", count) or not isinstance(updated, str):
+                    raise ValueError("ServiceNow revision fields missing or invalid.")
+                updated_at = datetime.strptime(updated, "%Y-%m-%d %H:%M:%S")
+                revision = f"{int(count)}:{updated_at.isoformat()}"
             events.append(
                 NormalizedEvent(
                     source=self.name,
-                    event_type="incident_updated",
-                    external_id=str(rec.get("number") or rec.get("sys_id")),
+                    event_type="incident_revision_observed" if revision else "incident_updated",
+                    external_id=_revision_identity(key, revision) if revision else str(rec.get("number") or key),
                     payload={
+                        **({"object_id": key, "revision": revision} if revision else {}),
                         "number": rec.get("number"),
                         "state": rec.get("state"),
                         "severity": rec.get("severity"),
@@ -498,6 +528,9 @@ def validate_connector_config(
 ) -> None:
     """Check server-controlled credential references and outbound host policy."""
     values = environ if environ is not None else os.environ
+    if "track_updates" in config and (connector_type not in {"jira", "servicenow"}
+                                      or not isinstance(config["track_updates"], bool)):
+        raise ValueError("track_updates must be boolean and is supported only for Jira and ServiceNow.")
     for key in CONNECTOR_SECRET_SUFFIXES.get(connector_type, {}):
         expected = _connector_secret_env_name(connector_type, key, tenant_key)
         if config.get(key) != expected:
@@ -558,6 +591,8 @@ def build_connector(
             kwargs[key[: -len("_env")]] = value
         else:
             kwargs[key] = config[key]
+    if connector_type in {"jira", "servicenow"}:
+        kwargs["track_updates"] = config.get("track_updates", False)
     return cls(**kwargs)
 
 

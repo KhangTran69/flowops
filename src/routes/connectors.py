@@ -248,6 +248,8 @@ def update_connector(
     _validate_connector_config(
         payload.connector_type, payload.config, payload.tenant_key
     )
+    if record.tenant_key != payload.tenant_key or record.connector_type != payload.connector_type:
+        raise HTTPException(409, "Connector tenant and provider type are immutable; create a new connector.")
     record.name = payload.name
     record.connector_type = payload.connector_type
     record.kind = cls.kind
