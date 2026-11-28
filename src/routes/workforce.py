@@ -909,6 +909,8 @@ def retry_event(event_id: str, actor: Actor = Depends(role_actor("IT_ADMIN")), s
                         and _is_before(event.delivered_at, db.utcnow() - CALLBACK_TIMEOUT))
     if event.delivery_status != "FAILED" and event.workflow_status != "FAILED" and not callback_overdue:
         raise HTTPException(409, "Retry is available for failed events or callbacks missing for at least 10 minutes.")
+    if event.lease_token and event.lease_until and not _is_before(event.lease_until, db.utcnow()):
+        raise HTTPException(409, "Automation delivery is still owned by a worker.")
     event.delivery_status, event.attempts, event.next_attempt_at = "PENDING", 0, db.utcnow()
     event.workflow_status = "WAITING"
     event.delivered_at = None

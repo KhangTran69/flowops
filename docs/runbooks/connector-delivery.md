@@ -52,3 +52,27 @@ PostgreSQL coordinates competing pollers with row locks; SQLite remains
 the single-process local development path. CI uses fake providers and a
 disposable database. Real-provider authentication, actual delivery latency,
 pagination completeness and network egress controls require staging evidence.
+
+## Opt-in observed revision tracking
+
+Set boolean track_updates=true on a Jira or ServiceNow connector only after
+reviewing trigger rules in an isolated tenant. The default remains the original
+first-seen event identity. Revision mode emits issue_revision_observed or
+incident_revision_observed instead, with deterministic hashed object/revision
+identities. Jira uses the timezone-normalized updated timestamp; ServiceNow
+uses sys_id, sys_mod_count and sys_updated_on. Replaying a page deduplicates
+the same observed revision. Distinct observed revisions can trigger actions.
+Rules matching all event types can also match these new types, so do not enable
+blindly. Existing historical fingerprints are never rewritten.
+
+This is snapshot-based update tracking, not change-data capture or a guaranteed
+incremental high-watermark. Intermediate updates overwritten between polls,
+deleted objects, ACL-filtered results and search-index delays may be missed.
+Full scans repeat to detect later revisions. Provider sandbox verification,
+including token expiry and update visibility, is still required. Connector
+tenant and provider type cannot be changed in place; create a separately
+reviewed connector instead.
+
+Provider contracts:
+https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-search/
+https://www.servicenow.com/docs/r/xanadu/platform-administration/table-administration-and-data-management/r_GlobalDefaultFields.html

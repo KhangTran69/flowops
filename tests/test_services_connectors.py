@@ -253,3 +253,44 @@ def test_servicenow_keyset_page(monkeypatch):
     assert cursor == f"{50:032x}"
     assert connector.fetch_page(None, cursor) == ([], None)
     assert calls[1]["sysparm_query"] == f"sys_id>{cursor}^ORDERBYsys_id"
+
+
+def test_jira_revision_mode_preserves_legacy_identity_and_dedupes_observed_versions(monkeypatch):
+    import json
+
+    def page(updated):
+        return _PollResponse([json.dumps({
+            "issues": [{"id": "42", "fields": {"updated": updated}}],
+            "isLast": True,
+        }).encode()])
+
+    old = "2026-11-28T01:02:03.000+0000"
+    new = "2026-11-28T01:02:04.000+0000"
+    monkeypatch.setattr(connectors.requests, "get", lambda *a, **kw: page(old))
+    legacy = connectors.JiraConnector("https://jira.example", "test", "test", "project = OPS")
+    tracked = connectors.JiraConnector("https://jira.example", "test", "test", "project = OPS", track_updates=True)
+    assert legacy.fetch_page(None, None)[0][0].external_id == "42"
+    first = tracked.fetch_page(None, None)[0][0]
+    assert first.event_type == "issue_revision_observed"
+    assert first.fingerprint() == tracked.fetch_page(None, None)[0][0].fingerprint()
+    monkeypatch.setattr(connectors.requests, "get", lambda *a, **kw: page(new))
+    second = tracked.fetch_page(None, None)[0][0]
+    assert first.fingerprint() != second.fingerprint()
+    assert second.payload["object_id"] == "42"
+
+
+def test_servicenow_revision_mode_distinguishes_same_second_updates(monkeypatch):
+    import json
+
+    row = {"sys_id": "a" * 32, "number": "INC42", "sys_updated_on": "2026-11-28 01:02:03", "sys_mod_count": "2"}
+    monkeypatch.setattr(connectors.requests, "get", lambda *a, **kw: _PollResponse([json.dumps({"result": [row]}).encode()]))
+    tracked = connectors.ServiceNowConnector("https://snow.example", "test", "test", track_updates=True)
+    first = tracked.fetch_page(None, None)[0][0]
+    row["sys_mod_count"] = "3"
+    second = tracked.fetch_page(None, None)[0][0]
+    assert first.event_type == "incident_revision_observed"
+    assert first.fingerprint() != second.fingerprint()
+    assert second.fingerprint() == tracked.fetch_page(None, None)[0][0].fingerprint()
+    row.pop("sys_mod_count")
+    with pytest.raises(ValueError, match="revision"):
+        tracked.fetch_page(None, None)

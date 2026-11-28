@@ -1,4 +1,4 @@
-import { useState, type FormEvent, type ReactNode } from 'react'
+import { useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { DataState } from '../components/DataState'
 import { PageHeader, JsonView } from '../components/Basics'
 import { RecordTable, type Column } from '../components/RecordTable'
@@ -132,8 +132,10 @@ function Audit() {
 }
 function LocalWorkforce() {
   const [section,setSection]=useState<Section>('Overview')
-  return <><PageHeader title="Workforce operations" description="Local synthetic development only. No production workforce browser access."/><nav aria-label="Workforce pages" className="flex flex-wrap gap-2 mb-5">{sections.map(s=><button key={s} className="btn" aria-current={s===section?'page':undefined} onClick={()=>setSection(s)}>{s}</button>)}</nav>
-    <h2 className="text-lg font-semibold mb-3">{section}</h2>
+  const heading = useRef<HTMLHeadingElement>(null)
+  function navigate(next: Section) { setSection(next); requestAnimationFrame(() => heading.current?.focus()) }
+  return <><PageHeader title="Workforce operations" description="Local synthetic development only. No production workforce browser access."/><nav aria-label="Workforce pages" className="flex flex-wrap gap-2 mb-5">{sections.map(s=><button key={s} className="btn" aria-current={s===section?'page':undefined} onClick={()=>navigate(s)}>{s}</button>)}</nav>
+    <h2 ref={heading} tabIndex={-1} className="text-lg font-semibold mb-3">{section}</h2>
     {section==='Overview'?<Overview/>:section==='Employees'?<Employees/>:section==='Requests'?<Requests key="requests" approvals={false}/>:section==='Approvals'?<Requests key="approvals" approvals/>:section==='IT tasks'?<Tasks/>:section==='Assets'?<Assets/>:section==='Automation'?<Automation/>:<Audit/>}
   </>
 }

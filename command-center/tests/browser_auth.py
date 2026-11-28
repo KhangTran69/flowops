@@ -47,6 +47,14 @@ def main():
             denied = page.request.post(console + "/api/flowops", data={"method": "GET", "path": path},
                                        headers={"X-FlowOps-Request": "1", "X-User-Role": "admin"})
             assert denied.status == 403
+        for method, path in (("GET", "/workforce/employees"), ("POST", "/workforce/employees"),
+                             ("PATCH", "/workforce/tasks/1")):
+            denied = page.request.post(console + "/api/flowops", data={"method": method, "path": path, "body": {}},
+                                       headers={"X-FlowOps-Request": "1", "X-User-Role": "admin"})
+            assert denied.status in (400, 403)
+        page.goto(console + "/workforce")
+        expect(page.get_by_role("heading", name="Workforce browser access unavailable")).to_be_visible()
+        print("WORKFORCE_PROTECTED_OPERATOR_DENIED", flush=True)
         page.goto(console + "/triggers")
         expect(page.get_by_text("Global administrator access required.")).to_be_visible()
         page.goto(console + "/tickets")
