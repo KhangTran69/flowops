@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import secrets
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -283,7 +284,9 @@ def _seed_onboarding_runs(session: Session) -> dict[str, int]:
     counts["events"] += 1
 
     # Run B: paused awaiting approval. The gated first step is still pending;
-    # an operator resumes, approves, and the DAG takes over from there.
+    # an operator resumes, approves, and the DAG takes over from there. Its
+    # SLA timer comes due ~90 s after seeding, so the timers service in a
+    # running stack escalates it live during the guided demo journey.
     run_b_request = request_for("Marcus Webb", "marcus.webb", "Sales")
     items_b = _checklist(session, run_b_request, {
         "create_user_account": "pending", "provision_laptop": "completed",
@@ -307,7 +310,7 @@ def _seed_onboarding_runs(session: Session) -> dict[str, int]:
     counts["step_runs"] += 1
     session.add(db.WorkflowTimerRecord(
         request_id=run_b_request.id, item_id=items_b["create_user_account"].id,
-        kind="step_sla", due_at=db.utcnow() + timedelta(minutes=30), status="pending",
+        kind="step_sla", due_at=db.utcnow() + timedelta(seconds=90), status="pending",
     ))
     for event_type, payload in (
         ("workflow.run.started", {"definition": "onboarding-dag", "version": 1}),
@@ -319,6 +322,32 @@ def _seed_onboarding_runs(session: Session) -> dict[str, int]:
         ))
         counts["events"] += 1
     return counts
+
+
+def _seed_triggers(session: Session) -> int:
+    """One HMAC-signed webhook source and trigger for the /ui/triggers page.
+
+    ``secret_generated`` mirrors what POST /event-sources/{key}/rotate-secret
+    returns, so webhook triggers stay executable and the guided journey can
+    rotate the secret live to sign a real delivery.
+    """
+    session.add(db.EventSourceRecord(
+        key="demo-source", name="Demo HR system", tenant_key=TENANT,
+        secret=secrets.token_urlsafe(32), secret_generated=True, active=True,
+    ))
+    session.add(db.TriggerRecord(
+        key="demo-new-hire", name="New hire from HR system",
+        source_key="demo-source", event_type="hr.new_hire",
+        target_type="onboarding_request", definition_key="onboarding-dag",
+        mapping_json=json.dumps({
+            "employee_name": "$event.name",
+            "employee_email": "$event.email",
+            "department": "$event.department",
+            "requester_id": "$event.requester_id",
+        }, separators=(",", ":")),
+        schedule_kind="webhook", active=True,
+    ))
+    return 1
 
 
 def _seed_failure_signal(session: Session) -> int:
@@ -382,6 +411,7 @@ def seed(*, reset: bool = False) -> dict[str, int]:
         counts["tickets"] = _seed_tickets(session)
         counts["definitions"] = _seed_definitions(session)
         counts.update(_seed_onboarding_runs(session))
+        counts["triggers"] = _seed_triggers(session)
         counts["failure_signal"] = _seed_failure_signal(session)
         session.add(db.WorkforceAuditRecord(
             actor_subject=ACTOR, action="demo.dataset_seeded", tenant_key=TENANT,
