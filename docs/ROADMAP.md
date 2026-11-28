@@ -170,10 +170,14 @@ These are the project's *own* declared gates (PR #51–#53, console-monitoring).
 - [ ] Configure a real Entra app registration (interactive browser sign-in or
       gateway-issued per-user tokens; the console deliberately does not
       implement its own login flow).
-- [ ] Verify the gateway strips client-supplied identity headers
+- [x] Verify the gateway strips client-supplied identity headers
       (`X-User-Role`, `X-User-Email`, `X-Actor-Email`) — there is already a
       security regression suite in `command-center/server/*.test.mjs`; extend
       it to prove strip-before-forward with a fake upstream.
+      — done 2026-11-28: `docker/nginx/default.conf` empties the three
+      headers on the app location and
+      `command-center/server/gateway.test.mjs` proves strip-before-forward
+      by running the real config under nginx with a fake upstream.
 - [ ] Lift the workforce browser release gate (`docs/console-monitoring.md`)
       only after an independently tested sign-in journey exists in the
       browser-smoke suite against a protected backend.
