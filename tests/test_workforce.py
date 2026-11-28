@@ -2,6 +2,7 @@
 import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -99,6 +100,137 @@ def test_manager_approval_creates_tasks_once_and_completes_only_when_required_ta
             response = client.patch(f"/workforce/tasks/{task['id']}", json={"status": "DONE", "completion_notes": "Checked."})
             assert response.status_code == 200, response.text
     assert client.get(f"/workforce/onboarding-requests/{request_id}").json()["status"] == "COMPLETED"
+
+
+def test_simulated_worker_completes_legacy_null_tenant_request(workforce_client):
+    client, set_actor = workforce_client
+    _, request_id = _approved_request(client, set_actor)
+    session = db.SessionLocal()
+    try:
+        request = session.get(db.StaffOnboardingRecord, request_id)
+        request.tenant_key = None
+        employee = session.get(db.EmployeeRecord, request.employee_id)
+        employee.tenant_key = None
+        for model in (db.ITTaskRecord, db.WorkforceAutomationEventRecord, db.WorkforceApprovalRecord):
+            rows = session.execute(select(model).where(model.request_id == request_id)).scalars()
+            for row in rows:
+                row.tenant_key = None
+        session.commit()
+    finally:
+        session.close()
+
+    from src.workforce_worker import run_once
+    result = run_once()
+
+    assert result["status"] == "DELIVERED"
+    assert result["workflow_status"] == "SUCCEEDED"
+    set_actor(Actor("global-operator", ("AUTOMATION.ADMIN",), source="bearer"))
+    detail = client.get(f"/workforce/onboarding-requests/{request_id}").json()
+    assert next(task for task in detail["tasks"] if task["task_key"] == "provision_account")["status"] == "DONE"
+
+
+def test_global_operator_sees_legacy_null_tenant_requests_tasks_and_dashboard(workforce_client):
+    client, set_actor = workforce_client
+    _, request_id = _approved_request(client, set_actor)
+    session = db.SessionLocal()
+    try:
+        request = session.get(db.StaffOnboardingRecord, request_id)
+        request.tenant_key = None
+        session.get(db.EmployeeRecord, request.employee_id).tenant_key = None
+        for model in (db.ITTaskRecord, db.WorkforceAutomationEventRecord, db.WorkforceApprovalRecord):
+            for row in session.execute(select(model).where(model.request_id == request_id)).scalars():
+                row.tenant_key = None
+        session.commit()
+    finally:
+        session.close()
+
+    set_actor(Actor("it-demo", ("IT_ADMIN",), source="session", tenant_key="tenant-a"))
+    assert client.get("/workforce/onboarding-requests").json() == []
+    assert client.get("/workforce/tasks").json() == []
+
+    set_actor(Actor("global-operator", ("AUTOMATION.ADMIN",), source="bearer"))
+    requests = client.get("/workforce/onboarding-requests").json()
+    tasks = client.get("/workforce/tasks").json()
+    dashboard = client.get("/workforce/dashboard").json()
+    detail = client.get(f"/workforce/onboarding-requests/{request_id}").json()
+
+    assert [row["id"] for row in requests] == [request_id]
+    assert len(tasks) == 5
+    assert len(detail["tasks"]) == 5
+    assert dashboard["in_progress"] == 1
+    assert dashboard["overdue_tasks"] == 0
+
+
+def test_global_views_exclude_task_with_mismatched_tenant_ownership(workforce_client):
+    client, set_actor = workforce_client
+    _, request_id = _approved_request(client, set_actor)
+    session = db.SessionLocal()
+    try:
+        task = session.execute(select(db.ITTaskRecord).where(
+            db.ITTaskRecord.request_id == request_id)).scalars().first()
+        task.tenant_key = "tenant-b"
+        task.due_at = db.utcnow() - timedelta(days=1)
+        task_id = task.id
+        session.commit()
+    finally:
+        session.close()
+
+    set_actor(Actor("global-operator", ("AUTOMATION.ADMIN",), source="bearer"))
+    visible_tasks = client.get("/workforce/tasks").json()
+    dashboard = client.get("/workforce/dashboard").json()
+
+    assert len(visible_tasks) == 4
+    assert all(task["id"] != task_id for task in visible_tasks)
+    assert dashboard["overdue_tasks"] == 0
+
+
+def test_global_operator_audit_is_visible_to_affected_tenant(workforce_client):
+    client, set_actor = workforce_client
+    _, request_id = _approved_request(client, set_actor)
+    task = client.get("/workforce/tasks").json()[0]
+    set_actor(Actor("global-operator", ("AUTOMATION.ADMIN",), source="bearer"))
+
+    changed = client.patch(f"/workforce/tasks/{task['id']}", json={"status": "IN_PROGRESS"})
+
+    assert changed.status_code == 200, changed.text
+    set_actor(Actor("tenant-hr", ("HR",), source="session", tenant_key="tenant-a"))
+    audit = client.get("/workforce/audit").json()
+    assert any(row["action"] == "it_task.in_progress" and row["entity_id"] == str(task["id"])
+               for row in audit)
+
+
+def test_tenant_scoped_admin_sees_only_automation_errors_for_its_tenant(workforce_client):
+    client, set_actor = workforce_client
+    headers = {"X-FlowOps-Automation-Key": "n8n-test-secret"}
+    response = client.post("/workforce/integration/errors", headers=headers, json={
+        "eventId": "tenant-error-1", "tenantKey": "tenant-a",
+        "workflowName": "provisioning", "error": "simulated failure",
+    })
+    assert response.status_code == 202, response.text
+
+    set_actor(Actor("it-a", ("IT_ADMIN",), source="session", tenant_key="tenant-a"))
+    tenant_a_errors = [row for row in client.get("/workforce/audit").json()
+                       if row["action"] == "automation.error"]
+    set_actor(Actor("it-b", ("IT_ADMIN",), source="session", tenant_key="tenant-b"))
+    tenant_b_errors = [row for row in client.get("/workforce/audit").json()
+                       if row["action"] == "automation.error"]
+
+    assert [row["entity_id"] for row in tenant_a_errors] == ["tenant-error-1"]
+    assert tenant_b_errors == []
+
+
+def test_n8n_error_workflow_forwards_available_tenant_key():
+    workflow_path = Path(__file__).parents[1] / "n8n/workflows/03-automation-errors.json"
+    workflow = json.loads(workflow_path.read_text())
+    record_node = next(node for node in workflow["nodes"] if node["name"] == "Record failure in FlowOps")
+    body_expression = record_node["parameters"]["jsonBody"]
+    context_node = next(node for node in workflow["nodes"] if node["name"] == "Resolve tenant context")
+    context_code = context_node["parameters"]["jsCode"]
+
+    assert "tenantKey:" in body_expression
+    assert "$json.tenantKey" in body_expression
+    assert "tenantByWorkflowId" in context_code
+    assert "json.workflow?.id" in context_code
 
 
 def test_asset_assignment_is_single_owner_and_return_is_audited(workforce_client):
