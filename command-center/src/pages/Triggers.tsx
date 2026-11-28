@@ -32,6 +32,7 @@ function TriggerList() {
     setError('')
     const fields = new FormData(event.currentTarget)
     const value = (key: string) => String(fields.get(key) ?? '').trim()
+    if (['.', '..'].includes(value('key'))) { setError('Choose a non-reserved trigger key.'); return }
     let mapping: Record<string, unknown>
     try { mapping = jsonObject(value('mapping')) } catch { setError('Mapping must be a valid JSON object.'); return }
     setBusy(true)
@@ -52,7 +53,7 @@ function TriggerList() {
       <h2 className="text-lg font-semibold">Create trigger</h2>
       <p className="muted text-sm">New triggers are active immediately. Use an approved source and verify the mapping before enabling external event delivery.</p>
       <div className="grid gap-3 sm:grid-cols-2">
-        <label>Key<input name="key" className="input" required maxLength={80} pattern="[A-Za-z0-9_.:-]+" /></label>
+        <label>Key<input name="key" className="input" required maxLength={80} pattern="[A-Za-z0-9_.\-]+" /></label>
         <label>Name<input name="name" className="input" required maxLength={200} /></label>
         <label>Event source<select name="source" className="input" required defaultValue=""><option value="">Select source</option>{(sources.data ?? []).filter(s => s.active).map(s => <option key={s.key} value={s.key}>{s.name} ({s.key})</option>)}</select></label>
         <label>Event type<input name="event" className="input" required maxLength={64} /></label>

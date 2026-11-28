@@ -2,7 +2,7 @@
 import os
 import json
 import time
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from playwright.sync_api import expect, sync_playwright
 
@@ -63,6 +63,15 @@ def main():
     base = os.environ.get("FLOWOPS_BROWSER_URL", "http://127.0.0.1:8787")
     wait_ready(base + "/api/session")
     _seed_notification_rows()
+    # Only the isolated synthetic browser backend is used. The source secret
+    # is never displayed or printed and no webhook is fired.
+    source = Request(
+        os.environ.get("FLOWOPS_API_URL", "http://127.0.0.1:8000") + "/event-sources",
+        data=json.dumps({"key": "browser-smoke-source", "name": "Browser smoke source", "global_scope": True}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    with urlopen(source, timeout=5) as response:
+        assert response.status == 201
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch()
         page = browser.new_page(viewport={"width": 1280, "height": 900})
@@ -200,7 +209,22 @@ def main():
         expect(page.get_by_role('heading', name='Event sources')).to_be_visible()
         page.get_by_role('button', name='New trigger').click()
         expect(page.get_by_role('heading', name='Create trigger')).to_be_visible()
-        page.get_by_role('button', name='Close create form').click()
+        page.get_by_label('Key', exact=True).fill('browser-smoke-trigger')
+        page.get_by_label('Name', exact=True).fill('Browser smoke trigger')
+        page.get_by_label('Event source').select_option('browser-smoke-source')
+        page.get_by_label('Event type').fill('synthetic.ticket')
+        page.get_by_label('Mapping JSON').fill('{"title":"$event.data.title"}')
+        page.get_by_role('button', name='Create active trigger').click()
+        expect(page.get_by_role('heading', name='Browser smoke trigger', exact=True)).to_be_visible(timeout=15000)
+        page.get_by_label('Test event JSON').fill('{"data":{"title":"Synthetic preview"}}')
+        page.get_by_role('button', name='Preview mapping').click()
+        expect(page.get_by_text('Mapping preview complete.')).to_be_visible(timeout=15000)
+        expect(page.get_by_text('Synthetic preview', exact=False)).to_be_visible()
+        expect(page.get_by_role('heading', name='Recent deliveries')).to_be_visible()
+        page.once('dialog', lambda dialog: dialog.accept())
+        page.get_by_role('button', name='Deactivate trigger').click()
+        expect(page.get_by_role('button', name='Activate trigger')).to_be_visible(timeout=15000)
+        expect(page.get_by_role('button', name='Preview mapping')).to_be_disabled()
         page.goto(base + '/knowledge-base')
         expect(page.get_by_role('heading', name='Knowledge base')).to_be_visible()
         page.get_by_label('Search articles').fill('VPN')
