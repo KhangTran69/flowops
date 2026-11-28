@@ -15,7 +15,7 @@ import signal
 import time
 import uuid
 
-from src import db, idempotency, outbox
+from src import db, idempotency, outbox, rate_limit
 from src.notify import deliver_webhook
 from src.services.connectors import deliver_outbox_notification
 
@@ -143,6 +143,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.sweep_interval > 0 and (time.monotonic() - last_sweep) >= args.sweep_interval:
             last_sweep = time.monotonic()
             removed = sweep_idempotency_keys()
+            try:
+                rate_limit.sweep_expired()
+            except Exception as error:  # retention must not interrupt dispatch
+                import logging
+
+                logging.getLogger(__name__).warning("Rate limit retention failed: %s", type(error).__name__)
             if removed:
                 print(f"idempotency sweep removed {removed} expired keys", flush=True)
         if not args.once:

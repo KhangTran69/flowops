@@ -59,3 +59,27 @@ def test_postgres_rate_limit_is_tenant_scoped_and_recovers(database):
         session.commit()
     assert rate_limit.sweep_expired() == 2
     assert rate_limit.consume(a, 4)[0]
+
+
+def test_authenticated_api_quota_shared_across_clients(database, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from src import api
+    from src.auth import Actor
+    from src.deps import _actor_from_header
+
+    monkeypatch.setenv("FLOWOPS_RATE_LIMIT_PER_MINUTE", "5")
+    actor = Actor("synthetic-api-principal", ("automation.admin",), source="bearer")
+    api.app.dependency_overrides[_actor_from_header] = lambda: actor
+    try:
+        # Separate clients contend for the same authenticated quota.
+        def request(_):
+            with TestClient(api.app) as client:
+                return client.get("/tickets").status_code
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            statuses = list(pool.map(request, range(16)))
+        assert statuses.count(200) == 5
+        assert statuses.count(429) == 11
+    finally:
+        api.app.dependency_overrides.pop(_actor_from_header, None)

@@ -29,3 +29,10 @@ groups:
           severity: warning
         annotations:
           summary: "Failed notification deliveries require reconciliation"
+      - alert: FlowOpsSharedAdmissionUnavailable
+        expr: sum(increase(flowops_rate_limit_decisions_total{outcome="unavailable"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Shared request admission is failing closed"

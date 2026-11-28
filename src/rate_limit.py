@@ -106,4 +106,4 @@ def sweep_expired() -> int:
         rows = select(table.c.digest).where(table.c.window_id < window - 2).limit(1000).with_for_update(skip_locked=True)
         result = connection.execute(delete(table).where(
             table.c.digest.in_(rows), table.c.window_id < window - 2))
-        return result.rowcount
+        return int(result.rowcount or 0)
