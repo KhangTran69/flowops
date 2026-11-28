@@ -18,6 +18,8 @@ const nav = [
   { to: '/audit', label: 'Audit', icon: FileText },
   { to: '/deliveries', label: 'Deliveries', icon: Activity },
   { to: '/analytics', label: 'Analytics', icon: BarChart3 },
+  { to: '/triggers', label: 'Triggers', icon: GitBranch },
+  { to: '/knowledge-base', label: 'Knowledge base', icon: BookOpen },
 ]
 
 export function Layout({ children }: { children: ReactNode }) {
@@ -43,15 +45,15 @@ export function Layout({ children }: { children: ReactNode }) {
   if (configured === false) return <div className="grid min-h-screen place-items-center p-6"><div className="card max-w-lg p-6"><h1 className="text-xl font-semibold">Console access unavailable</h1><p className="muted mt-2">Sign in through the configured authentication gateway, or ask your administrator to verify the console configuration.</p></div></div>
   return <div className="min-h-screen md:flex">
     <a href="#main-content" className="sr-only focus:not-sr-only focus:absolute focus:z-50 focus:bg-white focus:p-3 focus:text-black">Skip to main content</a>
-    <aside className={cn('fixed inset-y-0 left-0 z-40 w-64 bg-slate-950 p-3 text-slate-200 transition-transform md:static md:translate-x-0', mobile ? 'visible translate-x-0' : 'invisible -translate-x-full md:visible')}>
+    <aside className={cn('fixed inset-y-0 left-0 z-40 flex w-64 flex-col overflow-y-auto bg-slate-950 p-3 text-slate-200 transition-transform md:static md:translate-x-0', mobile ? 'visible translate-x-0' : 'invisible -translate-x-full md:visible')}>
       <div className="mb-6 flex items-center justify-between px-2 py-2">
         <Link to="/" className="flex items-center gap-2 text-lg font-semibold"><span className="grid h-7 w-7 place-items-center rounded bg-[var(--primary)] text-white">F</span> FlowOps</Link>
         <button ref={closeMenu} className="md:hidden" onClick={() => { setMobile(false); menuTrigger.current?.focus() }} aria-label="Close menu"><X size={18} /></button>
       </div>
       <nav id="main-navigation" className="space-y-1" aria-label="Main">
-        {nav.map(({ to, label, icon: Icon }) => <NavLink key={to} to={to} end={to === '/'} className={({ isActive }) => cn('flex items-center gap-2 rounded px-3 py-2 text-sm text-slate-300 hover:bg-white/10', isActive && 'bg-white/10 text-white')}><Icon size={16} /> {label}</NavLink>)}
+        {nav.filter(item => item.to !== '/triggers' || role === 'admin').map(({ to, label, icon: Icon }) => <NavLink key={to} to={to} end={to === '/'} className={({ isActive }) => cn('flex items-center gap-2 rounded px-3 py-2 text-sm text-slate-300 hover:bg-white/10', isActive && 'bg-white/10 text-white')}><Icon size={16} /> {label}</NavLink>)}
       </nav>
-      <div className="absolute bottom-3 left-3 right-3 rounded bg-white/5 p-3 text-xs text-slate-400"><div className="mb-1 flex items-center gap-1"><Activity size={13} /> {healthLabel}</div><div className="truncate">{email}</div><div className="capitalize">{role}</div></div>
+      <div className="mt-auto rounded bg-white/5 p-3 text-xs text-slate-400"><div className="mb-1 flex items-center gap-1"><Activity size={13} /> {healthLabel}</div><div className="truncate">{email}</div><div className="capitalize">{role}</div></div>
     </aside>
     {mobile && <div className="fixed inset-0 z-30 bg-black/40 md:hidden" onClick={() => setMobile(false)} />}
     <div className="min-w-0 flex-1">

@@ -124,9 +124,9 @@ operator value:
   journey seeding real dead-letter/pending fixtures)
 - [x] **Analytics** (`/ui/analytics`) — summary cards, step bottlenecks,
   tenant/window filters
-- [ ] **Triggers** (`/ui/triggers`, trigger detail) — source config, delivery
-  history, test-fire
-- [ ] **Knowledge base** (`/ui/knowledge-base`) — read-only search
+- [x] **Triggers** (`/ui/triggers`, trigger detail) — source metadata, trigger creation/update,
+  delivery history and non-executing mapping preview. Secret creation/rotation remains in backend administration.
+- [x] **Knowledge base** (`/ui/knowledge-base`) — read-only search and category filtering
 - [ ] **Workforce module** (`/workforce/ui`) — gated behind the browser
   release gate until production identity ships
 

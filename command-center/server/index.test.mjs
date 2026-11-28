@@ -39,6 +39,12 @@ test('production proxy verifies identity and forwards only authenticated credent
     assert.equal((await invoke('POST', '/workflow-definitions', { Authorization: 'Bearer operator', 'X-User-Role': 'admin' })).status, 403)
     assert.equal((await invoke('POST', '/tickets', { Cookie: 'flowops_ui_session=verified' }, false)).status, 403)
     assert.equal((await invoke('GET', '/tickets/..', { Authorization: 'Bearer admin' })).status, 400)
+    for (const [method, path] of [['GET', '/triggers'], ['GET', '/event-sources'], ['POST', '/triggers/example/test'], ['PUT', '/triggers/example']]) {
+      assert.equal((await invoke(method, path, { Authorization: 'Bearer operator', 'X-User-Role': 'admin' })).status, 403)
+      assert.equal((await invoke(method, path, { Authorization: 'Bearer admin' })).status, 403)
+    }
+    assert.equal((await invoke('POST', '/webhooks/triggers/example', { Authorization: 'Bearer admin' })).status, 400)
+    assert.equal((await invoke('POST', '/event-sources', { Authorization: 'Bearer admin' })).status, 400)
     const session = await fetch(url + '/api/session', { headers: { Authorization: 'Bearer operator', 'X-User-Email': 'forged' } })
     assert.deepEqual(await session.json(), { role: 'operator', configured: true, email: 'verified-user' })
     const created = await invoke('POST', '/tickets', { Authorization: 'Bearer operator', 'Idempotency-Key': 'stable-123', 'X-Actor-Email': 'forged' })

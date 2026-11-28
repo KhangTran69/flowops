@@ -159,3 +159,9 @@ export type AnalyticsHealth = {
   threshold_minutes: number; tenant_key: string | null; stuck_count: number
   stuck_runs: { run_id: number; request_id: number; tenant_key: string | null; definition_key: string; heartbeat_at: string; age_seconds: number; reason: string }[]
 }
+
+export type EventSource = { key: string; name: string; active: boolean; created_at: string; tenant_key: string | null; global_scope: boolean; secret_generated: boolean }
+export type Trigger = { key: string; name: string; source_key: string; event_type: string; target_type: string; definition_key: string | null; mapping_json: Record<string, unknown>; schedule_kind: string; interval_seconds: number | null; daily_at_utc: string | null; active: boolean; last_fired_at: string | null; created_at: string; updated_at: string }
+export type TriggerDelivery = { id: number; trigger_key: string; event_id: string; status: string; request_id: string | null; received_at: string; processed_at: string | null }
+export type TriggerPreview = { trigger_key: string; target_type: string; mapped_payload: Record<string, unknown> }
+export type KnowledgeArticle = { id: string; title: string; category: string; keywords: string[]; steps: string[]; summary: string }

@@ -43,6 +43,14 @@ def main():
             "method": "POST", "path": "/workflow-definitions", "body": {},
         }, headers={"X-FlowOps-Request": "1", "X-User-Role": "admin"})
         assert forged.status == 403
+        for path in ("/triggers", "/event-sources", "/triggers/browser-smoke-trigger/deliveries"):
+            denied = page.request.post(console + "/api/flowops", data={"method": "GET", "path": path},
+                                       headers={"X-FlowOps-Request": "1", "X-User-Role": "admin"})
+            assert denied.status == 403
+        page.goto(console + "/triggers")
+        expect(page.get_by_text("Global administrator access required.")).to_be_visible()
+        page.goto(console + "/tickets")
+        expect(page.get_by_role("button", name="New ticket")).to_be_visible()
         # Verify server-side revocation, even when a previously copied cookie is replayed.
         copied = context.cookies()
         identity = page.request.get(api + "/command-center/session").json()

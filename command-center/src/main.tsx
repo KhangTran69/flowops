@@ -19,6 +19,9 @@ import DefinitionDetail from './pages/DefinitionDetail'
 import Audit from './pages/Audit'
 import Deliveries from './pages/Deliveries'
 import Analytics from './pages/Analytics'
+import Triggers from './pages/Triggers'
+import TriggerDetail from './pages/TriggerDetail'
+import KnowledgeBase from './pages/KnowledgeBase'
 import './index.css'
 
 createRoot(document.getElementById('root')!).render(
@@ -42,6 +45,9 @@ createRoot(document.getElementById('root')!).render(
             <Route path="/audit" element={<Audit />} />
             <Route path="/deliveries" element={<Deliveries />} />
             <Route path="/analytics" element={<Analytics />} />
+            <Route path="/triggers" element={<Triggers />} />
+            <Route path="/triggers/:key" element={<TriggerDetail />} />
+            <Route path="/knowledge-base" element={<KnowledgeBase />} />
             <Route path="*" element={<div className="card p-6">Page not found.</div>} />
           </Routes>
         </Layout>

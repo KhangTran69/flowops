@@ -34,3 +34,13 @@ test('analytics schemas preserve unknown durations and reject incompatible data'
   assert(steps.safeParse([{ step: 'Manual', succeeded: 0, failed: 1, attempts: 1, failure_rate: 1, median_seconds: null, p95_seconds: null, sample: 0, ranked: false }]).success)
   assert(!steps.safeParse([{ step: 'Manual', median_seconds: -1 }]).success)
 })
+
+test('trigger and knowledge base contracts reject malformed rows', () => {
+  const kb = responseSchema('GET', '/knowledge-base')
+  assert(kb.safeParse([{id:'kb', title:'VPN', category:'network', keywords:['vpn'], steps:['Check status'], summary:'Guide'}]).success)
+  assert(!kb.safeParse([{id:'kb', title:'VPN', steps:'not a list'}]).success)
+  const preview = responseSchema('POST', '/triggers/example/test')
+  assert(preview.safeParse({trigger_key:'example', target_type:'ticket', mapped_payload:{title:'Sample'}}).success)
+  assert(!preview.safeParse({trigger_key:'example', target_type:'ticket', mapped_payload:[]}).success)
+  assert(!responseSchema('GET', '/triggers').safeParse([{key:'example', active:'yes'}]).success)
+})
