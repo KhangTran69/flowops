@@ -8,6 +8,7 @@ cookie flags, expiry, and CSRF behavior stay explicit and testable offline.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -146,6 +147,8 @@ def authenticate_admin(username: str, password: str) -> Actor | None:
     """Authenticate only explicitly configured, development-gated accounts."""
     if os.environ.get("FLOWOPS_ENVIRONMENT", "development").lower() != "development":
         return None
+    if not username or len(username) > 256 or not password or len(password) > 1024:
+        return None
     try:
         users = json.loads(os.environ.get("FLOWOPS_DEMO_USERS", "{}"))
     except json.JSONDecodeError:
@@ -177,6 +180,18 @@ def create_session(actor: Actor) -> UISession:
     )
 
 
+def _account_configuration_revision(secret: str | None = None) -> str:
+    """Bind development sessions to the configured account set, not a raw hash.
+
+    Account removal, role/tenant edits and password rotation invalidate
+    existing browser sessions across processes without retaining credentials
+    in the cookie. No production browser issuer is enabled.
+    """
+    raw = os.environ.get("FLOWOPS_DEMO_USERS", "{}")
+    return hmac.new((secret or session_secret()).encode(),
+                    b"flowops-demo-account-revision:" + raw.encode(), hashlib.sha256).hexdigest()
+
+
 def encode_session(session: UISession, secret: str | None = None) -> str:
     return _serializer(secret).dumps(
         {
@@ -184,6 +199,7 @@ def encode_session(session: UISession, secret: str | None = None) -> str:
             "roles": list(session.roles),
             "csrf": session.csrf_token,
             "tenant_key": session.tenant_key,
+            "account_revision": _account_configuration_revision(secret),
         }
     )
 
@@ -204,6 +220,11 @@ def decode_session(
         raise UISessionError("Invalid UI session payload.")
     roles = data.get("roles")
     csrf = data.get("csrf")
+    revision = data.get("account_revision")
+    if not isinstance(revision, str) or not secrets.compare_digest(
+        revision.encode(), _account_configuration_revision(secret).encode()
+    ):
+        raise UISessionError("UI session account configuration changed or is invalid.")
     if (
         not isinstance(roles, list) or not roles
         or any(not isinstance(role, str) or not role or role != role.strip() for role in roles)
@@ -245,7 +266,7 @@ def read_session(request) -> UISession | None:
     if os.environ.get("FLOWOPS_ENVIRONMENT", "development").lower() != "development":
         return None
     value = request.cookies.get(SESSION_COOKIE)
-    if not value:
+    if not value or len(value) > 8192:
         return None
     try:
         session = decode_session(value)
