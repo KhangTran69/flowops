@@ -140,3 +140,20 @@ scheduled arrival rates, wall-clock lease expiration, provider effects or
 end-to-end staging latency. The logical phase clock intentionally avoids
 network calls and timing-dependent sleeps. Representative staging and
 credentialed integration evidence remain open.
+
+
+### Paced wall-clock queue workload
+
+`python -m scripts.benchmark_queue_arrivals` extends the existing logical-time
+queue benchmark without replacing its evidence. Four concurrent claimers
+process synthetic work with a fixed 150 ms service delay while a producer
+targets 4/s for two seconds, 48/s for two seconds, and 12/s for four seconds.
+Actual arrival rates, backlog, expected retries and terminal failures,
+abandoned leases, end-to-end and claim/finalize latency percentiles, throughput
+and drain time are written to `benchmark-queue-arrivals.json`. CI gates
+missing/duplicate results, unexpected errors, over-budget attempts, nonzero
+final backlog, failure injection, stale owner finalization, and backlog growth;
+the synthetic p95 ceiling is 25 s and drain deadline 40 s. These intentionally
+loose ceilings are regression safeguards, not customer-facing SLOs. No provider
+or real workflow adapter is executed. Representative production staging,
+real provider latency, distributed hosts and larger sustained tests remain open.

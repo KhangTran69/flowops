@@ -195,6 +195,7 @@ jobs:
         run: |
           alembic upgrade head
           python -m scripts.benchmark_queue
+          python -m scripts.benchmark_queue_arrivals
           python -m scripts.benchmark_console
       - name: Upload PostgreSQL benchmark evidence
         if: always()
@@ -204,6 +205,7 @@ jobs:
           path: |
             benchmark-console.json
             benchmark-queue.json
+            benchmark-queue-arrivals.json
           if-no-files-found: warn
 
   command-center:
