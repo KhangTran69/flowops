@@ -26,3 +26,10 @@ lease is an uncertain external effect: reconcile receiver-side evidence
 before retrying. This is at-least-once delivery, not exactly-once execution.
 The dispatcher backs off after database operational errors; repeated
 outages should be escalated rather than bypassing database fencing.
+
+The global-admin metrics endpoint exposes flowops_notification_expired_leases
+as a bounded-cardinality gauge; FlowOpsExpiredNotificationLease alerts after
+five minutes of sustained expired ownership. The threshold is provisional.
+Check dispatcher health, database reachability and receiver-side delivery
+evidence before retrying. A zero gauge does not prove all external deliveries
+succeeded.

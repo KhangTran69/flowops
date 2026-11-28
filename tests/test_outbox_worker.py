@@ -166,3 +166,22 @@ def test_expired_dispatcher_cannot_finalize_without_takeover(database):
         session.commit()
         replacement = outbox.claim_delivery(session, now=expired)
         assert replacement is not None and replacement.lease_owner_token != token
+
+
+def test_expired_lease_metric_excludes_active_and_terminal_rows(database):
+    from fastapi.testclient import TestClient
+
+    from src import api
+
+    expired_id = _insert()
+    active_id = _insert()
+    delivered_id = _insert(status="delivered")
+    with db.SessionLocal() as session:
+        for notification_id, seconds in ((expired_id, -60), (active_id, 60), (delivered_id, -60)):
+            row = session.get(db.NotificationOutboxRecord, notification_id)
+            row.lease_owner_token = "synthetic-owner"
+            row.lease_expires_at = db.utcnow() + timedelta(seconds=seconds)
+        session.commit()
+    response = TestClient(api.app).get("/metrics")
+    assert response.status_code == 200
+    assert "flowops_notification_expired_leases 1\n" in response.text
