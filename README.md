@@ -29,6 +29,36 @@ The platform-specific layer is deliberately thin. FlowOps owns validation,
 tenant scoping, idempotency, auditability, and error semantics so a workflow
 can move between automation tools without changing the safety model.
 
+## Live demo
+
+A public demo stack (deployed with [deploy/fly.toml](deploy/fly.toml), see
+[deploy/README.md](deploy/README.md)) is planned for this release series;
+the URL will be placed here when it is live.
+
+Until then, everything below renders from a local seeded stack —
+`docker compose up -d --wait && docker compose exec app python -m
+scripts.seed_demo` — and the screenshots in
+[docs/assets/](docs/assets/) were captured from exactly that stack by
+[scripts/capture_demo_screenshots.py](scripts/capture_demo_screenshots.py):
+
+| Screenshot | What it shows |
+| --- | --- |
+| [landing](docs/assets/landing.png) | `/` — live counts and API status |
+| [dashboard](docs/assets/dashboard.png) | `/dashboard` — run health, routing mix, notification state |
+| [tickets](docs/assets/tickets.png) | `/ui/tickets` — classified, routed, searchable ticket list |
+| [approval-journey](docs/assets/approval-journey.png) | A paused onboarding run waiting on a human approval gate |
+| [analytics](docs/assets/analytics.png) | `/ui/analytics` — runs by status, approvals, SLA timers, bottlenecks |
+| [console-runs](docs/assets/console-runs.png) | React command center — workflow runs |
+| [console-definitions](docs/assets/console-definitions.png) | React command center — versioned workflow definitions |
+
+The sixty-second version: a ticket arrives and is classified and routed by
+rule; an HR webhook fires a trigger that creates a versioned DAG run; a
+durable worker executes steps while approval-gated steps wait for an
+operator; a breached SLA re-queues a step to the escalation queue and
+notifies; every one of those actions lands in the audit trail and the
+analytics. Run it yourself with `./scripts/demo_smoke.sh --journey`
+(see [docs/portfolio-demo.md](docs/portfolio-demo.md)).
+
 ## What is implemented
 
 | Milestone | Status | What it delivers |
