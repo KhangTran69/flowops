@@ -556,5 +556,3 @@ def webhook_intake(
     if isinstance(payload, list):
         return [_process_intake(item, session, actor_subject) for item in payload]
     return _process_intake(payload, session, actor_subject)
-
-

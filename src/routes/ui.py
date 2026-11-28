@@ -764,4 +764,3 @@ def dashboard(
             },
         },
     )
-
