@@ -240,6 +240,10 @@ def revoke_session(session_db, session: UISession) -> None:
 
 
 def read_session(request) -> UISession | None:
+    # The only cookie issuer currently implemented is the development login.
+    # A signed development cookie is not evidence of provider authentication.
+    if os.environ.get("FLOWOPS_ENVIRONMENT", "development").lower() != "development":
+        return None
     value = request.cookies.get(SESSION_COOKIE)
     if not value:
         return None
@@ -267,7 +271,7 @@ def set_session_cookie(response, session: UISession) -> None:
 
 
 def clear_session_cookie(response) -> None:
-    response.delete_cookie(SESSION_COOKIE, path="/", samesite="lax")
+    response.delete_cookie(SESSION_COOKIE, path="/", samesite="lax", httponly=True, secure=cookie_secure())
 
 
 def actor_from_session(session: UISession) -> Actor:
@@ -278,13 +282,13 @@ def csrf_matches(request, session: UISession) -> bool:
     supplied = request.headers.get("X-CSRF-Token")
     if not supplied:
         return False
-    return secrets.compare_digest(supplied, session.csrf_token)
+    return secrets.compare_digest(supplied.encode(), session.csrf_token.encode())
 
 
 def safe_next(value: str | None, default: str = "/dashboard") -> str:
     """Only allow same-site absolute paths; reject schemes/protocol-relative."""
     if not value or not value.startswith("/") or value.startswith("//"):
         return default
-    if "\\" in value or "\n" in value or "\r" in value:
+    if "\\" in value or any(ord(char) < 32 or ord(char) == 127 for char in value):
         return default
     return value

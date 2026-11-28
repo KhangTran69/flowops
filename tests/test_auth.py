@@ -85,6 +85,7 @@ def test_entra_jwt_claims_and_jwks_cache(monkeypatch):
 
     calls = []
     class Response:
+        status_code = 200
         def raise_for_status(self): pass
         def json(self): return {"keys": [public_jwk]}
 
@@ -278,6 +279,7 @@ def test_signed_entra_claims_fail_closed_on_ambiguous_identity(monkeypatch):
     monkeypatch.setattr(_authenticate_jwt, "cache", {}, raising=False)
 
     class Response:
+        status_code = 200
         def raise_for_status(self):
             pass
 
@@ -322,3 +324,18 @@ def test_signed_entra_claims_fail_closed_on_ambiguous_identity(monkeypatch):
         monkeypatch.setattr("src.auth.requests.get", lambda *args, **kwargs: BadResponse())
         with pytest.raises(AuthenticationError):
             authenticate(base)
+
+
+@pytest.mark.parametrize("url", [
+    "http://issuer.example/keys", "https://user:secret@issuer.example/keys",
+    "https://issuer.example/keys#fragment", "https://issuer.example/keys?token=secret",
+])
+def test_entra_configuration_rejects_unsafe_key_urls(url):
+    from src.auth import validate_auth_configuration
+
+    with pytest.raises(AuthenticationError, match="HTTPS"):
+        validate_auth_configuration({
+            "FLOWOPS_ENVIRONMENT": "production", "FLOWOPS_AUTH_REQUIRED": "true",
+            "FLOWOPS_ENTRA_ISSUER": "https://issuer.example",
+            "FLOWOPS_ENTRA_AUDIENCE": "flowops", "FLOWOPS_ENTRA_JWKS_URL": url,
+        })

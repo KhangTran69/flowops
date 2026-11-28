@@ -158,7 +158,7 @@ def logout(
         response = RedirectResponse("/login", status_code=303)
         ui_session.clear_session_cookie(response)
         return response
-    if not csrf_token or not secrets.compare_digest(csrf_token, session.csrf_token):
+    if not csrf_token or not secrets.compare_digest(csrf_token.encode(), session.csrf_token.encode()):
         raise HTTPException(status_code=403, detail="CSRF token missing or invalid.")
     ui_session.revoke_session(session_db, session)
     db.log_execution(

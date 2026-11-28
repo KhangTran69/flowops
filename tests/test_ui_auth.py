@@ -305,3 +305,20 @@ def test_malformed_signed_session_is_denied(client, payload):
         ui_session.decode_session(signed, secret=SECRET)
     client.cookies.set(ui_session.SESSION_COOKIE, signed)
     assert client.get("/command-center/session").status_code == 401
+
+
+def test_development_session_rejected_after_production_transition(client, monkeypatch):
+    _admin_cookie(client)
+    assert client.get("/command-center/session").status_code == 200
+    monkeypatch.setenv("FLOWOPS_ENVIRONMENT", "production")
+    assert client.get("/command-center/session").status_code == 401
+
+
+def test_non_ascii_csrf_is_denied_without_server_error(client):
+    _admin_cookie(client)
+    response = client.post("/logout", data={"csrf_token": "é"}, follow_redirects=False)
+    assert response.status_code == 403
+
+
+def test_control_characters_not_allowed_in_redirect():
+    assert ui_session.safe_next("/\t/evil.example") == "/dashboard"

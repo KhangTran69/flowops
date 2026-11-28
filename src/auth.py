@@ -6,6 +6,7 @@ import secrets
 import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 import jwt
 import requests
@@ -53,6 +54,20 @@ def _identity_tenant(value: Any) -> str | None:
     return value
 
 
+def _validate_entra_urls(issuer: str, jwks_url: str) -> None:
+    for label, value in (("issuer", issuer), ("JWKS URL", jwks_url)):
+        try:
+            parsed = urlsplit(value)
+            valid = (parsed.scheme == "https" and bool(parsed.hostname)
+                     and parsed.username is None and parsed.password is None
+                     and not parsed.fragment and not parsed.query
+                     and not any(char.isspace() for char in value))
+        except ValueError:
+            valid = False
+        if not valid:
+            raise AuthenticationError(f"Entra {label} must be a trusted HTTPS URL.")
+
+
 def _authenticate_jwt(token: str, values: dict[str, str]) -> Actor:
     issuer = values.get("FLOWOPS_ENTRA_ISSUER")
     audience = values.get("FLOWOPS_ENTRA_AUDIENCE")
@@ -61,13 +76,16 @@ def _authenticate_jwt(token: str, values: dict[str, str]) -> Actor:
     if not issuer or not audience or not jwks_url:
         raise AuthenticationError("Entra issuer, audience, and JWKS URL are required.")
 
+    _validate_entra_urls(issuer, jwks_url)
     cache = _authenticate_jwt.__dict__.setdefault("cache", {})
     now = time.time()
     keys, expires = cache.get(jwks_url, (None, 0))
     if keys is None or expires <= now:
         try:
-            response = requests.get(jwks_url, timeout=5)
+            response = requests.get(jwks_url, timeout=5, allow_redirects=False)
             response.raise_for_status()
+            if 300 <= response.status_code < 400:
+                raise ValueError("Signing key redirects are not permitted.")
             keys = response.json()["keys"]
             if not isinstance(keys, list) or not all(isinstance(item, dict) for item in keys):
                 raise ValueError("Malformed signing key set.")
@@ -128,6 +146,7 @@ def validate_auth_configuration(
             raise AuthenticationError(
                 "Entra issuer, audience, and JWKS URL must all be configured."
             )
+        _validate_entra_urls(values["FLOWOPS_ENTRA_ISSUER"], values["FLOWOPS_ENTRA_JWKS_URL"])
         return
     if environment == "development" and values.get("FLOWOPS_DEV_BEARER_TOKEN"):
         return
