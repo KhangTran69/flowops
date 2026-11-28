@@ -96,7 +96,7 @@ function TaskEditor({ task, reload }: { task: WorkforceTask; reload: () => void 
       due_at: v.due_at ? new Date(String(v.due_at)).toISOString() : null,
       completion_notes: String(v.completion_notes).trim() || null,
     }, reload, 'PATCH')}>
-      <label>Status<select className="input" value={status} onChange={e=>setStatus(e.target.value)}>{['TODO','IN_PROGRESS','BLOCKED','DONE'].filter(s=>s!=='DONE'||task.task_key!=='provision_account').map(s=><option key={s}>{s}</option>)}</select></label>
+      <label>Task status<select aria-label="Task status" className="input" value={status} onChange={e=>setStatus(e.target.value)}>{['TODO','IN_PROGRESS','BLOCKED','DONE'].filter(s=>s!=='DONE'||task.task_key!=='provision_account').map(s=><option key={s}>{s}</option>)}</select></label>
       <Field name="assignee_subject" label="Assignee subject" initial={task.assignee_subject??''} required={false} maxLength={256}/>
       <Field name="due_at" label="Due date and time (local)" type="datetime-local" initial={task.due_at ? new Date(new Date(task.due_at).getTime()-new Date(task.due_at).getTimezoneOffset()*60000).toISOString().slice(0,16):''} required={false}/>
       <label>Completion notes<textarea name="completion_notes" className="input" maxLength={2000} defaultValue={task.completion_notes??''}/></label>

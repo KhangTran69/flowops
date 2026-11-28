@@ -35,7 +35,7 @@ export function RecordTable<T extends object>({ rows, columns, rowHref, rowKey, 
         const href = rowHref?.(r)
         return <div key={keyOf(r, i)} className={cn('card p-3', href && 'cursor-pointer')} onClick={e => navigate(e, href)}>
           {columns.map((c, j) => <div key={c.key} className="flex justify-between gap-3 border-b border-[hsl(var(--border))] py-1 last:border-0">
-            <span className="muted text-xs uppercase">{c.header}</span><span className="text-right">{cell(r, c, j, href)}</span>
+            <span className="muted text-xs uppercase">{c.header}</span><div className="min-w-0 break-words text-right">{cell(r, c, j, href)}</div>
           </div>)}
         </div>
       })}</div>
