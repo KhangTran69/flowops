@@ -12,7 +12,6 @@ from fastapi.testclient import TestClient
 
 from src import api, db
 
-
 CORE_READ_TARGET_MS = 500.0
 
 
