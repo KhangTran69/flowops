@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Link, NavLink, useLocation } from 'react-router-dom'
-import { Activity, BookOpen, ClipboardList, FileText, GitBranch, LayoutDashboard, Menu, Moon, ShieldCheck, Sun, Ticket, Workflow, X } from 'lucide-react'
+import { Activity, BookOpen, ClipboardList, FileText, GitBranch, LayoutDashboard, ListTree, Menu, Moon, ShieldCheck, Sun, Ticket, Workflow, X } from 'lucide-react'
 import { useSession } from '../lib/session'
 import { usePoll } from '../hooks/usePoll'
 import { cn } from '../lib/utils'
@@ -12,6 +12,7 @@ const nav = [
   { to: '/tickets', label: 'Tickets', icon: Ticket },
   { to: '/requests', label: 'Requests', icon: ClipboardList },
   { to: '/runs', label: 'Workflow runs', icon: Workflow },
+  { to: '/jobs', label: 'Jobs', icon: ListTree },
   { to: '/approvals', label: 'Approvals', icon: ShieldCheck },
   { to: '/definitions', label: 'Definitions', icon: GitBranch },
   { to: '/audit', label: 'Audit', icon: FileText },

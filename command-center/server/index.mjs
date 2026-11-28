@@ -17,7 +17,9 @@ const GET_PATHS = [
   rr('/health'), rr('/ready'), rr('/command-center/summary'), rr('/command-center/deliveries'), rr('/tickets'), rr(`/tickets/${SEG}`),
   rr('/onboarding-requests'), rr(`/onboarding-requests/${SEG}`),
   rr(`/onboarding-requests/${SEG}/run`), rr('/workflow-runs'),
-  rr(`/workflow-runs/${SEG}`), rr('/workflow-definitions'),
+  rr(`/workflow-runs/${SEG}`),
+  rr('/workflow-jobs'), rr(`/workflow-jobs/${SEG}`), rr(`/workflow-jobs/${SEG}/history`),
+  rr('/workflow-definitions'),
   rr(`/workflow-definitions/${SEG}`), rr(`/workflow-definitions/${SEG}/diff`),
   rr('/execution-logs'), rr('/audit'),
 ]
@@ -26,9 +28,11 @@ const OPERATOR_POST = [
   rr(`/tickets/${SEG}/ai-recommendations/apply`),
   rr('/onboarding-requests'), rr(`/onboarding-requests/${SEG}/run`),
   rr(`/workflow-runs/${SEG}/(pause|resume|cancel)`),
+  rr(`/workflow-jobs/${SEG}/retry`),
 ]
 const ADMIN_POST = [
   rr(`/workflow-runs/${SEG}/steps/${SEG}/(approve|reject)`),
+  rr(`/workflow-jobs/${SEG}/cancel`),
   rr('/workflow-definitions'), rr('/workflow-definitions/validate'), rr(`/workflow-definitions/${SEG}/publish`),
 ]
 const ADMIN_PUT = [rr(`/workflow-definitions/${SEG}`)]

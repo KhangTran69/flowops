@@ -3259,9 +3259,44 @@
       ],
       "title": "Last Error"
      },
+     "lease_expires_at": {
+      "anyOf": [
+       {
+        "format": "date-time",
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Lease Expires At"
+     },
+     "lease_owner_token": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Lease Owner Token"
+     },
      "max_attempts": {
       "title": "Max Attempts",
       "type": "integer"
+     },
+     "payload": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Payload"
      },
      "resource_id": {
       "anyOf": [
@@ -3284,6 +3319,18 @@
        }
       ],
       "title": "Resource Type"
+     },
+     "result": {
+      "anyOf": [
+       {
+        "additionalProperties": true,
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Result"
      },
      "status": {
       "title": "Status",
