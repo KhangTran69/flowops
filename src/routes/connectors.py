@@ -4,7 +4,7 @@ Admin surface (``/connectors``, ``/trigger-rules``) configures sources and
 rules; the operator/webhook surface (``/events``) ingests canonical events,
 and the per-connector webhook sink authenticates transport-level signatures
 before handing deliveries to the shared ingestion pipeline in
-``src.connectors``.
+``src.services.connectors``.
 """
 
 from __future__ import annotations
@@ -17,10 +17,10 @@ from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from src import connectors as connector_lib
 from src import db
 from src.auth import Actor
 from src.deps import _actor_tenant, _admin_actor, _event_webhook_actor
+from src.services import connectors as connector_lib
 
 router = APIRouter(tags=["connectors"])
 MAX_EVENT_REQUEST_BYTES = 8 * 1024 * 1024

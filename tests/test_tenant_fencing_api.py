@@ -642,7 +642,7 @@ def test_blank_tenant_admin_cannot_list_connectors(fencing_client):
 
 
 def test_tenant_connector_polling_passes_actor_scope(fencing_client, monkeypatch):
-    from src import connectors
+    from src.services import connectors
 
     client, set_actor = fencing_client
     set_actor(
