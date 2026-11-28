@@ -9,7 +9,7 @@ import os
 import uuid
 from datetime import datetime, timedelta
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, or_, select, true, update
 from sqlalchemy.orm import Session
 
 from src import db, jobs
@@ -21,7 +21,7 @@ def _due(now: datetime, *, manual: bool = False):
     table = db.NotificationOutboxRecord
     return and_(
         table.status == "pending",
-        True if manual else or_(table.next_attempt_at.is_(None), table.next_attempt_at <= now),
+        true() if manual else or_(table.next_attempt_at.is_(None), table.next_attempt_at <= now),
         or_(
             table.lease_owner_token.is_(None),
             table.lease_expires_at.is_(None),
