@@ -219,7 +219,7 @@ def main():
         page.get_by_label('Test event JSON').fill('{"data":{"title":"Synthetic preview"}}')
         page.get_by_role('button', name='Preview mapping').click()
         expect(page.get_by_text('Mapping preview complete.')).to_be_visible(timeout=15000)
-        expect(page.get_by_text('Synthetic preview', exact=False)).to_be_visible()
+        expect(page.get_by_role('status').locator('pre').filter(has_text='Synthetic preview')).to_be_visible()
         expect(page.get_by_role('heading', name='Recent deliveries')).to_be_visible()
         page.once('dialog', lambda dialog: dialog.accept())
         page.get_by_role('button', name='Deactivate trigger').click()
