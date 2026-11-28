@@ -28,16 +28,16 @@ from src.deps import (
     _scope_execution_log_query,
     _scope_ticket_or_request_keyed_query,
 )
-from src.routes.onboarding import (  # noqa: E402
-    _definition_out,
-    _load_request,
-    _workflow_run_out,
-)
+from src.routes.definitions import _definition_out  # noqa: E402
 from src.routes.tickets import (  # noqa: E402
     _analyze_ticket,
     _load_ticket,
     _ticket_history,
     _triage_out,
+)
+from src.services.onboarding import (  # noqa: E402
+    _load_request,
+    _workflow_run_out,
 )
 
 router = APIRouter()
