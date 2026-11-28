@@ -2,9 +2,9 @@
 
 from datetime import datetime, timezone
 
+import pytest
 from alembic import command
 from alembic.config import Config
-import pytest
 from sqlalchemy import create_engine, inspect, text
 
 
