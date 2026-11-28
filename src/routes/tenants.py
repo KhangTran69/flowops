@@ -6,7 +6,7 @@ import json
 import os
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -21,12 +21,12 @@ router = APIRouter(tags=["tenants"])
 
 class TenantIn(BaseModel):
     name: str = Field(min_length=1, max_length=200)
-    entra_tenant_id: Optional[str] = Field(default=None, max_length=64)
-    default_domain: Optional[str] = Field(default=None, max_length=255)
-    licence_sku: Optional[str] = Field(default=None, max_length=120)
-    usage_location: Optional[str] = Field(default=None, pattern=r"^[A-Z]{2}$")
-    psa_company_id: Optional[str] = Field(default=None, pattern=r"^\d+$")
-    credential_ref: Optional[str] = Field(
+    entra_tenant_id: str | None = Field(default=None, max_length=64)
+    default_domain: str | None = Field(default=None, max_length=255)
+    licence_sku: str | None = Field(default=None, max_length=120)
+    usage_location: str | None = Field(default=None, pattern=r"^[A-Z]{2}$")
+    psa_company_id: str | None = Field(default=None, pattern=r"^\d+$")
+    credential_ref: str | None = Field(
         default=None,
         pattern=r"^[A-Za-z0-9_]{1,64}$",
         description="Suffix of FLOWOPS_TENANT_<REF>_GRAPH_CLIENT_ID/SECRET env vars. Never the secret itself.",
@@ -129,7 +129,7 @@ def graph_factory() -> tenants.GraphClientFactory:
 
 @router.post("/tenants/drift-check")
 def drift_check(
-    tenant: Optional[str] = Query(default=None, description="Check one tenant; default all active."),
+    tenant: str | None = Query(default=None, description="Check one tenant; default all active."),
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
 ) -> dict[str, Any]:

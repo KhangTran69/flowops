@@ -10,7 +10,7 @@ before handing deliveries to the shared ingestion pipeline in
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, ValidationError
@@ -57,7 +57,7 @@ async def _read_event_request_body(request: Request) -> bytes:
 class ConnectorIn(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     connector_type: str = Field(pattern=r"^(jira|servicenow|slack|msteams|generic)$")
-    tenant_key: Optional[str] = Field(default=None, max_length=64)
+    tenant_key: str | None = Field(default=None, max_length=64)
     config: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = True
 
@@ -65,18 +65,18 @@ class ConnectorIn(BaseModel):
 class ConnectorOut(ConnectorIn):
     id: int
     kind: str
-    last_polled_at: Optional[str] = None
+    last_polled_at: str | None = None
 
 
 class TriggerRuleIn(BaseModel):
     name: str = Field(min_length=1, max_length=120)
-    tenant_key: Optional[str] = Field(default=None, max_length=64)
-    source: Optional[str] = Field(default=None, max_length=40)
+    tenant_key: str | None = Field(default=None, max_length=64)
+    source: str | None = Field(default=None, max_length=40)
     event_type: str = Field(default="*", min_length=1, max_length=80)
     predicate: str = Field(default="true", min_length=1, max_length=2000)
     action_type: str = Field(pattern=r"^(start_workflow|notify)$")
-    request_type: Optional[str] = Field(default=None, pattern=r"^(onboarding|offboarding)$")
-    notify_url: Optional[str] = Field(default=None, max_length=500)
+    request_type: str | None = Field(default=None, pattern=r"^(onboarding|offboarding)$")
+    notify_url: str | None = Field(default=None, max_length=500)
     static_inputs: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = True
 
@@ -91,11 +91,11 @@ class EventIn(BaseModel):
 
     source: str = Field(default="api", min_length=1, max_length=40)
     type: str = Field(min_length=1, max_length=80)
-    id: Optional[str] = Field(default=None, max_length=255)
+    id: str | None = Field(default=None, max_length=255)
     title: str = Field(default="", max_length=200)
     description: str = Field(default="")
     payload: dict[str, Any] = Field(default_factory=dict)
-    tenant: Optional[str] = Field(default=None, max_length=64)
+    tenant: str | None = Field(default=None, max_length=64)
 
 
 def _to_normalized(item: EventIn) -> connector_lib.NormalizedEvent:
@@ -316,7 +316,7 @@ async def connector_webhook(
         )
     except ValueError as error:
         # Configured but secret env missing -> service unavailable, not a crash.
-        raise HTTPException(503, str(error))
+        raise HTTPException(503, str(error)) from error
 
     body = await _read_event_request_body(request)
     verifier = getattr(connector, "verify_webhook", None)
@@ -324,8 +324,8 @@ async def connector_webhook(
         raise HTTPException(401, "Webhook signature verification failed.")
     try:
         payload = _json.loads(body or b"{}")
-    except (_json.JSONDecodeError, UnicodeDecodeError):
-        raise HTTPException(400, "Request body is not valid JSON.")
+    except (_json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(400, "Request body is not valid JSON.") from exc
 
     events = connector.parse_webhook(payload)
     if len(events) > MAX_EVENTS_PER_BATCH:
@@ -524,8 +524,8 @@ async def ingest_events_api(
 
     try:
         payload = _json.loads(await _read_event_request_body(request) or b"{}")
-    except (_json.JSONDecodeError, UnicodeDecodeError):
-        raise HTTPException(400, "Request body is not valid JSON.")
+    except (_json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(400, "Request body is not valid JSON.") from exc
     if isinstance(payload, list):
         items = payload
     elif isinstance(payload, dict) and "events" in payload:

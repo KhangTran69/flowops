@@ -7,13 +7,12 @@ identifiers instead of being swallowed by bare ``except Exception`` blocks.
 
 import logging
 import os
-from typing import Any, Optional
-
+from typing import Any
 
 _CONFIGURED = False
 
 
-def configure(level: Optional[str] = None) -> logging.Logger:
+def configure(level: str | None = None) -> logging.Logger:
     """Idempotently configure the root ``flowops`` logger.
 
     Log level comes from ``FLOWOPS_LOG_LEVEL`` (default ``INFO``). Format is a
@@ -41,10 +40,10 @@ def log_exception(
     context: str,
     error: BaseException,
     *,
-    run_id: Optional[str] = None,
-    ticket_id: Optional[str] = None,
-    request_id: Optional[Any] = None,
-    correlation_id: Optional[str] = None,
+    run_id: str | None = None,
+    ticket_id: str | None = None,
+    request_id: Any | None = None,
+    correlation_id: str | None = None,
     **fields: Any,
 ) -> None:
     """Log a handled exception with identifiers before it is re-raised.

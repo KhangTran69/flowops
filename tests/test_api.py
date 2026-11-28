@@ -13,8 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src import api, db
-from src.routes import monitoring
-from src.routes import tickets
+from src.routes import monitoring, tickets
 
 VALID_REQUEST = {
     "userId": 7,

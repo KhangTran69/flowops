@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from typing import Any, Optional
+from typing import Any
 
 import httpx
 from mcp.server.mcpserver import MCPServer
@@ -52,7 +52,7 @@ class FlowOpsTools:
         if not self.allow_writes:
             raise FlowOpsToolError(f"{tool} is a write tool; set FLOWOPS_MCP_ALLOW_WRITES=true to enable it")
 
-    def list_tickets(self, status: Optional[str] = None, queue: Optional[str] = None, limit: int = 20) -> list[dict]:
+    def list_tickets(self, status: str | None = None, queue: str | None = None, limit: int = 20) -> list[dict]:
         tickets = self._call("GET", "/tickets", params={"limit": 500})
         filtered = [
             t for t in tickets
@@ -90,8 +90,8 @@ class FlowOpsTools:
         employee_email: str,
         department: str,
         requester_id: int,
-        tenant_key: Optional[str] = None,
-        start_date: Optional[str] = None,
+        tenant_key: str | None = None,
+        start_date: str | None = None,
     ) -> dict:
         """Create an onboarding/offboarding request; its approval steps wait for a human."""
         self._require_writes("request_onboarding")
@@ -123,7 +123,7 @@ class FlowOpsTools:
     def automation_kpis(self, days: int = 30) -> dict:
         return self._call("GET", "/reports/summary", params={"days": days})
 
-    def tenant_drift_report(self, tenant: Optional[str] = None) -> dict:
+    def tenant_drift_report(self, tenant: str | None = None) -> dict:
         return self._call("POST", "/tenants/drift-check", params={"tenant": tenant} if tenant else None)
 
 

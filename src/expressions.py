@@ -23,8 +23,9 @@ Example::
 from __future__ import annotations
 
 import re
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any
 
 MAX_SOURCE_LENGTH = 500
 MAX_DEPTH = 24

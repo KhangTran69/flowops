@@ -1,14 +1,14 @@
 """Tests for the credential-free v0.6 action layer."""
 
 import shutil
+
 import pytest
 from fastapi.testclient import TestClient
 
 from src import api, db
 from src.actions import ActionResult
-from src.routes import onboarding as onboarding_routes
 from src.notify import DeliveryResult
-
+from src.routes import onboarding as onboarding_routes
 
 VALID_REQUEST = {
     "request_type": "onboarding",
@@ -108,7 +108,9 @@ def test_adapter_selection_requires_webhook_url():
     assert adapter_from_environment({"FLOWOPS_ACTION_ADAPTER": "simulated"}).__class__.__name__ == "SimulatedMicrosoftAdapter"
     with pytest.raises(ValueError, match="FLOWOPS_POWER_AUTOMATE_URL"):
         adapter_from_environment({"FLOWOPS_ACTION_ADAPTER": "power_automate"})
-    assert isinstance(adapter_from_environment({"FLOWOPS_ACTION_ADAPTER": "power_automate", "FLOWOPS_POWER_AUTOMATE_URL": "https://flow.example/trigger"}), PowerAutomateAdapter)
+    assert isinstance(adapter_from_environment(
+        {"FLOWOPS_ACTION_ADAPTER": "power_automate", "FLOWOPS_POWER_AUTOMATE_URL": "https://flow.example/trigger"}),
+        PowerAutomateAdapter)
 
 
 def test_power_automate_classifies_authentication_failures(monkeypatch):
@@ -307,7 +309,7 @@ def test_powershell_adapter_from_environment():
 
 
 def test_webhook_adapter_posts(monkeypatch):
-    from src.actions import GenericWebhookAdapter, ActionResult
+    from src.actions import ActionResult, GenericWebhookAdapter
 
     calls = []
 
@@ -345,7 +347,7 @@ def test_webhook_adapter_posts(monkeypatch):
 
 
 def test_webhook_adapter_without_idempotency_key(monkeypatch):
-    from src.actions import GenericWebhookAdapter, ActionResult
+    from src.actions import ActionResult, GenericWebhookAdapter
 
     class Response:
         def raise_for_status(self):

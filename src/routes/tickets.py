@@ -15,30 +15,37 @@ import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from fastapi import status as http_status
 from pydantic import BaseModel
-from sqlalchemy import Integer, String, and_, cast, func, or_, select, text
+from sqlalchemy import Integer, cast, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from src import ai_agent, db, idempotency, jobs, metrics, scheduler
+from src import ai_agent, db, idempotency
+from src.api import (  # noqa: E402
+    IDEMPOTENCY_SCOPE_TICKET,
+    _complete_idempotency_key,
+    _record_ai_provider_error,
+    _record_ai_triage,
+    _release_idempotency_key,
+    _request_fingerprint,
+    _reserve_idempotency_key,
+    _validate_idempotency_key,
+)
 from src.auth import Actor
 from src.deps import (
     _actor_tenant,
-    _global_admin_actor,
     _new_run_id,
     _operator_actor,
     _require_ticket_access,
     _scope_execution_log_query,
-    _scope_ticket_or_request_keyed_query,
     _webhook_actor,
 )
 from src.notify import deliver_webhook
 from src.routing import route_ticket
-from src.ticket_processor import normalize_ticket
 from src.schemas import (
     AIRecommendationOut,
     AISummaryOut,
@@ -51,19 +58,7 @@ from src.schemas import (
     TicketHistoryOut,
     TicketIntakeRequest,
 )
-
-from src.api import (  # noqa: E402
-    IDEMPOTENCY_SCOPE_TICKET,
-    _complete_idempotency_key,
-    _record_ai_apply,
-    _record_ai_provider_error,
-    _record_ai_triage,
-    _release_idempotency_key,
-    _request_fingerprint,
-    _reserve_idempotency_key,
-    _validate_idempotency_key,
-)
-
+from src.ticket_processor import normalize_ticket
 
 router = APIRouter()
 
@@ -122,7 +117,7 @@ def _notify(event: str, ticket: Ticket, run_id: str, session: Session) -> None:
 def _process_intake(
     request: TicketIntakeRequest,
     session: Session,
-    actor_subject: Optional[str] = None,
+    actor_subject: str | None = None,
 ) -> Ticket:
     """Normalize, route, persist, and log one incoming ticket."""
     run_id = _new_run_id()
@@ -173,7 +168,7 @@ def create_ticket(
     response: Response,
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
-    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> Ticket:
     """Validate, route, and store a ticket.
 
@@ -403,9 +398,9 @@ def _analyze_ticket(
     record: db.TicketRecord,
     history: list[dict[str, Any]],
     *,
-    request: Optional[Request] = None,
-    session: Optional[Session] = None,
-    actor: Optional[Actor] = None,
+    request: Request | None = None,
+    session: Session | None = None,
+    actor: Actor | None = None,
 ) -> ai_agent.TriageResult:
     snapshot = ai_agent.TicketSnapshot.from_record(record)
     try:
@@ -438,12 +433,12 @@ def list_tickets(
     actor: Actor = Depends(_operator_actor),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
-    tenant: Optional[str] = Query(default=None, max_length=64),
-    search: Optional[str] = Query(default=None, max_length=200),
-    status: Optional[str] = Query(default=None, max_length=64),
-    priority: Optional[str] = Query(default=None, max_length=64),
-    queue: Optional[str] = Query(default=None, max_length=128),
-    category: Optional[str] = Query(default=None, max_length=128),
+    tenant: str | None = Query(default=None, max_length=64),
+    search: str | None = Query(default=None, max_length=200),
+    status: str | None = Query(default=None, max_length=64),
+    priority: str | None = Query(default=None, max_length=64),
+    queue: str | None = Query(default=None, max_length=128),
+    category: str | None = Query(default=None, max_length=128),
 ) -> list[Ticket]:
     """List stored tickets with bounded database pagination."""
     query = select(db.TicketRecord).order_by(cast(db.TicketRecord.ticket_id, Integer))
@@ -511,10 +506,14 @@ def command_center_summary(
     return DashboardSummaryOut(
         open_tickets=session.scalar(tickets.where(db.TicketRecord.status == "open")) or 0,
         urgent_tickets=session.scalar(tickets.where(db.TicketRecord.status == "open", db.TicketRecord.priority == "urgent")) or 0,
-        pending_approvals=session.scalar(items.where(active, db.ChecklistItemRecord.requires_approval.is_(True), db.ChecklistItemRecord.status == "pending")) or 0,
+        pending_approvals=session.scalar(items.where(
+            active, db.ChecklistItemRecord.requires_approval.is_(True), db.ChecklistItemRecord.status == "pending")) or 0,
         active_runs=session.scalar(runs.where(active)) or 0,
         overdue_steps=session.scalar(overdue) or 0,
-        recorded_closed_today=session.scalar(tickets.where(db.TicketRecord.status == "closed", db.TicketRecord.closed_at >= midnight, db.TicketRecord.closed_at < midnight + timedelta(days=1))) or 0,
+        recorded_closed_today=session.scalar(tickets.where(
+            db.TicketRecord.status == "closed",
+            db.TicketRecord.closed_at >= midnight,
+            db.TicketRecord.closed_at < midnight + timedelta(days=1))) or 0,
     )
 
 

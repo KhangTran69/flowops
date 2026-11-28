@@ -58,6 +58,16 @@ tests skip unless `FLOWOPS_TEST_POSTGRES_URL` is set; CI's `postgres-idempotency
 job runs them against a `postgres:16` service. Test counts are not pinned in
 docs — run the suite for the current number.
 
+## Lint
+```bash
+ruff check src tests scripts
+```
+Configuration lives in `pyproject.toml` (`[tool.ruff]`). The rules are
+`E,F,I,B,UP` with `line-length = 140` and `target-version = "py310"` — py310
+matches the repo's Python floor, and 140 keeps the existing dense line style
+instead of reformatting the codebase. CI runs this in a blocking `lint` job;
+a failing `ruff check` fails the PR.
+
 ## Conventions for changes
 - Schema changes go through a new Alembic revision; never edit existing migrations or the baseline. SQLite also gets the additive column via `_add_missing_columns()` in `src/db.py`.
 - API changes are additive: existing response shapes, status codes, and idempotency semantics are contracts. The command-center validates responses against typed contracts (`command-center/src/lib/contracts.ts`) at runtime.

@@ -16,7 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from src import api, db, jobs, triggers, worker
+from src import api, db, triggers, worker
 
 SECRET = "whsec-LEAKCANARY-7f3a9c1e5b-32-byte-test-secret"
 PG_URL = os.environ.get("FLOWOPS_TEST_POSTGRES_URL")
@@ -235,7 +235,7 @@ def test_webhook_secret_and_signature_never_leak(client, caplog):
         assert any(log.action == "trigger.delivery.received" for log in logs)
         job_rows = session.execute(select(db.WorkflowJobRecord)).scalars().all()
         stored = [d.payload_json + (d.error or "") for d in deliveries]
-        stored += [json.dumps({c.name: str(getattr(l, c.name)) for c in l.__table__.columns}) for l in logs]
+        stored += [json.dumps({c.name: str(getattr(log, c.name)) for c in log.__table__.columns}) for log in logs]
         stored += [json.dumps({c.name: str(getattr(j, c.name)) for c in j.__table__.columns}) for j in job_rows]
         for blob in stored:
             for needle in needles:

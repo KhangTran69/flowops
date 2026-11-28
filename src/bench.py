@@ -20,7 +20,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from fastapi.testclient import TestClient
 
@@ -113,7 +113,7 @@ def _as_utc(value):
 def run_benchmark(
     *,
     requests: int = 25,
-    database_url: Optional[str] = None,
+    database_url: str | None = None,
     iteration_cap: int = 20_000,
 ) -> BenchmarkReport:
     """Drive ``requests`` workflows to completion and measure the run."""
@@ -260,7 +260,7 @@ def format_report(report: BenchmarkReport) -> str:
     )
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="FlowOps end-to-end workflow benchmark")
     parser.add_argument("--requests", type=int, default=25)
     parser.add_argument("--json", dest="json_path", default=None)

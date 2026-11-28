@@ -21,7 +21,7 @@ import time
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from fastapi import status as http_status
@@ -31,12 +31,22 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src import db, definitions, idempotency, scheduler, timers, ui_session, workflow
-from src.onboarding import checklist_for, initial_status_for
 from src.actions import ActionAdapter, ActionError, action_for_step, adapter_from_environment
+from src.api import (  # noqa: E402
+    IDEMPOTENCY_PROCESSING_TIMEOUT,
+    IDEMPOTENCY_SCOPE_ONBOARDING,
+    _action_attempts,
+    _complete_idempotency_key,
+    _notify_action_failure,
+    _release_idempotency_key,
+    _request_fingerprint,
+    _reserve_idempotency_key,
+    _validate_idempotency_key,
+)
 from src.auth import Actor
 from src.deps import (
-    _admin_actor,
     _actor_tenant,
+    _admin_actor,
     _global_admin_actor,
     _new_run_id,
     _operator_actor,
@@ -44,6 +54,7 @@ from src.deps import (
     _require_workflow_run_access,
 )
 from src.m365_simulator import M365Simulator
+from src.onboarding import checklist_for, initial_status_for
 from src.schemas import (
     ActionExecutionOut,
     ChecklistItemOut,
@@ -63,19 +74,6 @@ from src.schemas import (
     WorkflowRunOut,
     WorkflowStepRunOut,
 )
-
-from src.api import (  # noqa: E402
-    IDEMPOTENCY_PROCESSING_TIMEOUT,
-    IDEMPOTENCY_SCOPE_ONBOARDING,
-    _action_attempts,
-    _complete_idempotency_key,
-    _notify_action_failure,
-    _release_idempotency_key,
-    _request_fingerprint,
-    _reserve_idempotency_key,
-    _validate_idempotency_key,
-)
-
 
 router = APIRouter()
 
@@ -188,7 +186,7 @@ def _definition_out(
 
 def _definition_mutation(
     session: Session, response: Response, actor: Actor, operation: str,
-    definition_key: str, payload: BaseModel, idempotency_key: Optional[str],
+    definition_key: str, payload: BaseModel, idempotency_key: str | None,
 ) -> WorkflowDefinitionOut:
     """Use the existing fenced transaction for all definition mutations."""
     _validate_idempotency_key(idempotency_key)
@@ -276,7 +274,7 @@ def create_workflow_definition(
     response: Response,
     actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
-    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> WorkflowDefinitionOut:
     return _definition_mutation(session, response, actor, "create", payload.key, payload, idempotency_key)
 
@@ -288,7 +286,7 @@ def create_workflow_definition_version(
     response: Response,
     actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
-    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> WorkflowDefinitionOut:
     return _definition_mutation(session, response, actor, "version", key, payload, idempotency_key)
 
@@ -300,7 +298,7 @@ def publish_workflow_definition(
     response: Response,
     actor: Actor = Depends(_global_admin_actor),
     session: Session = Depends(db.get_session),
-    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> WorkflowDefinitionOut:
     return _definition_mutation(session, response, actor, "publish", key, payload, idempotency_key)
 
@@ -449,7 +447,7 @@ def get_workflow_definition(
 def _create_onboarding_request(
     request: OnboardingRequestIn,
     session: Session,
-    actor_subject: Optional[str] = None,
+    actor_subject: str | None = None,
 ) -> OnboardingRequestOut:
     """Create the record and checklist, returning the API response shape."""
     started = time.perf_counter()
@@ -531,7 +529,7 @@ def create_onboarding_request(
     response: Response,
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
-    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> OnboardingRequestOut:
     """Create an onboarding/offboarding request and generate its checklist.
 
@@ -653,7 +651,7 @@ def get_onboarding_request_status(
 
 def _workflow_run_out(
     session: Session, run: db.WorkflowRunRecord, *,
-    loaded: Optional[tuple] = None,
+    loaded: tuple | None = None,
 ) -> WorkflowRunOut:
     if loaded is None:
         request, items = _load_request(session, run.request_id)
@@ -779,11 +777,11 @@ def command_center_session(
 
 @router.get("/workflow-runs", response_model=list[WorkflowRunOut])
 def list_workflow_runs(
-    status_filter: Optional[str] = Query(default=None, alias="status"),
-    tenant: Optional[str] = Query(default=None, max_length=64),
-    definition: Optional[str] = Query(default=None, max_length=128),
-    created_after: Optional[datetime] = Query(default=None),
-    created_before: Optional[datetime] = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status"),
+    tenant: str | None = Query(default=None, max_length=64),
+    definition: str | None = Query(default=None, max_length=128),
+    created_after: datetime | None = Query(default=None),
+    created_before: datetime | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     actor: Actor = Depends(_operator_actor),
@@ -837,7 +835,7 @@ def list_workflow_runs(
 
 def _run_action(
     session: Session, run_id: int, actor: Actor, action: str,
-    response: Response, idempotency_key: Optional[str],
+    response: Response, idempotency_key: str | None,
 ) -> WorkflowRunOut:
     run = session.get(db.WorkflowRunRecord, run_id)
     if run is None:
@@ -903,7 +901,7 @@ def decide_workflow_step(
     response: Response,
     actor: Actor = Depends(_admin_actor),
     session: Session = Depends(db.get_session),
-    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> WorkflowRunOut:
     # Authenticate and authorize before a reservation can be replayed.
     run = session.get(db.WorkflowRunRecord, run_id)
@@ -1001,7 +999,7 @@ def pause_workflow_run(
     response: Response,
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
-    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> WorkflowRunOut:
     return _run_action(session, run_id, actor, "pause", response, idempotency_key)
 
@@ -1012,7 +1010,7 @@ def resume_workflow_run(
     response: Response,
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
-    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> WorkflowRunOut:
     return _run_action(session, run_id, actor, "resume", response, idempotency_key)
 
@@ -1023,7 +1021,7 @@ def cancel_workflow_run(
     response: Response,
     actor: Actor = Depends(_operator_actor),
     session: Session = Depends(db.get_session),
-    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> WorkflowRunOut:
     return _run_action(session, run_id, actor, "cancel", response, idempotency_key)
 
@@ -1043,7 +1041,7 @@ def _transition_item(
     item_id: int,
     request: Request,
     action: Literal["approve", "complete"],
-    actor_subject: Optional[str] = None,
+    actor_subject: str | None = None,
 ) -> OnboardingRequestOut:
     record, items = _load_request(session, request_id)
     item = _get_item(session, record, item_id)
@@ -1465,7 +1463,7 @@ def complete_offboarding_step(
         session.add(claim)
         try:
             session.commit()
-        except IntegrityError:
+        except IntegrityError as exc:
             session.rollback()
             winner = session.execute(
                 select(table).where(
@@ -1479,7 +1477,7 @@ def complete_offboarding_step(
             session.commit()
             raise HTTPException(
                 409, "Offboarding step is already running; retry later."
-            )
+            ) from exc
 
     item = next(i for i in items if i.step_key == step_key)
     missing = workflow.missing_prerequisites(item, items)

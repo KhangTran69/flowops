@@ -30,10 +30,15 @@ def main():
         with engine.connect() as connection:
             columns = {column["name"] for column in sa.inspect(connection).get_columns("tickets")}
             assert "description" not in columns and "requester_email" not in columns
-            assert connection.execute(sa.text("SELECT title FROM tickets WHERE ticket_id=:id"), {"id": ticket_id}).scalar_one() == "Migration fixture"
+            assert connection.execute(
+                sa.text("SELECT title FROM tickets WHERE ticket_id=:id"), {"id": ticket_id}
+            ).scalar_one() == "Migration fixture"
         command.upgrade(config, "head")
         with engine.begin() as connection:
-            row = connection.execute(sa.text("SELECT title, description, requester_email FROM tickets WHERE ticket_id=:id"), {"id": ticket_id}).one()
+            row = connection.execute(
+                sa.text("SELECT title, description, requester_email FROM tickets WHERE ticket_id=:id"),
+                {"id": ticket_id},
+            ).one()
             assert tuple(row) == ("Migration fixture", None, None)
             connection.execute(sa.text("DELETE FROM tickets WHERE ticket_id=:id"), {"id": ticket_id})
         print("MIGRATION_ROUNDTRIP: PASS; legacy ticket retained; downgraded optional metadata is intentionally lost.")

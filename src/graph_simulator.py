@@ -96,7 +96,9 @@ class SimulatedTenant:
         if path == "users" and method == "POST":
             upn = body["userPrincipalName"]
             if any(u["userPrincipalName"].lower() == upn.lower() for u in self.users.values()):
-                return _error(400, "Request_BadRequest", "Another object with the same value for property userPrincipalName already exists.")
+                return _error(
+                    400, "Request_BadRequest",
+                    "Another object with the same value for property userPrincipalName already exists.")
             user = self._add_user(
                 upn, body["displayName"], [],
                 usageLocation=body.get("usageLocation"), department=body.get("department"),
@@ -115,14 +117,17 @@ class SimulatedTenant:
                 return httpx.Response(200, json={"value": True})
             if sub == "mailboxSettings" and method == "PATCH":
                 if not user["assignedLicenses"]:
-                    return _error(404, "MailboxNotEnabledForRESTAPI", "The mailbox is either inactive, soft-deleted, or is hosted on-premise.")
+                    return _error(
+                        404, "MailboxNotEnabledForRESTAPI",
+                        "The mailbox is either inactive, soft-deleted, or is hosted on-premise.")
                 user["mailboxSettings"] = body
                 return httpx.Response(200, json=body)
             if sub == "assignLicense" and method == "POST":
                 if not user.get("usageLocation"):
                     return _error(400, "Request_BadRequest", "License assignment cannot be done for user with invalid usage location.")
                 for remove in body.get("removeLicenses", []):
-                    user["assignedLicenses"] = [l for l in user["assignedLicenses"] if l["skuId"] != remove]
+                    user["assignedLicenses"] = [
+                        license for license in user["assignedLicenses"] if license["skuId"] != remove]
                     self._sku_by_id(remove)["consumedUnits"] -= 1
                 for add in body.get("addLicenses", []):
                     sku = self._sku_by_id(add["skuId"])

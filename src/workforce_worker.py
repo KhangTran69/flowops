@@ -9,7 +9,6 @@ import re
 import time
 import uuid
 from datetime import timedelta
-from typing import Optional
 
 import requests
 from sqlalchemy import or_, select, update
@@ -20,7 +19,7 @@ MAX_ATTEMPTS = 5
 LEASE_SECONDS = 60
 
 
-def _safe_error(value: Optional[str]) -> Optional[str]:
+def _safe_error(value: str | None) -> str | None:
     if not value:
         return value
     value = re.sub(r"(?i)\bBearer\s+[^\s,;]+", "Bearer [REDACTED]", value)
@@ -54,7 +53,7 @@ def _claim(session):
     return candidate.id, candidate.event_id, candidate.payload_json, lease_token, candidate.attempts + 1
 
 
-def run_once(*, timeout: float = 10.0) -> Optional[dict]:
+def run_once(*, timeout: float = 10.0) -> dict | None:
     db._ensure_tables()
     session = db.SessionLocal()
     try:

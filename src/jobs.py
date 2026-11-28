@@ -8,8 +8,9 @@ job after another worker has taken it over.
 
 import json
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timedelta
-from typing import Any, Iterable, Optional
+from typing import Any
 
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
@@ -42,10 +43,10 @@ def enqueue_job(
     *,
     job_type: str,
     payload: dict[str, Any],
-    idempotency_key: Optional[str] = None,
-    resource_type: Optional[str] = None,
-    resource_id: Optional[str] = None,
-    label: Optional[str] = None,
+    idempotency_key: str | None = None,
+    resource_type: str | None = None,
+    resource_id: str | None = None,
+    label: str | None = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
 ) -> db.WorkflowJobRecord:
     """Insert a queued job, deduplicating by idempotency key when supplied."""
@@ -90,12 +91,12 @@ def _claimable(now: datetime):
 
 def claim_job(
     session: Session,
-    worker_id: Optional[str] = None,
+    worker_id: str | None = None,
     *,
     lease_seconds: int = DEFAULT_LEASE_SECONDS,
-    now: Optional[datetime] = None,
+    now: datetime | None = None,
     candidate_limit: int = 10,
-) -> Optional[db.WorkflowJobRecord]:
+) -> db.WorkflowJobRecord | None:
     """Atomically claim the oldest due job for this worker."""
     now = now or db.utcnow()
     token = uuid.uuid4().hex
@@ -136,7 +137,7 @@ def heartbeat_job(
     owner_token: str,
     *,
     lease_seconds: int = DEFAULT_LEASE_SECONDS,
-    now: Optional[datetime] = None,
+    now: datetime | None = None,
 ) -> bool:
     """Extend a running job lease only while this worker still owns it."""
     now = now or db.utcnow()
@@ -163,8 +164,8 @@ def complete_job(
     job_id: int,
     owner_token: str,
     *,
-    result: Optional[dict[str, Any]] = None,
-    now: Optional[datetime] = None,
+    result: dict[str, Any] | None = None,
+    now: datetime | None = None,
 ) -> bool:
     """Mark a job succeeded only if this worker still owns the lease."""
     now = now or db.utcnow()
@@ -198,9 +199,9 @@ def fail_job(
     error: str,
     *,
     retryable: bool = True,
-    now: Optional[datetime] = None,
-    delay_seconds: Optional[int] = None,
-) -> Optional[str]:
+    now: datetime | None = None,
+    delay_seconds: int | None = None,
+) -> str | None:
     """Schedule a retry or dead-letter a job, fenced on the owner token.
 
     Returns the resulting status, or ``None`` if this worker no longer owns the
@@ -248,7 +249,7 @@ def fail_job(
 
 
 def retry_failed_job(
-    session: Session, job_id: int, *, now: Optional[datetime] = None
+    session: Session, job_id: int, *, now: datetime | None = None
 ) -> bool:
     """Operator action: return a failed job to the queue with a fresh budget."""
     now = now or db.utcnow()
@@ -272,7 +273,7 @@ def retry_failed_job(
 
 
 def cancel_job(
-    session: Session, job_id: int, *, now: Optional[datetime] = None
+    session: Session, job_id: int, *, now: datetime | None = None
 ) -> bool:
     """Operator action: cancel a job that has not started yet."""
     now = now or db.utcnow()
@@ -299,7 +300,7 @@ def cancel_job(
 def list_jobs(
     session: Session,
     *,
-    status: Optional[str] = None,
+    status: str | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> Iterable[db.WorkflowJobRecord]:

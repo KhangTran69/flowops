@@ -21,8 +21,9 @@ import secrets
 import string
 import threading
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator, Optional, Protocol
+from typing import Any, Protocol
 
 import httpx
 
@@ -40,9 +41,9 @@ class GraphError(RuntimeError):
         self,
         message: str,
         *,
-        status_code: Optional[int] = None,
-        code: Optional[str] = None,
-        request_id: Optional[str] = None,
+        status_code: int | None = None,
+        code: str | None = None,
+        request_id: str | None = None,
     ) -> None:
         detail = message
         if code:
@@ -100,7 +101,7 @@ class ClientCredentialsToken:
         *,
         authority: str = LOGIN_AUTHORITY,
         scope: str = GRAPH_SCOPE,
-        http_client: Optional[httpx.Client] = None,
+        http_client: httpx.Client | None = None,
         timeout: float = 10.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -114,7 +115,7 @@ class ClientCredentialsToken:
         self.http_client = http_client
         self.timeout = timeout
         self.clock = clock
-        self._access_token: Optional[str] = None
+        self._access_token: str | None = None
         self._expires_at = 0.0
         self._lock = threading.Lock()
 
@@ -194,7 +195,7 @@ class GraphClient:
         token_provider: TokenProvider,
         *,
         base_url: str = GRAPH_BASE_URL,
-        http_client: Optional[httpx.Client] = None,
+        http_client: httpx.Client | None = None,
         timeout: float = 15.0,
         max_retries: int = 4,
         sleep: Callable[[float], None] = time.sleep,
@@ -213,10 +214,10 @@ class GraphClient:
         method: str,
         path: str,
         *,
-        params: Optional[dict[str, Any]] = None,
+        params: dict[str, Any] | None = None,
         json: Any = None,
-        headers: Optional[dict[str, str]] = None,
-    ) -> Optional[dict[str, Any]]:
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any] | None:
         url = path if path.startswith("https://") else f"{self.base_url}/{path.lstrip('/')}"
         client = self.http_client or httpx.Client(timeout=self.timeout)
         try:
@@ -257,10 +258,10 @@ class GraphClient:
                 client.close()
 
     def paginate(
-        self, path: str, *, params: Optional[dict[str, Any]] = None, headers: Optional[dict[str, str]] = None
+        self, path: str, *, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None
     ) -> Iterator[dict[str, Any]]:
         """Yield every item of a collection, following ``@odata.nextLink``."""
-        next_path: Optional[str] = path
+        next_path: str | None = path
         next_params = params
         while next_path:
             page = self.request("GET", next_path, params=next_params, headers=headers) or {}
@@ -270,7 +271,7 @@ class GraphClient:
 
     # -- users -------------------------------------------------------------
 
-    def find_user(self, user_principal_name: str) -> Optional[dict[str, Any]]:
+    def find_user(self, user_principal_name: str) -> dict[str, Any] | None:
         matches = list(
             self.paginate(
                 "users",
@@ -295,8 +296,8 @@ class GraphClient:
         *,
         display_name: str,
         user_principal_name: str,
-        department: Optional[str] = None,
-        usage_location: Optional[str] = None,
+        department: str | None = None,
+        usage_location: str | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "accountEnabled": True,

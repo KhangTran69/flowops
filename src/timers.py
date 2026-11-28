@@ -8,9 +8,8 @@ import os
 import time
 import uuid
 from datetime import datetime, timedelta
-from typing import Optional
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, select, update
 from sqlalchemy.orm import Session
 
 from src import db
@@ -21,7 +20,7 @@ CANCELLED = "cancelled"
 
 
 def sync_timers(
-    session: Session, request_id: int, *, now: Optional[datetime] = None
+    session: Session, request_id: int, *, now: datetime | None = None
 ) -> None:
     """Create timers for active SLA steps and cancel timers for inactive ones."""
     at = now or db.utcnow()
@@ -57,7 +56,7 @@ def sync_timers(
 def fire_due(
     session: Session,
     *,
-    now: Optional[datetime] = None,
+    now: datetime | None = None,
     limit: int = 50,
     lease_seconds: int = 60,
 ) -> list[db.WorkflowTimerRecord]:
@@ -129,7 +128,6 @@ def fire_due(
             )
         if item.status == "pending":
             escalation = None
-            raw = getattr(item, "when_json", None)
             # The definition keeps escalation_queue in the step payload; the
             # checklist column is optional and may be absent on legacy rows.
             escalation = getattr(item, "escalation_queue", None)
@@ -139,7 +137,7 @@ def fire_due(
     return fired
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--poll", action="store_true")
