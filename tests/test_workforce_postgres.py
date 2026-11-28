@@ -91,3 +91,16 @@ def test_postgres_duplicate_task_completion_preserves_original_notes(workforce):
     winner = next(note for status, note in results if status == 200)
     tasks = client.get(f"/workforce/onboarding-requests/{request_id}").json()["tasks"]
     assert next(row for row in tasks if row["id"] == task["id"])["completion_notes"] == winner
+
+
+def test_postgres_manager_audit_filters_text_entity_ids(workforce):
+    client, request_id = workforce
+    actor = Actor("manager-a", ("MANAGER",), source="bearer", tenant_key="tenant-a")
+    api.app.dependency_overrides[_actor_from_header] = lambda: actor
+    response = client.get("/workforce/audit")
+    assert response.status_code == 200, response.text
+    assert any(row["entity_id"] == str(request_id) and row["action"] == "onboarding.approved"
+               for row in response.json())
+    other = Actor("other-manager", ("MANAGER",), source="bearer", tenant_key="tenant-a")
+    api.app.dependency_overrides[_actor_from_header] = lambda: other
+    assert client.get("/workforce/audit").json() == []

@@ -11,7 +11,7 @@ from datetime import date, datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select, update
+from sqlalchemy import String, cast, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -774,7 +774,8 @@ def _complete_provisioning(session: Session, event: db.WorkforceAutomationEventR
     if outcome == "success":
         if task.status != "DONE":
             task.status, task.completed_at = "DONE", db.utcnow()
-            task.completion_notes = "Simulated account provisioning confirmed by automation callback."
+            task.completion_notes = ("Provider reported account provisioning success; external effect not independently verified."
+                                     if actor_subject == "n8n" else "Simulated account provisioning completed.")
             automation_actor = Actor(actor_subject, (), tenant_key=event.tenant_key)
             _audit(session, automation_actor, "automation.provisioning_succeeded", "it_task", task.id,
                    tenant_key=task.tenant_key)
@@ -918,13 +919,21 @@ def audit(offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=200),
     query = _scope(select(db.WorkforceAuditRecord), db.WorkforceAuditRecord, actor)
     roles = {x.upper() for x in actor.roles}
     if "MANAGER" in roles and not (roles & {"HR", "IT_ADMIN", "AUTOMATION.ADMIN"}):
-        employee_ids = select(db.EmployeeRecord.id).where(db.EmployeeRecord.manager_subject == actor.subject)
-        request_ids = select(db.StaffOnboardingRecord.id).where(db.StaffOnboardingRecord.employee_id.in_(employee_ids))
-        task_ids = select(db.ITTaskRecord.id).where(db.ITTaskRecord.request_id.in_(request_ids))
+        employee_ids = _scope(select(db.EmployeeRecord.id).where(
+            db.EmployeeRecord.manager_subject == actor.subject), db.EmployeeRecord, actor)
+        request_ids = _scope(select(db.StaffOnboardingRecord.id).where(
+            db.StaffOnboardingRecord.employee_id.in_(employee_ids)), db.StaffOnboardingRecord, actor)
+        task_ids = _scope(select(db.ITTaskRecord.id).where(
+            db.ITTaskRecord.request_id.in_(request_ids)), db.ITTaskRecord, actor)
+        # Audit entity IDs are text, while workforce primary keys are integers.
+        # PostgreSQL rejects the implicit text/integer comparison SQLite permits.
         query = query.where(
-            ((db.WorkforceAuditRecord.entity_type == "onboarding_request") & db.WorkforceAuditRecord.entity_id.in_(request_ids)) |
-            ((db.WorkforceAuditRecord.entity_type == "employee") & db.WorkforceAuditRecord.entity_id.in_(employee_ids)) |
-            ((db.WorkforceAuditRecord.entity_type == "it_task") & db.WorkforceAuditRecord.entity_id.in_(task_ids))
+            ((db.WorkforceAuditRecord.entity_type == "onboarding_request") &
+             db.WorkforceAuditRecord.entity_id.in_(request_ids.with_only_columns(cast(db.StaffOnboardingRecord.id, String)))) |
+            ((db.WorkforceAuditRecord.entity_type == "employee") &
+             db.WorkforceAuditRecord.entity_id.in_(employee_ids.with_only_columns(cast(db.EmployeeRecord.id, String)))) |
+            ((db.WorkforceAuditRecord.entity_type == "it_task") &
+             db.WorkforceAuditRecord.entity_id.in_(task_ids.with_only_columns(cast(db.ITTaskRecord.id, String))))
         )
     rows = session.execute(query.order_by(db.WorkforceAuditRecord.created_at.desc()).offset(offset).limit(limit)).scalars()
     return [{"id": x.id, "actor_subject": x.actor_subject, "action": x.action, "entity_type": x.entity_type,

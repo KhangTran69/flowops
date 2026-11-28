@@ -95,6 +95,7 @@ def test_manager_approval_creates_tasks_once_and_completes_only_when_required_ta
 
     tasks = client.get("/workforce/tasks").json()
     assert sum(task["status"] == "DONE" for task in tasks) == 1
+    assert "external effect not independently verified" in next(task for task in tasks if task["task_key"] == "provision_account")["completion_notes"]
     for task in tasks:
         if task["task_key"] != "provision_account":
             response = client.patch(f"/workforce/tasks/{task['id']}", json={"status": "DONE", "completion_notes": "Checked."})
