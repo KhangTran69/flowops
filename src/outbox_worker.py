@@ -16,8 +16,8 @@ import time
 import uuid
 
 from src import db, idempotency, outbox
-from src.connectors import deliver_outbox_notification
 from src.notify import deliver_webhook
+from src.services.connectors import deliver_outbox_notification
 
 
 def _new_run_id() -> str:
