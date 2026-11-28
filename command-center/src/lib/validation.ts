@@ -46,6 +46,16 @@ const triggerDelivery = z.object({ id: integer, trigger_key: text, event_id: tex
 const triggerPreview = z.object({ trigger_key: text, target_type: text, mapped_payload: z.record(text, z.unknown()) })
 const knowledgeArticle = z.object({ id: text, title: text, category: text, keywords: z.array(text), steps: z.array(text), summary: text })
 
+const wfDashboard = z.object({ pending_approvals: count, in_progress: count, completed: count, overdue_tasks: count, available_assets: count, assigned_assets: count, failed_automation_deliveries: count, missing_automation_callbacks: count })
+const wfEmployee = z.object({ id: integer, employee_number: text, full_name: text, work_email: text, department: text, job_title: text, start_date: text, manager_subject: text, status: text })
+const wfRequest = z.object({ id: integer, employee_id: integer, employee_name: text, employee_email: text, department: text, start_date: text, manager_subject: text, status: text, created_by: text, submitted_at: nullableText, completed_at: nullableText, rejection_reason: nullableText })
+const wfTask = z.object({ id: integer, request_id: integer, task_key: text, title: text, description: text, assignee_subject: nullableText, due_at: nullableText, required: z.boolean(), status: text, completion_notes: nullableText, completed_at: nullableText })
+const wfRequestDetail = wfRequest.extend({ tasks: z.array(wfTask), approval: z.object({ decision: text, actor_subject: text, comment: nullableText, decided_at: text }).nullable() })
+const wfAsset = z.object({ id: integer, asset_tag: text, serial_number: nullableText, category: text, brand_model: text, condition: text, status: text, employee_id: integer.nullable() })
+const wfAssignment = z.object({ id: integer, employee_id: integer, assigned_by: text, assigned_at: text, returned_at: nullableText, return_notes: nullableText })
+const wfEvent = z.object({ event_id: text, event_type: text, request_id: integer, delivery_status: text, workflow_status: text, attempts: count, next_attempt_at: nullableText, last_error: nullableText, created_at: text, delivered_at: nullableText, callback_overdue: z.boolean() })
+const wfReminder = z.object({ event_id: text, task_id: integer, outcome: text, detail: nullableText, created_at: text })
+const wfAudit = z.object({ id: integer, actor_subject: text, action: text, entity_type: text, entity_id: text, detail: nullableText, created_at: text })
 export type Triage = z.infer<typeof triage>
 
 export function responseSchema(method: string, path: string): z.ZodType | undefined {
@@ -60,6 +70,25 @@ export function responseSchema(method: string, path: string): z.ZodType | undefi
   if (/^\/triggers\/[^/]+\/test$/.test(path)) return triggerPreview
   if (/^\/triggers\/[^/]+$/.test(path)) return trigger
   if (path === '/knowledge-base') return z.array(knowledgeArticle)
+  if (path === '/workforce/dashboard') return wfDashboard
+  if (path === '/workforce/employees') return method === 'GET' ? z.array(wfEmployee) : wfEmployee
+  if (path === '/workforce/onboarding-requests') return method === 'GET' ? z.array(wfRequest) : wfRequest
+  if (/^\/workforce\/onboarding-requests\/\d+$/.test(path)) return method === 'PATCH' ? wfRequest : wfRequestDetail
+  if (/^\/workforce\/onboarding-requests\/\d+\/(submit|approve|reject|copy-rejected)$/.test(path)) return wfRequest
+  if (/^\/workforce\/onboarding-requests\/\d+\/cancel$/.test(path)) return z.object({ id: integer, status: text })
+  if (/^\/workforce\/employees\/\d+$/.test(path)) return wfEmployee
+  if (/^\/workforce\/employees\/\d+\/status$/.test(path)) return z.object({ id: integer, status: text })
+  if (/^\/workforce\/tasks\/\d+$/.test(path)) return wfTask
+  if (/^\/workforce\/assets\/\d+\/status$/.test(path)) return wfAsset
+  if (path === '/workforce/tasks') return z.array(wfTask)
+  if (path === '/workforce/assets') return method === 'GET' ? z.array(wfAsset) : wfAsset
+  if (/^\/workforce\/assets\/\d+\/history$/.test(path)) return z.array(wfAssignment)
+  if (/^\/workforce\/assets\/\d+\/assign$/.test(path)) return z.object({ assignment_id: integer, asset_id: integer, employee_id: integer, assigned_at: text })
+  if (/^\/workforce\/assets\/\d+\/return$/.test(path)) return wfAsset
+  if (path === '/workforce/automation/events') return z.array(wfEvent)
+  if (path === '/workforce/automation/reminders') return z.array(wfReminder)
+  if (path === '/workforce/audit') return z.array(wfAudit)
+  if (/^\/workforce\/automation\/events\/[^/]+\/simulate$/.test(path)) return z.object({ eventId: text, workflowStatus: text, simulated: z.boolean().optional(), duplicate: z.boolean().optional() })
   if (path === '/command-center/deliveries') return z.array(z.object({ id: integer, ticket_id: nullableText, status: z.enum(['pending', 'failed']), attempts: integer.nonnegative(), created_at: text }))
   if (path === '/tickets') return method === 'GET' ? z.array(ticket) : ticket
   if (path === '/tickets/manual') return ticket

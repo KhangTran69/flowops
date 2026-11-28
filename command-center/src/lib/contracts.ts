@@ -165,3 +165,14 @@ export type Trigger = { key: string; name: string; source_key: string; event_typ
 export type TriggerDelivery = { id: number; trigger_key: string; event_id: string; status: string; request_id: string | null; received_at: string; processed_at: string | null }
 export type TriggerPreview = { trigger_key: string; target_type: string; mapped_payload: Record<string, unknown> }
 export type KnowledgeArticle = { id: string; title: string; category: string; keywords: string[]; steps: string[]; summary: string }
+
+export type WorkforceDashboard = { pending_approvals: number; in_progress: number; completed: number; overdue_tasks: number; available_assets: number; assigned_assets: number; failed_automation_deliveries: number; missing_automation_callbacks: number }
+export type WorkforceEmployee = { id: number; employee_number: string; full_name: string; work_email: string; department: string; job_title: string; start_date: string; manager_subject: string; status: string }
+export type WorkforceRequest = { id: number; employee_id: number; employee_name: string; employee_email: string; department: string; start_date: string; manager_subject: string; status: string; created_by: string; submitted_at: string | null; completed_at: string | null; rejection_reason: string | null }
+export type WorkforceTask = { id: number; request_id: number; task_key: string; title: string; description: string; assignee_subject: string | null; due_at: string | null; required: boolean; status: string; completion_notes: string | null; completed_at: string | null }
+export type WorkforceRequestDetail = WorkforceRequest & { tasks: WorkforceTask[]; approval: { decision: string; actor_subject: string; comment: string | null; decided_at: string } | null }
+export type WorkforceAsset = { id: number; asset_tag: string; serial_number: string | null; category: string; brand_model: string; condition: string; status: string; employee_id: number | null }
+export type WorkforceAssignment = { id: number; employee_id: number; assigned_by: string; assigned_at: string; returned_at: string | null; return_notes: string | null }
+export type WorkforceEvent = { event_id: string; event_type: string; request_id: number; delivery_status: string; workflow_status: string; attempts: number; next_attempt_at: string | null; last_error: string | null; created_at: string; delivered_at: string | null; callback_overdue: boolean }
+export type WorkforceReminder = { event_id: string; task_id: number; outcome: string; detail: string | null; created_at: string }
+export type WorkforceAudit = { id: number; actor_subject: string; action: string; entity_type: string; entity_id: string; detail: string | null; created_at: string }

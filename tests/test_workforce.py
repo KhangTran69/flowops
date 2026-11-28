@@ -95,6 +95,8 @@ def test_manager_approval_creates_tasks_once_and_completes_only_when_required_ta
 
     tasks = client.get("/workforce/tasks").json()
     assert sum(task["status"] == "DONE" for task in tasks) == 1
+    provision = next(task for task in tasks if task["task_key"] == "provision_account")
+    assert "external effect not independently verified" in provision["completion_notes"]
     for task in tasks:
         if task["task_key"] != "provision_account":
             response = client.patch(f"/workforce/tasks/{task['id']}", json={"status": "DONE", "completion_notes": "Checked."})
@@ -407,6 +409,7 @@ def test_worker_lease_token_fences_stale_worker_after_reclaim(workforce_client, 
     monkeypatch.setenv("FLOWOPS_N8N_WEBHOOK_SECRET", "webhook-secret")
 
     class Response:
+        status_code = 200
         def raise_for_status(self):
             pass
 
@@ -597,3 +600,88 @@ def test_workforce_production_browser_gate_does_not_disable_bearer_api(workforce
     set_actor(Actor("hr-bearer", ("HR",), source="bearer", tenant_key="tenant-a"))
     assert client.get("/workforce/ui").status_code == 403
     assert client.get("/workforce/employees").status_code == 200
+
+
+def test_provisioning_cannot_be_completed_manually_or_simulated_in_live_mode(workforce_client, monkeypatch):
+    client, set_actor = workforce_client
+    _, request_id = _approved_request(client, set_actor)
+    tasks = client.get("/workforce/tasks").json()
+    provision = next(task for task in tasks if task["task_key"] == "provision_account")
+    assert client.patch(f"/workforce/tasks/{provision['id']}", json={"status": "DONE"}).status_code == 409
+    event = client.get("/workforce/automation/events").json()[0]
+    monkeypatch.setenv("FLOWOPS_AUTOMATION_ADAPTER", "n8n")
+    assert client.post(f"/workforce/automation/events/{event['event_id']}/simulate").status_code == 404
+    assert client.get(f"/workforce/onboarding-requests/{request_id}").json()["status"] == "IN_PROGRESS"
+    task = next(task for task in tasks if task["task_key"] != "provision_account")
+    path = f"/workforce/tasks/{task['id']}"
+    assert client.patch(path, json={"status": "DONE", "completion_notes": "Verified"}).status_code == 200
+    assert client.patch(path, json={"status": "DONE", "completion_notes": "Overwrite"}).status_code == 409
+    assert next(row for row in client.get("/workforce/tasks").json() if row["id"] == task["id"])["completion_notes"] == "Verified"
+
+
+def test_global_admin_cannot_move_existing_draft_between_tenants(workforce_client):
+    client, set_actor = workforce_client
+    employee_a = _employee(client)
+    draft = client.post("/workforce/onboarding-requests", json={"employee_id": employee_a["id"]}).json()
+    set_actor(Actor("hr-b", ("HR",), source="session", tenant_key="tenant-b"))
+    employee_b = client.post("/workforce/employees", json={
+        "employee_number": "EMP-B", "full_name": "Synthetic B", "work_email": "b@example.test",
+        "department": "IT", "job_title": "Operator", "start_date": "2027-01-01",
+        "manager_subject": "manager-b",
+    }).json()
+    set_actor(Actor("global-admin", ("automation.admin",), source="bearer"))
+    response = client.patch(f"/workforce/onboarding-requests/{draft['id']}",
+                            json={"employee_id": employee_b["id"]})
+    assert response.status_code == 404
+    assert client.get(f"/workforce/onboarding-requests/{draft['id']}").json()["employee_id"] == employee_a["id"]
+
+
+def test_conflicting_callback_and_inactive_tenant_rejected(workforce_client):
+    client, set_actor = workforce_client
+    _, _ = _approved_request(client, set_actor)
+    event_id = client.get("/workforce/automation/events").json()[0]["event_id"]
+    headers = {"X-FlowOps-Automation-Key": "callback-test-secret"}
+    payload = {"eventId": event_id, "tenantKey": "tenant-a", "outcome": "success"}
+    path = "/workforce/automation/callbacks/provisioning"
+    assert client.post(path, json=payload, headers=headers).status_code == 200
+    assert client.post(path, json={**payload, "outcome": "failure"}, headers=headers).status_code == 409
+    with db.SessionLocal() as session:
+        session.get(db.TenantRecord, "tenant-a").active = False
+        session.commit()
+    assert client.post(path, json=payload, headers=headers).status_code == 404
+
+
+def test_workforce_abandoned_claims_consume_attempt_budget(workforce_client, monkeypatch):
+    client, set_actor = workforce_client
+    _, _ = _approved_request(client, set_actor)
+    from src.workforce_worker import MAX_ATTEMPTS, _claim, run_once
+    for attempt in range(MAX_ATTEMPTS):
+        with db.SessionLocal() as session:
+            claim = _claim(session)
+            assert claim is not None and claim[4] == attempt + 1
+            row = session.get(db.WorkforceAutomationEventRecord, claim[0])
+            row.lease_until = db.utcnow() - timedelta(seconds=1)
+            session.commit()
+    monkeypatch.setenv("FLOWOPS_AUTOMATION_ADAPTER", "n8n")
+    monkeypatch.setattr("src.workforce_worker.requests.post", lambda *a, **kw: pytest.fail("exhausted claim dispatched"))
+    assert run_once() is None
+    with db.SessionLocal() as session:
+        row = session.execute(select(db.WorkforceAutomationEventRecord)).scalar_one()
+        assert row.delivery_status == "FAILED" and row.attempts == MAX_ATTEMPTS
+
+
+def test_workforce_retry_does_not_replace_active_delivery_lease(workforce_client):
+    client, set_actor = workforce_client
+    _, _ = _approved_request(client, set_actor)
+    with db.SessionLocal() as session:
+        row = session.execute(select(db.WorkforceAutomationEventRecord)).scalar_one()
+        event_id = row.event_id
+        row.workflow_status = "FAILED"
+        row.lease_token = "active-worker"
+        row.lease_until = db.utcnow() + timedelta(seconds=60)
+        session.commit()
+    response = client.post(f"/workforce/automation/events/{event_id}/retry")
+    assert response.status_code == 409
+    with db.SessionLocal() as session:
+        row = session.execute(select(db.WorkforceAutomationEventRecord)).scalar_one()
+        assert row.lease_token == "active-worker" and row.workflow_status == "FAILED"

@@ -44,3 +44,12 @@ test('trigger and knowledge base contracts reject malformed rows', () => {
   assert(!preview.safeParse({trigger_key:'example', target_type:'ticket', mapped_payload:[]}).success)
   assert(!responseSchema('GET', '/triggers').safeParse([{key:'example', active:'yes'}]).success)
 })
+
+test('workforce contracts fail closed on malformed scope and counts', () => {
+  const dashboard = responseSchema('GET','/workforce/dashboard')
+  const counts = {pending_approvals:0,in_progress:0,completed:0,overdue_tasks:0,available_assets:0,assigned_assets:0,failed_automation_deliveries:0,missing_automation_callbacks:0}
+  assert(dashboard.safeParse(counts).success)
+  assert(!dashboard.safeParse({...counts, pending_approvals:-1}).success)
+  assert(!responseSchema('GET','/workforce/employees').safeParse([{id:1,full_name:'Synthetic'}]).success)
+  assert(!responseSchema('GET','/workforce/onboarding-requests/1').safeParse({id:1,tasks:[]}).success)
+})

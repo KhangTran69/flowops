@@ -4,7 +4,7 @@ import { responseSchema } from './validation'
 export type ApiResult<T = unknown> = { ok: boolean; status: number; data?: T; error?: string }
 
 export async function api<T = unknown>(
-  method: 'GET' | 'POST' | 'PUT',
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH',
   path: string,
   opts: { query?: Record<string, unknown>; body?: unknown; idempotencyKey?: string; signal?: AbortSignal } = {},
 ): Promise<ApiResult<T>> {
@@ -29,7 +29,7 @@ export async function api<T = unknown>(
 }
 
 export async function mutate(
-  method: 'POST' | 'PUT',
+  method: 'POST' | 'PUT' | 'PATCH',
   path: string,
   body: unknown,
   successMsg: string,
