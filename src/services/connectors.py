@@ -184,7 +184,10 @@ def _revision_identity(object_id: str, revision: str) -> str:
 def _jira_revision(value: Any) -> str:
     if not isinstance(value, str):
         raise ValueError("Jira revision timestamp missing.")
-    updated = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    normalized = value.replace("Z", "+00:00")
+    if re.search(r"[+-][0-9]{4}$", normalized):
+        normalized = normalized[:-2] + ":" + normalized[-2:]
+    updated = datetime.fromisoformat(normalized)
     if updated.tzinfo is None:
         raise ValueError("Jira revision timestamp requires timezone.")
     return updated.astimezone(timezone.utc).isoformat()
@@ -277,7 +280,8 @@ class ServiceNowConnector(SourceConnector):
             auth=(self.username, self.password),
             headers={"Accept": "application/json"},
             params={"sysparm_limit": MAX_POLL_RECORDS, "sysparm_query": query,
-                    "sysparm_fields": "sys_id,number,state,severity,assigned_to,short_description,description,sys_mod_count,sys_updated_on"},
+                    "sysparm_fields": ("sys_id,number,state,severity,assigned_to,short_description,"
+                                       "description,sys_mod_count,sys_updated_on")},
             timeout=15,
             stream=True,
             allow_redirects=False,
