@@ -322,3 +322,32 @@ def test_non_ascii_csrf_is_denied_without_server_error(client):
 
 def test_control_characters_not_allowed_in_redirect():
     assert ui_session.safe_next("/\t/evil.example") == "/dashboard"
+
+
+def test_account_changes_invalidate_existing_development_sessions(client, monkeypatch):
+    assert _login(client).status_code == 303
+    old = client.cookies.get(ui_session.SESSION_COOKIE)
+    assert client.get("/command-center/session").status_code == 200
+    monkeypatch.setenv("FLOWOPS_DEMO_USERS", "{}")
+    assert client.get("/command-center/session").status_code == 401
+    assert _login(client).status_code == 401
+    with pytest.raises(ui_session.UISessionError, match="configuration"):
+        ui_session.decode_session(old)
+
+
+def test_relogin_revokes_previous_cookie(client):
+    assert _login(client).status_code == 303
+    old = client.cookies.get(ui_session.SESSION_COOKIE)
+    assert _login(client).status_code == 303
+    assert client.get("/command-center/session").status_code == 200
+    client.cookies.clear()
+    client.cookies.set(ui_session.SESSION_COOKIE, old)
+    assert client.get("/command-center/session").status_code == 401
+
+
+def test_cross_site_and_oversized_login_are_rejected(client):
+    response = client.post("/login", data={"username": "admin", "password": "admin"},
+                           headers={"Sec-Fetch-Site": "cross-site"}, follow_redirects=False)
+    assert response.status_code == 403
+    assert _login(client, password="x" * 1025).status_code == 401
+    assert client.get("/command-center/session").status_code == 401

@@ -10,7 +10,6 @@ Or as a polling daemon:
 """
 
 import argparse
-import json
 import logging
 import signal
 import time
@@ -19,7 +18,7 @@ import uuid
 from sqlalchemy.exc import OperationalError
 
 from src import db, idempotency, outbox
-from src.notify import deliver_webhook
+from src.notify import DeliveryResult, deliver_webhook
 from src.services.connectors import deliver_outbox_notification
 
 
@@ -63,8 +62,10 @@ def run_once(
             return None
         owner_token = record.lease_owner_token or ""
         started = time.perf_counter()
-        payload = json.loads(record.payload_json)
-        if payload.get("event") == "trigger.fired" and payload.get("tenant"):
+        payload = outbox.decode_payload(record.payload_json)
+        if payload is None:
+            delivery = DeliveryResult(success=False, attempts=1, last_error="Invalid persisted notification payload.")
+        elif payload.get("event") == "trigger.fired" and payload.get("tenant"):
             delivery = deliver_outbox_notification(
                 record.url, payload, session, max_attempts=1
             )
@@ -78,7 +79,7 @@ def run_once(
             success=delivery.success,
             attempt_delta=delivery.attempts or 1,
             error=delivery.last_error,
-            max_attempts=outbox.max_attempts_from_environment(),
+            max_attempts=1 if payload is None else outbox.max_attempts_from_environment(),
         )
         if resulting is None:
             session.rollback()

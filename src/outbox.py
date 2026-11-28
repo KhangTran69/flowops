@@ -5,8 +5,10 @@ delivers once, then commits a conditional transition. A stale owner cannot
 overwrite a takeover or double-finalize the row.
 """
 
+import json
 import os
 import uuid
+from typing import Any
 from datetime import datetime, timedelta
 
 from sqlalchemy import and_, or_, select, true, update
@@ -38,8 +40,11 @@ def claim_delivery(
     now: datetime | None = None,
     notification_id: int | None = None,
     manual: bool = False,
+    actor_subject: str = "notification-worker",
 ) -> db.NotificationOutboxRecord | None:
     """Claim one due pending delivery for this dispatcher."""
+    if lease_seconds <= 0:
+        raise ValueError("Notification lease must be positive.")
     now = now or db.utcnow()
     token = uuid.uuid4().hex
     table = db.NotificationOutboxRecord
@@ -51,6 +56,26 @@ def claim_delivery(
         query = query.with_for_update(skip_locked=True)
     candidates = session.execute(query).scalars().all()
     for notification_id in candidates:
+        # A claim consumes one attempt before any external request. A crash
+        # after sending is ambiguous; stop after the budget, rather than
+        # silently delivering forever. Explicit requeue clears the lease
+        # and permits one further attempt, preserving history.
+        exhausted = session.execute(
+            update(table).execution_options(synchronize_session=False)
+            .where(table.id == notification_id, condition,
+                   table.lease_owner_token.is_not(None),
+                   table.attempts >= max_attempts_from_environment())
+            .values(status="failed", lease_owner_token=None, lease_expires_at=None,
+                    next_attempt_at=None, updated_at=now,
+                    last_error="Abandoned delivery exhausted retry budget; reconcile external effects before retry.")
+        )
+        if exhausted.rowcount == 1:  # type: ignore[attr-defined]
+            record = session.get(table, notification_id, populate_existing=True)
+            db.log_execution(session, run_id=uuid.uuid4().hex[:12], action="notification.dead_lettered",
+                             status="failure", ticket_id=record.ticket_id if record else None,
+                             duration_ms=0, detail=f"outbox #{notification_id}: abandoned attempt budget exhausted",
+                             actor_subject=actor_subject)
+            continue
         result = session.execute(
             update(table)
             .execution_options(synchronize_session=False)
@@ -58,6 +83,7 @@ def claim_delivery(
             .values(
                 lease_owner_token=token,
                 lease_expires_at=now + timedelta(seconds=lease_seconds),
+                attempts=table.attempts + 1,
                 updated_at=now,
             )
         )
@@ -91,7 +117,8 @@ def finalize_delivery(
         or record.lease_owner_token != owner_token
     ):
         return None
-    attempts = record.attempts + max(0, attempt_delta)
+    # The claim already recorded the first attempt durably.
+    attempts = record.attempts + max(0, attempt_delta - 1)
     values = {
         "attempts": attempts,
         "last_error": error,
@@ -126,6 +153,15 @@ def finalize_delivery(
         .values(**values)
     )
     return resulting if outcome.rowcount == 1 else None  # type: ignore[attr-defined]  # rowcount is CursorResult-only at runtime
+
+
+def decode_payload(value: str) -> dict[str, Any] | None:
+    """Invalid stored envelopes must be dead-lettered, not crash the daemon."""
+    try:
+        payload = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def max_attempts_from_environment() -> int:

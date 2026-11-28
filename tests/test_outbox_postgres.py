@@ -144,4 +144,4 @@ def test_postgres_manual_retry_does_not_dispatch_worker_owned_row(client, monkey
     with db.SessionLocal() as session:
         row = session.get(db.NotificationOutboxRecord, notification_id)
         assert row.lease_owner_token == token
-        assert row.status == "pending" and row.attempts == 0
+        assert row.status == "pending" and row.attempts == 1

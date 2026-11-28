@@ -185,3 +185,30 @@ def test_expired_lease_metric_excludes_active_and_terminal_rows(database):
     response = TestClient(api.app).get("/metrics")
     assert response.status_code == 200
     assert "flowops_notification_expired_leases 1\n" in response.text
+
+
+def test_abandoned_notification_attempts_are_bounded(database, monkeypatch):
+    monkeypatch.setenv("FLOWOPS_NOTIFICATION_MAX_ATTEMPTS", "2")
+    notification_id = _insert()
+    with db.SessionLocal() as session:
+        at = db.utcnow()
+        first = outbox.claim_delivery(session, now=at, lease_seconds=1)
+        assert first is not None and first.attempts == 1
+        second = outbox.claim_delivery(session, now=at + timedelta(seconds=1), lease_seconds=1)
+        assert second is not None and second.attempts == 2
+        assert outbox.claim_delivery(session, now=at + timedelta(seconds=2)) is None
+        row = session.get(db.NotificationOutboxRecord, notification_id, populate_existing=True)
+        assert row.status == "failed" and row.attempts == 2
+        assert row.lease_owner_token is None
+        assert "reconcile external effects" in row.last_error
+
+
+def test_invalid_notification_payload_is_dead_lettered(database, monkeypatch):
+    notification_id = _insert()
+    with db.SessionLocal() as session:
+        row = session.get(db.NotificationOutboxRecord, notification_id)
+        row.payload_json = "[]"
+        session.commit()
+    monkeypatch.setattr(outbox_worker, "deliver_webhook", lambda *args, **kwargs: pytest.fail("invalid payload sent"))
+    processed = outbox_worker.run_once()
+    assert processed is not None and processed.status == "failed" and processed.attempts == 1
