@@ -25,3 +25,5 @@ data/*.db-wal
 
 # Local scratch databases and generated test artifacts
 tmp/
+.vercel
+.env*
