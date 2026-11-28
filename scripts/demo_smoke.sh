@@ -174,6 +174,8 @@ for request in json.load(sys.stdin):
     if request.get("employee_name") == name:
         print(request["id"])
         break
+else:
+    sys.exit(1)
 ' "$employee"
 }
 
