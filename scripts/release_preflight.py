@@ -1,7 +1,9 @@
 """Fail closed before a protected Fly release changes the database schema."""
 import os
 import subprocess
+from urllib.parse import urlsplit
 
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 
@@ -21,8 +23,23 @@ def validate_release(environ: dict[str, str]) -> None:
     for name in ("FLOWOPS_ACTION_ADAPTER", "FLOWOPS_AUTOMATION_ADAPTER", "FLOWOPS_AI_ADAPTER"):
         if environ.get(name) != "simulated":
             raise ValueError(f"{name} must remain simulated for this release candidate.")
-    if environ.get("FLOWOPS_NOTIFICATION_WEBHOOK_URL"):
-        raise ValueError("Outbound notification webhooks must remain disabled.")
+    for name in ("FLOWOPS_NOTIFICATION_WEBHOOK_URL", "FLOWOPS_ACTION_FAILURE_WEBHOOK_URL",
+                 "FLOWOPS_N8N_WEBHOOK_URL", "FLOWOPS_N8N_API_KEY",
+                 "FLOWOPS_AUTOMATION_CALLBACK_SECRET", "FLOWOPS_N8N_WEBHOOK_SECRET"):
+        if environ.get(name):
+            raise ValueError(f"{name} must remain unset for the isolated simulated candidate.")
+    if environ.get("FLOWOPS_SESSION_SECRET") == environ.get("FLOWOPS_WEBHOOK_API_KEY"):
+        raise ValueError("Session and webhook credentials must be distinct.")
+    for name in ("FLOWOPS_ENTRA_ISSUER", "FLOWOPS_ENTRA_JWKS_URL"):
+        try:
+            parsed = urlsplit(environ.get(name, ""))
+            valid = (parsed.scheme == "https" and bool(parsed.hostname)
+                     and parsed.username is None and parsed.password is None
+                     and not parsed.query and not parsed.fragment)
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError(f"{name} must be a trusted HTTPS URL.")
     try:
         url = make_url(environ.get("FLOWOPS_DATABASE_URL", ""))
     except (ArgumentError, ValueError):
@@ -35,9 +52,31 @@ def validate_release(environ: dict[str, str]) -> None:
     validate_workforce_integration_configuration(environ)
 
 
+# Stable application-specific session lock serializes release migrations.
+RELEASE_LOCK_ID = 7061408101
+
+
+def migrate_once(database_url: str) -> None:
+    engine = create_engine(database_url, connect_args={"connect_timeout": 10})
+    try:
+        with engine.connect() as connection:
+            acquired = connection.execute(
+                text("SELECT pg_try_advisory_lock(:key)"), {"key": RELEASE_LOCK_ID}
+            ).scalar_one()
+            if not acquired:
+                raise RuntimeError("Another FlowOps release owns the database migration lock.")
+            try:
+                subprocess.run(["alembic", "upgrade", "head"], check=True, timeout=600)
+            finally:
+                connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": RELEASE_LOCK_ID})
+    finally:
+        engine.dispose()
+
+
 def main() -> None:
-    validate_release(dict(os.environ))
-    subprocess.run(["alembic", "upgrade", "head"], check=True)
+    environ = dict(os.environ)
+    validate_release(environ)
+    migrate_once(environ["FLOWOPS_DATABASE_URL"])
 
 
 if __name__ == "__main__":

@@ -138,3 +138,12 @@ For the demo path on a single host, run it with
 - Prometheus/Grafana (attach a Grafana Cloud agent to `/metrics` later).
 - Live connectors and real Microsoft 365 actions — deliberately out of scope
   for the demo (simulated adapters; see ROADMAP gates).
+
+The simulated release candidate refuses outbound action-failure and notification
+webhooks, n8n credentials and callback secrets, non-HTTPS identity endpoints,
+and reused session/webhook credentials. The release command takes a
+PostgreSQL session advisory lock before invoking Alembic (ten-minute command
+timeout); overlapping preflight releases fail before migrating. This is not
+a substitute for an approved maintenance window: manual Alembic invocations
+do not participate in this lock. Public rollout remains blocked until the
+real identity, staging and accessibility gates have been satisfied.

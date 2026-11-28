@@ -10,7 +10,7 @@
 # evidence artifact.
 #
 # Usage: from the repo root of a RUNNING compose stack:
-#   ./scripts/backup_restore_rehearsal.sh
+#   FLOWOPS_DISPOSABLE_REHEARSAL=1 ./scripts/backup_restore_rehearsal.sh
 #
 # This rehearsal seeds synthetic source data. Run only on an explicitly
 # disposable stack with no concurrent API traffic. Writer services are
@@ -21,7 +21,7 @@ if [[ "${FLOWOPS_DISPOSABLE_REHEARSAL:-}" != "1" ]]; then
   echo "Refusing rehearsal: an explicitly disposable synthetic compose stack is required." >&2
   exit 1
 fi
-REHEARSAL_CONTAINER="flowops-rehearsal-pg-$"
+REHEARSAL_CONTAINER="flowops-rehearsal-pg-$$"
 RESTORE_ID=""
 PAUSE_ATTEMPTED=0
 REHEARSAL_HOST_PORT="${FLOWOPS_REHEARSAL_PG_PORT:-}"
@@ -79,6 +79,8 @@ STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "FlowOps backup/restore rehearsal — ${STAMP} — commit ${GIT_SHA}"
 
 # ---------------------------------------------------------------------------
+# A mistaken opt-in must not seed a protected application.
+docker compose exec -T app python -c 'import os, sys; sys.exit(0 if os.environ.get("FLOWOPS_ENVIRONMENT", "development") == "development" else 1)' || { echo "Refusing to seed a protected or unavailable application." >&2; exit 1; }
 echo "Preparing non-trivial data on the source stack"
 # The demo seed (when present in the image) fills every dashboard; the
 # rehearsal fixtures add rows this script can spot-check verbatim afterwards.
